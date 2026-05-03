@@ -415,7 +415,7 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 	return &ddlOp{tag: "CREATE TABLE", do: func() error {
 		cols := make([]catalog.Column, len(p.Columns))
 		for i, c := range p.Columns {
-			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull}
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique}
 		}
 		if err := env.Schema.CreateTable(catalog.Table{Name: p.Name, Columns: cols}); err != nil {
 			return err
@@ -568,6 +568,9 @@ func (i *insertOp) Next(_ context.Context) (Row, error) {
 		}
 		built[r] = row
 	}
+	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
+		return nil, err
+	}
 	for _, row := range built {
 		i.table.Insert(row)
 		i.inserted++
@@ -585,6 +588,36 @@ func checkNotNull(ct catalog.Table, row storage.Row) error {
 		}
 		if idx >= len(row) || row[idx] == nil {
 			return NotNullViolation(ct.Name, col.Name)
+		}
+	}
+	return nil
+}
+
+// checkUnique enforces single-column UNIQUE constraints. We rebuild the
+// per-column value sets from existing rows on every insert — DESIGN.md
+// §3 explicitly accepts O(n) scans for correctness in M3. NULLs are
+// not considered equal (real PG semantics), so multiple NULLs in a
+// unique column are allowed.
+func checkUnique(ct catalog.Table, existing, incoming []storage.Row) error {
+	for idx, col := range ct.Columns {
+		if !col.Unique {
+			continue
+		}
+		seen := map[any]struct{}{}
+		for _, r := range existing {
+			if idx >= len(r) || r[idx] == nil {
+				continue
+			}
+			seen[r[idx]] = struct{}{}
+		}
+		for _, r := range incoming {
+			if idx >= len(r) || r[idx] == nil {
+				continue
+			}
+			if _, dup := seen[r[idx]]; dup {
+				return UniqueViolation(ct.Name, col.Name)
+			}
+			seen[r[idx]] = struct{}{}
 		}
 	}
 	return nil

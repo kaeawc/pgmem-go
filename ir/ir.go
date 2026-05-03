@@ -86,6 +86,7 @@ type ColumnDef struct {
 	Name    string
 	Type    types.Type
 	NotNull bool
+	Unique  bool // PRIMARY KEY sets both NotNull and Unique
 }
 
 // Insert appends rows to the named table. Columns names the target

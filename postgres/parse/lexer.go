@@ -53,6 +53,9 @@ const (
 	kwTrue
 	kwFalse
 	kwAs
+	kwPrimary
+	kwKey
+	kwUnique
 )
 
 type token struct {
@@ -85,6 +88,9 @@ var keywords = map[string]tokenKind{
 	"true":      kwTrue,
 	"false":     kwFalse,
 	"as":        kwAs,
+	"primary":   kwPrimary,
+	"key":       kwKey,
+	"unique":    kwUnique,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
