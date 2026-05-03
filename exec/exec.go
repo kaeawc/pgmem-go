@@ -502,13 +502,37 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		}
 		resolvedRows[i] = out
 	}
-	return &insertOp{
+	op := &insertOp{
 		table:  st,
 		ct:     ct,
 		colMap: colMap,
 		rows:   resolvedRows,
 		params: env.Params,
-	}, nil
+	}
+	if len(p.Returning) > 0 {
+		// RETURNING expressions see the post-INSERT row, so their column
+		// refs resolve against the table's full schema (catalog order),
+		// not the INSERT's column list.
+		tableSchema := make([]Column, len(ct.Columns))
+		for k, c := range ct.Columns {
+			tableSchema[k] = Column{Name: c.Name, Type: c.Type}
+		}
+		op.returning = make([]ir.Expr, len(p.Returning))
+		op.returningCols = make([]Column, len(p.Returning))
+		for k, e := range p.Returning {
+			r, err := resolveExpr(e, tableSchema, env.Params)
+			if err != nil {
+				return nil, err
+			}
+			op.returning[k] = r
+			name := ""
+			if k < len(p.ReturningNames) {
+				name = p.ReturningNames[k]
+			}
+			op.returningCols[k] = Column{Name: name, Type: r.Type()}
+		}
+	}
+	return op, nil
 }
 
 // buildInsertColumnMap returns the mapping from VALUES-tuple position
@@ -547,45 +571,82 @@ type insertOp struct {
 	params   []Param
 	done     bool
 	inserted int
+
+	// Optional RETURNING projection. Non-nil iff the INSERT has a
+	// RETURNING clause; in that case OutputSchema is non-empty and
+	// Next emits one row per inserted row before EOF.
+	returning     []ir.Expr
+	returningCols []Column
+	pending       []Row // computed during the side-effect pass
+	pendingPos    int
 }
 
-func (i *insertOp) OutputSchema() []Column { return nil }
+func (i *insertOp) OutputSchema() []Column { return i.returningCols }
 func (i *insertOp) Close() error           { return nil }
 
 func (i *insertOp) Next(_ context.Context) (Row, error) {
-	if i.done {
-		return nil, io.EOF
+	if !i.done {
+		if err := i.runOnce(); err != nil {
+			return nil, err
+		}
 	}
+	if i.pendingPos < len(i.pending) {
+		r := i.pending[i.pendingPos]
+		i.pendingPos++
+		return r, nil
+	}
+	return nil, io.EOF
+}
+
+// runOnce performs the side effect (build, validate, insert) and, if
+// the INSERT carries a RETURNING clause, computes the projected output
+// rows so subsequent Next calls can deliver them.
+func (i *insertOp) runOnce() error {
 	i.done = true
-	// Build and validate every row before touching storage. M3 doesn't
-	// have transactional rollback yet, so a failure mid-loop would leave
-	// rows that came before the failed one stuck in the table.
+	// Build and validate every row before touching storage. The
+	// transaction layer that would otherwise undo half-applied writes
+	// hasn't landed yet (it's later in M3), so the operator itself
+	// guarantees all-or-nothing.
 	built := make([]storage.Row, len(i.rows))
 	for r, exprRow := range i.rows {
 		row := make(storage.Row, len(i.ct.Columns))
 		for j, e := range exprRow {
 			v, err := evalExpr(e, nil, i.params)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			row[i.colMap[j]] = v
 		}
 		if err := checkNotNull(i.ct, row); err != nil {
-			return nil, err
+			return err
 		}
 		built[r] = row
 	}
 	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
-		return nil, err
+		return err
 	}
 	if err := checkChecks(i.ct, built, i.params); err != nil {
-		return nil, err
+		return err
 	}
 	for _, row := range built {
 		i.table.Insert(row)
 		i.inserted++
 	}
-	return nil, io.EOF
+	if len(i.returning) > 0 {
+		i.pending = make([]Row, len(built))
+		for k, row := range built {
+			out := make(Row, len(i.returning))
+			for j, e := range i.returning {
+				v, err := evalExpr(e, Row(row), i.params)
+				if err != nil {
+					return err
+				}
+				out[j] = v
+			}
+			i.pending[k] = out
+		}
+	}
+	return nil
 }
 
 // checkNotNull validates a fully-built insert row against the catalog's

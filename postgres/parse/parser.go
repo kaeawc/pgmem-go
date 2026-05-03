@@ -197,6 +197,14 @@ func (p *parser) parseInsert() (ir.Node, error) {
 		}
 		break
 	}
+	if p.accept(kwReturning) {
+		exprs, names, err := p.parseSelectList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = exprs
+		stmt.ReturningNames = names
+	}
 	return stmt, nil
 }
 
