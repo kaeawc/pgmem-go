@@ -41,3 +41,14 @@ func UniqueViolation(table, column string) *SQLError {
 		Message: fmt.Sprintf("duplicate key value violates unique constraint %q", table+"_"+column+"_key"),
 	}
 }
+
+// CheckViolation reports SQLSTATE 23514 in the format real PG uses:
+// `new row for relation "<table>" violates check constraint "<name>"`.
+// constraint is the fully-qualified constraint name (column-level
+// CHECKs default to `<table>_<col>_check`).
+func CheckViolation(table, constraint string) *SQLError {
+	return &SQLError{
+		Code:    "23514",
+		Message: fmt.Sprintf("new row for relation %q violates check constraint %q", table, constraint),
+	}
+}

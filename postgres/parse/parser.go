@@ -143,6 +143,12 @@ func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error)
 		}
 		def.NotNull = true
 		def.Unique = true
+	case p.accept(kwCheck):
+		expr, err := p.parseParenExpr()
+		if err != nil {
+			return false, err
+		}
+		def.Check = expr
 	default:
 		return true, nil
 	}
