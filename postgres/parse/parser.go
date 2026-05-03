@@ -50,11 +50,43 @@ func (p *parser) parseStmt() (ir.Node, error) {
 		return p.parseSelect()
 	case kwInsert:
 		return p.parseInsert()
+	case kwDelete:
+		return p.parseDelete()
 	case kwCreate:
 		return p.parseCreateTable()
 	default:
 		return nil, fmt.Errorf("parse: unsupported leading token %q", tok.val)
 	}
+}
+
+// --- DELETE ---
+
+func (p *parser) parseDelete() (ir.Node, error) {
+	p.consume() // DELETE
+	if _, err := p.expect(kwFrom, "FROM"); err != nil {
+		return nil, err
+	}
+	name, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	stmt := &ir.Delete{Table: name.val}
+	if p.accept(kwWhere) {
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = cond
+	}
+	if p.accept(kwReturning) {
+		exprs, names, err := p.parseSelectList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = exprs
+		stmt.ReturningNames = names
+	}
+	return stmt, nil
 }
 
 // --- CREATE TABLE ---

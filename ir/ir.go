@@ -94,6 +94,19 @@ type ColumnDef struct {
 	Check Expr
 }
 
+// Delete removes rows from the named table that match Where. Where may
+// be nil, in which case every row is deleted. Returning, when set,
+// emits one row per deleted row, evaluated against the row's pre-
+// delete values (matching real PG).
+type Delete struct {
+	Table          string
+	Where          Expr
+	Returning      []Expr
+	ReturningNames []string
+}
+
+func (*Delete) node() {}
+
 // Insert appends rows to the named table. Columns names the target
 // columns in order; if empty, every column of the table is targeted in
 // catalog order. Rows is parallel to Columns.
