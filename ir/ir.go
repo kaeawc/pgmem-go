@@ -97,10 +97,17 @@ type ColumnDef struct {
 // Insert appends rows to the named table. Columns names the target
 // columns in order; if empty, every column of the table is targeted in
 // catalog order. Rows is parallel to Columns.
+//
+// If Returning is non-empty, the operator produces one output row per
+// inserted row, with each Expr evaluated against the freshly-inserted
+// row (so column refs see post-INSERT values). ReturningNames is
+// parallel to Returning and supplies the result schema's column names.
 type Insert struct {
-	Table   string
-	Columns []string
-	Rows    [][]Expr
+	Table          string
+	Columns        []string
+	Rows           [][]Expr
+	Returning      []Expr
+	ReturningNames []string
 }
 
 func (*Insert) node() {}
