@@ -34,7 +34,7 @@ func runInsert(t *testing.T, sch catalog.Schema, eng storage.Engine, plan *ir.In
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }() // safety net for the error path
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
 		return err
@@ -42,11 +42,12 @@ func runInsert(t *testing.T, sch catalog.Schema, eng storage.Engine, plan *ir.In
 	defer op.Close()
 	// Side-effect operators (Insert, CreateTable) signal "done" with EOF
 	// even on success — they have no rows to produce. Test helpers want
-	// the first non-EOF error, or nil.
+	// the first non-EOF error, or nil; on success we commit so canonical
+	// engine state reflects the change.
 	if _, err := op.Next(context.Background()); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
-	return nil
+	return txn.Commit()
 }
 
 // TestInsert_UniqueViolation_AgainstExistingRow covers the simplest

@@ -31,7 +31,7 @@ func runInsertReturning(t *testing.T, plan *ir.Insert) ([]exec.Row, error) {
 	eng.CreateTable("events", 2)
 
 	txn, _ := eng.Begin(context.Background())
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
 		return nil, err
@@ -41,7 +41,7 @@ func runInsertReturning(t *testing.T, plan *ir.Insert) ([]exec.Row, error) {
 	for {
 		row, err := op.Next(context.Background())
 		if errors.Is(err, io.EOF) {
-			return out, nil
+			return out, txn.Commit()
 		}
 		if err != nil {
 			return out, err

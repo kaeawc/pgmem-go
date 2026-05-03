@@ -35,7 +35,7 @@ func runInsertCheckFixture(t *testing.T, checkExpr ir.Expr, rows [][]ir.Expr) er
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
@@ -45,7 +45,7 @@ func runInsertCheckFixture(t *testing.T, checkExpr ir.Expr, rows [][]ir.Expr) er
 	if _, err := op.Next(context.Background()); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
-	return nil
+	return txn.Commit()
 }
 
 // gtZero is the catalog form of `qty > 0` — the parser would emit this
@@ -146,7 +146,7 @@ func TestInsert_CheckNullEvaluatesAsPass(t *testing.T) {
 		}},
 	}
 	txn, _ := eng.Begin(context.Background())
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
@@ -154,6 +154,9 @@ func TestInsert_CheckNullEvaluatesAsPass(t *testing.T) {
 	defer op.Close()
 	if _, err := op.Next(context.Background()); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Next: %v (NULL CHECK should pass)", err)
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 
 	st, _ := eng.Table("items")
