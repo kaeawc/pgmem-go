@@ -61,6 +61,57 @@ func (p *parser) parseStmt() (ir.Node, error) {
 	}
 }
 
+// parseFromClause reads `FROM a [INNER] JOIN b ON cond [JOIN ...]`
+// and produces a left-deep IR tree. We don't model commas in FROM yet
+// — JOINs only.
+func (p *parser) parseFromClause() (ir.Node, error) {
+	left, err := p.parseTableRef()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		if !p.peekIsJoin() {
+			return left, nil
+		}
+		// Optional INNER prefix; absent means INNER JOIN by default.
+		p.accept(kwInner)
+		if !p.accept(kwJoin) {
+			return nil, fmt.Errorf("parse: expected JOIN at %d", p.peek().pos)
+		}
+		right, err := p.parseTableRef()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwOn, "ON"); err != nil {
+			return nil, err
+		}
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		left = &ir.Join{Left: left, Right: right, Cond: cond, Type: ir.JoinInner}
+	}
+}
+
+func (p *parser) parseTableRef() (ir.Node, error) {
+	t, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Scan{Table: t.val}, nil
+}
+
+// peekIsJoin reports whether the next token starts a JOIN clause.
+// Both `JOIN` and `INNER JOIN` are recognized as the start.
+func (p *parser) peekIsJoin() bool {
+	switch p.peek().kind {
+	case kwJoin, kwInner:
+		return true
+	default:
+		return false
+	}
+}
+
 // --- UPDATE ---
 
 func (p *parser) parseUpdate() (ir.Node, error) {
@@ -323,11 +374,11 @@ func (p *parser) parseSelect() (ir.Node, error) {
 
 	var input ir.Node = &ir.Values{Rows: [][]ir.Expr{{}}}
 	if p.accept(kwFrom) {
-		t, err := p.expect(tIdent, "table name")
+		from, err := p.parseFromClause()
 		if err != nil {
 			return nil, err
 		}
-		input = &ir.Scan{Table: t.val}
+		input = from
 	}
 	if p.accept(kwWhere) {
 		cond, err := p.parseExpr()
@@ -337,8 +388,10 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		input = &ir.Filter{Input: input, Cond: cond}
 	}
 
-	plan := ir.Node(&ir.Project{Input: input, Exprs: exprs, OutputNames: names})
-
+	// ORDER BY sits *below* Project so its sort keys can reference
+	// FROM-clause columns (with their original Qualifier), not just
+	// the projected output. Aliased ORDER BY (`ORDER BY <alias>`) is a
+	// separate planning concern that lands when we have alias scope.
 	if p.accept(kwOrder) {
 		if _, err := p.expect(kwBy, "BY"); err != nil {
 			return nil, err
@@ -347,8 +400,10 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		plan = &ir.Sort{Input: plan, Keys: keys}
+		input = &ir.Sort{Input: input, Keys: keys}
 	}
+
+	plan := ir.Node(&ir.Project{Input: input, Exprs: exprs, OutputNames: names})
 
 	if hasLimitOrOffset(p) {
 		plan, err = p.parseLimitOffset(plan)

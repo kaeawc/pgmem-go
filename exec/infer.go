@@ -42,92 +42,141 @@ func InferParamTypes(plan ir.Node, sch catalog.Schema, declared []types.Type) []
 // most recently encountered Scan's table name; it lets BinOp inference
 // look up ColumnRef types against the catalog without needing the full
 // resolveExpr machinery.
+//
+// Per-node logic lives in walk* helpers below so this dispatch stays
+// short; gocyclo otherwise inflates with every new IR node we add.
 func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
 	switch p := n.(type) {
-	case *ir.Scan:
-		// Children handle their own walk; recording the table happens in
-		// the caller via the explicit scopeTable plumb-through.
 	case *ir.Project:
-		next := scopeFor(p.Input, scopeTable)
-		walkParams(p.Input, sch, next, hint, maxIdx)
-		for _, e := range p.Exprs {
-			walkExprParams(e, nil, sch, next, hint, maxIdx)
-		}
+		walkParamsProject(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Filter:
-		next := scopeFor(p.Input, scopeTable)
-		walkParams(p.Input, sch, next, hint, maxIdx)
-		walkExprParams(p.Cond, nil, sch, next, hint, maxIdx)
+		walkParamsFilter(p, sch, scopeTable, hint, maxIdx)
+	case *ir.Join:
+		walkParamsJoin(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Sort:
-		next := scopeFor(p.Input, scopeTable)
-		walkParams(p.Input, sch, next, hint, maxIdx)
-		for _, k := range p.Keys {
-			walkExprParams(k.Expr, nil, sch, next, hint, maxIdx)
-		}
+		walkParamsSort(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Limit:
-		next := scopeFor(p.Input, scopeTable)
-		walkParams(p.Input, sch, next, hint, maxIdx)
-		if p.Count != nil {
-			walkExprParams(p.Count, types.Int8, sch, next, hint, maxIdx)
-		}
-		if p.Offset != nil {
-			walkExprParams(p.Offset, types.Int8, sch, next, hint, maxIdx)
-		}
+		walkParamsLimit(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Insert:
-		ct, ok := sch.Table(p.Table)
-		if !ok {
-			return
-		}
-		colMap := insertColMap(ct, p.Columns)
-		for _, row := range p.Rows {
-			for j, e := range row {
-				var expected types.Type
-				if j < len(colMap) && colMap[j] >= 0 && colMap[j] < len(ct.Columns) {
-					expected = ct.Columns[colMap[j]].Type
-				}
-				walkExprParams(e, expected, sch, scopeTable, hint, maxIdx)
-			}
-		}
+		walkParamsInsert(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Delete:
-		// DELETE's scopeTable for inference is its target — WHERE and
-		// RETURNING expressions both reference the table's columns.
-		if p.Where != nil {
-			walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
-		}
-		for _, e := range p.Returning {
-			walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
-		}
+		walkParamsDelete(p, sch, hint, maxIdx)
 	case *ir.Update:
-		ct, ok := sch.Table(p.Table)
-		var colTypes map[string]types.Type
-		if ok {
-			colTypes = make(map[string]types.Type, len(ct.Columns))
-			for _, c := range ct.Columns {
-				colTypes[c.Name] = c.Type
-			}
-		}
-		for _, a := range p.Assignments {
-			// `col = $N` constrains $N to col's type.
-			walkExprParams(a.Expr, colTypes[a.Column], sch, p.Table, hint, maxIdx)
-		}
-		if p.Where != nil {
-			walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
-		}
-		for _, e := range p.Returning {
-			walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
-		}
+		walkParamsUpdate(p, sch, hint, maxIdx)
 	case *ir.Values:
-		for _, row := range p.Rows {
-			for _, e := range row {
-				walkExprParams(e, nil, sch, scopeTable, hint, maxIdx)
+		walkParamsValues(p, sch, scopeTable, hint, maxIdx)
+	case *ir.Scan, *ir.CreateTable, nil:
+		// Leaves carry no expressions; nothing to record.
+	}
+}
+
+func walkParamsProject(p *ir.Project, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	next := scopeFor(p.Input, scopeTable)
+	walkParams(p.Input, sch, next, hint, maxIdx)
+	for _, e := range p.Exprs {
+		walkExprParams(e, nil, sch, next, hint, maxIdx)
+	}
+}
+
+func walkParamsFilter(p *ir.Filter, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	next := scopeFor(p.Input, scopeTable)
+	walkParams(p.Input, sch, next, hint, maxIdx)
+	walkExprParams(p.Cond, nil, sch, next, hint, maxIdx)
+}
+
+// walkParamsJoin descends both sides. The ON condition uses qualified
+// refs the executor resolves against the combined schema; bare refs on
+// either side fall back to the type-from-the-other-side propagation in
+// walkExprParams.
+func walkParamsJoin(p *ir.Join, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	walkParams(p.Left, sch, scopeFor(p.Left, scopeTable), hint, maxIdx)
+	walkParams(p.Right, sch, scopeFor(p.Right, scopeTable), hint, maxIdx)
+	if p.Cond != nil {
+		walkExprParams(p.Cond, nil, sch, scopeTable, hint, maxIdx)
+	}
+}
+
+func walkParamsSort(p *ir.Sort, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	next := scopeFor(p.Input, scopeTable)
+	walkParams(p.Input, sch, next, hint, maxIdx)
+	for _, k := range p.Keys {
+		walkExprParams(k.Expr, nil, sch, next, hint, maxIdx)
+	}
+}
+
+func walkParamsLimit(p *ir.Limit, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	next := scopeFor(p.Input, scopeTable)
+	walkParams(p.Input, sch, next, hint, maxIdx)
+	if p.Count != nil {
+		walkExprParams(p.Count, types.Int8, sch, next, hint, maxIdx)
+	}
+	if p.Offset != nil {
+		walkExprParams(p.Offset, types.Int8, sch, next, hint, maxIdx)
+	}
+}
+
+func walkParamsInsert(p *ir.Insert, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	ct, ok := sch.Table(p.Table)
+	if !ok {
+		return
+	}
+	colMap := insertColMap(ct, p.Columns)
+	for _, row := range p.Rows {
+		for j, e := range row {
+			var expected types.Type
+			if j < len(colMap) && colMap[j] >= 0 && colMap[j] < len(ct.Columns) {
+				expected = ct.Columns[colMap[j]].Type
 			}
+			walkExprParams(e, expected, sch, scopeTable, hint, maxIdx)
 		}
-	case *ir.CreateTable, nil:
-		// nothing.
+	}
+}
+
+// walkParamsDelete: WHERE and RETURNING expressions both reference the
+// target table's columns, so scope is the table itself.
+func walkParamsDelete(p *ir.Delete, sch catalog.Schema, hint map[int]types.Type, maxIdx *int) {
+	if p.Where != nil {
+		walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
+	}
+	for _, e := range p.Returning {
+		walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
+	}
+}
+
+func walkParamsUpdate(p *ir.Update, sch catalog.Schema, hint map[int]types.Type, maxIdx *int) {
+	ct, ok := sch.Table(p.Table)
+	var colTypes map[string]types.Type
+	if ok {
+		colTypes = make(map[string]types.Type, len(ct.Columns))
+		for _, c := range ct.Columns {
+			colTypes[c.Name] = c.Type
+		}
+	}
+	for _, a := range p.Assignments {
+		// `col = $N` constrains $N to col's type.
+		walkExprParams(a.Expr, colTypes[a.Column], sch, p.Table, hint, maxIdx)
+	}
+	if p.Where != nil {
+		walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
+	}
+	for _, e := range p.Returning {
+		walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
+	}
+}
+
+func walkParamsValues(p *ir.Values, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
+	for _, row := range p.Rows {
+		for _, e := range row {
+			walkExprParams(e, nil, sch, scopeTable, hint, maxIdx)
+		}
 	}
 }
 
 // scopeFor extracts the underlying table for a child plan node by
 // walking through pure-relational wrappers. Stops at the first Scan.
+// A Join straddles two tables — there isn't a single scope to fall
+// back to — so we return the fallback in that case and rely on
+// qualified column refs for resolution.
 func scopeFor(n ir.Node, fallback string) string {
 	for {
 		switch x := n.(type) {
@@ -141,6 +190,8 @@ func scopeFor(n ir.Node, fallback string) string {
 			n = x.Input
 		case *ir.Limit:
 			n = x.Input
+		case *ir.Join:
+			return fallback
 		default:
 			return fallback
 		}

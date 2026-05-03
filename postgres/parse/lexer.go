@@ -23,6 +23,7 @@ const (
 	tComma
 	tSemi
 	tStar
+	tDot
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -60,6 +61,9 @@ const (
 	kwDelete
 	kwUpdate
 	kwSet
+	kwJoin
+	kwInner
+	kwOn
 )
 
 type token struct {
@@ -99,6 +103,9 @@ var keywords = map[string]tokenKind{
 	"delete":    kwDelete,
 	"update":    kwUpdate,
 	"set":       kwSet,
+	"join":      kwJoin,
+	"inner":     kwInner,
+	"on":        kwOn,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
@@ -127,6 +134,9 @@ func lex(src string) ([]token, error) {
 			i++
 		case c == '*':
 			out = append(out, token{tStar, "*", i})
+			i++
+		case c == '.':
+			out = append(out, token{tDot, ".", i})
 			i++
 		case c == '=':
 			out = append(out, token{tEq, "=", i})

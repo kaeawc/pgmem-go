@@ -46,6 +46,30 @@ type Filter struct {
 
 func (*Filter) node() {}
 
+// JoinType enumerates the join flavors. M4 ships with only Inner;
+// Left and Cross arrive in follow-up pieces but the IR is shaped to
+// receive them without restructuring.
+type JoinType int
+
+const (
+	JoinInner JoinType = iota
+	JoinLeft
+	JoinCross
+)
+
+// Join produces concatenated rows from Left and Right that satisfy
+// Cond. For an INNER JOIN the right rows that match are emitted; for
+// LEFT they are augmented with NULLs when no match exists. CROSS
+// ignores Cond.
+type Join struct {
+	Left  Node
+	Right Node
+	Cond  Expr
+	Type  JoinType
+}
+
+func (*Join) node() {}
+
 // SortKey is one ORDER BY clause: an expression and a direction.
 type SortKey struct {
 	Expr Expr
@@ -170,6 +194,11 @@ func (l *Literal) Type() types.Type { return l.T }
 // The static type comes from the input operator's schema and is
 // resolved at exec.Build time.
 type ColumnRef struct {
+	// Qualifier is the table-name prefix (`users` in `users.id`).
+	// Empty when the SQL source wrote a bare identifier, in which case
+	// resolution falls back to a single-match name lookup against the
+	// input schema and errors on ambiguity.
+	Qualifier string
 	// Name is the unresolved column name from the SQL source. It is set
 	// by the parser; exec.Build uses it (and the input schema) to fill
 	// in Index and T.

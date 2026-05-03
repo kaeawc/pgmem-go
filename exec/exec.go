@@ -21,9 +21,15 @@ type Row []any
 
 // Column is one slot in an operator's output schema. The wire layer
 // reads OutputSchema before pulling rows so it can emit RowDescription.
+//
+// Qualifier is the source table for joined or scanned columns and is
+// what allows `users.id` to resolve unambiguously when both sides of a
+// join expose an `id`. It is empty for projected/synthetic columns
+// since `SELECT id ...` doesn't give the result an inherited table.
 type Column struct {
-	Name string
-	Type types.Type
+	Qualifier string
+	Name      string
+	Type      types.Type
 }
 
 // Param is one bound query parameter. The type comes from the Parse
@@ -63,6 +69,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildValues(p, env)
 	case *ir.Filter:
 		return buildFilter(p, env)
+	case *ir.Join:
+		return buildJoin(p, env)
 	case *ir.Sort:
 		return buildSort(p, env)
 	case *ir.Limit:
@@ -93,7 +101,7 @@ func buildScan(p *ir.Scan, env *Env) (Operator, error) {
 	}
 	cols := make([]Column, len(ct.Columns))
 	for i, c := range ct.Columns {
-		cols[i] = Column{Name: c.Name, Type: c.Type}
+		cols[i] = Column{Qualifier: p.Table, Name: c.Name, Type: c.Type}
 	}
 	return &scanOp{cols: cols, rows: storageRowsToExec(st.Rows())}, nil
 }
@@ -252,6 +260,109 @@ func (f *filterOp) Next(ctx context.Context) (Row, error) {
 		if b, ok := v.(bool); ok && b {
 			return r, nil
 		}
+	}
+}
+
+// --- Join ---
+
+// buildJoin compiles a Join IR node into a nested-loop operator. The
+// operator's output schema is the concatenation of left and right
+// schemas, which preserves each side's Qualifier so downstream
+// ColumnRef resolution can disambiguate same-named columns.
+//
+// CROSS / LEFT join arrive in follow-up pieces; this PR only ships
+// INNER. The IR node accepts the others so the parser can grow without
+// touching this layer.
+func buildJoin(p *ir.Join, env *Env) (Operator, error) {
+	if p.Type != ir.JoinInner {
+		return nil, fmt.Errorf("exec: join type %d not supported yet", p.Type)
+	}
+	left, err := Build(p.Left, env)
+	if err != nil {
+		return nil, err
+	}
+	right, err := Build(p.Right, env)
+	if err != nil {
+		left.Close()
+		return nil, err
+	}
+	combined := append(append([]Column(nil), left.OutputSchema()...), right.OutputSchema()...)
+	var cond ir.Expr
+	if p.Cond != nil {
+		cond, err = resolveExpr(p.Cond, combined, env.Params)
+		if err != nil {
+			left.Close()
+			right.Close()
+			return nil, err
+		}
+	}
+	return &joinOp{left: left, right: right, cond: cond, cols: combined, params: env.Params}, nil
+}
+
+type joinOp struct {
+	left   Operator
+	right  Operator
+	cond   ir.Expr
+	cols   []Column
+	params []Param
+
+	// Right side is materialized once and rewound per left row so a
+	// child operator that's only good for a single Next pass (Scan,
+	// Project, …) still works. M5 can swap this for a hash join when
+	// performance matters.
+	rightRows []Row
+	rightInit bool
+
+	curLeft Row
+	rightAt int
+}
+
+func (j *joinOp) OutputSchema() []Column { return j.cols }
+func (j *joinOp) Close() error {
+	lerr := j.left.Close()
+	rerr := j.right.Close()
+	if lerr != nil {
+		return lerr
+	}
+	return rerr
+}
+
+func (j *joinOp) Next(ctx context.Context) (Row, error) {
+	if !j.rightInit {
+		rows, err := drain(j.right)
+		if err != nil {
+			return nil, err
+		}
+		j.rightRows = rows
+		j.rightInit = true
+	}
+	for {
+		if j.curLeft == nil {
+			next, err := j.left.Next(ctx)
+			if err != nil {
+				return nil, err
+			}
+			j.curLeft = next
+			j.rightAt = 0
+		}
+		for j.rightAt < len(j.rightRows) {
+			right := j.rightRows[j.rightAt]
+			j.rightAt++
+			combined := make(Row, 0, len(j.curLeft)+len(right))
+			combined = append(combined, j.curLeft...)
+			combined = append(combined, right...)
+			if j.cond == nil {
+				return combined, nil
+			}
+			v, err := evalExpr(j.cond, combined, j.params)
+			if err != nil {
+				return nil, err
+			}
+			if b, ok := v.(bool); ok && b {
+				return combined, nil
+			}
+		}
+		j.curLeft = nil
 	}
 }
 
@@ -1107,6 +1218,37 @@ func drain(op Operator) ([]Row, error) {
 	}
 }
 
+// resolveColumnRef finds the slot in schema that ref names. With a
+// qualifier we require both Qualifier and Name to match. Without a
+// qualifier we name-match alone — and if more than one column matches
+// (joined tables both have an `id`, say) we error like real PG.
+func resolveColumnRef(ref *ir.ColumnRef, schema []Column) (int, error) {
+	matches := make([]int, 0, 2)
+	for i, c := range schema {
+		if ref.Name != c.Name {
+			continue
+		}
+		if ref.Qualifier != "" && ref.Qualifier != c.Qualifier {
+			continue
+		}
+		matches = append(matches, i)
+	}
+	if len(matches) == 0 {
+		return 0, fmt.Errorf("exec: unknown column %s", refDisplayName(ref))
+	}
+	if len(matches) > 1 {
+		return 0, fmt.Errorf("exec: column reference %q is ambiguous", ref.Name)
+	}
+	return matches[0], nil
+}
+
+func refDisplayName(ref *ir.ColumnRef) string {
+	if ref.Qualifier != "" {
+		return fmt.Sprintf("%q.%q", ref.Qualifier, ref.Name)
+	}
+	return fmt.Sprintf("%q", ref.Name)
+}
+
 // resolveExpr recursively fills in ColumnRef.Index/T (from the input
 // schema) and ParamRef.T (from the bound parameter list). Pure literals
 // pass through unchanged.
@@ -1115,17 +1257,11 @@ func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
 	case *ir.Literal:
 		return x, nil
 	case *ir.ColumnRef:
-		idx := -1
-		for i, c := range schema {
-			if c.Name == x.Name {
-				idx = i
-				break
-			}
+		idx, err := resolveColumnRef(x, schema)
+		if err != nil {
+			return nil, err
 		}
-		if idx < 0 {
-			return nil, fmt.Errorf("exec: unknown column %q", x.Name)
-		}
-		return &ir.ColumnRef{Name: x.Name, Index: idx, T: schema[idx].Type}, nil
+		return &ir.ColumnRef{Qualifier: x.Qualifier, Name: x.Name, Index: idx, T: schema[idx].Type}, nil
 	case *ir.ParamRef:
 		if x.Index < 0 || x.Index >= len(params) {
 			return nil, fmt.Errorf("exec: $%d not bound (%d params provided)", x.Index+1, len(params))
