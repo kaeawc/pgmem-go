@@ -67,6 +67,11 @@ type Table interface {
 	// fresh copy of the current rows and returns the desired replacement.
 	// Inside a Txn this only mutates the per-tx snapshot; Commit applies.
 	Mutate(mutator func([]Row) []Row)
+	// NextAuto advances and returns the per-column SERIAL / BIGSERIAL
+	// counter. The counter lives on the canonical table, not on the
+	// txn snapshot — gaps from rolled-back transactions are intentional
+	// and match real PG sequence behaviour.
+	NextAuto(colIdx int) int64
 }
 
 // NewEngine returns an empty in-memory engine.
@@ -102,10 +107,12 @@ func (e *engine) CreateTable(name string, columnCount int) Table {
 // --- canonical (committed) table ---
 
 type table struct {
-	mu    sync.RWMutex
-	name  string
-	ncols int
-	rows  []Row
+	mu       sync.RWMutex
+	name     string
+	ncols    int
+	rows     []Row
+	autoMu   sync.Mutex // guards the per-column SERIAL counters
+	autoNext map[int]int64
 }
 
 func (t *table) Name() string { return t.name }
@@ -134,6 +141,18 @@ func (t *table) Mutate(mutator func([]Row) []Row) {
 // txn snapshot. The caller holds t.mu.
 func (t *table) replaceLocked(rows []Row) {
 	t.rows = rows
+}
+
+// NextAuto advances and returns the SERIAL counter for colIdx. First
+// call per column returns 1. Concurrent callers see distinct values.
+func (t *table) NextAuto(colIdx int) int64 {
+	t.autoMu.Lock()
+	defer t.autoMu.Unlock()
+	if t.autoNext == nil {
+		t.autoNext = map[int]int64{}
+	}
+	t.autoNext[colIdx]++
+	return t.autoNext[colIdx]
 }
 
 // --- transaction & per-tx snapshots ---
@@ -171,7 +190,7 @@ func (t *txn) Table(name string) (Table, bool) {
 	if !ok {
 		return nil, false
 	}
-	wrap := &txnTable{name: name, rows: copyRows(canonical.lockedRows())}
+	wrap := &txnTable{name: name, rows: copyRows(canonical.lockedRows()), canonical: canonical}
 	t.snapshots[name] = wrap
 	return wrap, true
 }
@@ -260,9 +279,14 @@ func (t *txn) RollbackToSavepoint(name string) error {
 	}
 	frame := t.savepoints[idx]
 	// Restore: replace snapshots with deep copies from the frame.
+	// We re-link each restored snapshot to its canonical so subsequent
+	// NextAuto calls keep advancing from the engine's counter.
 	t.snapshots = make(map[string]*txnTable, len(frame.tables))
 	for tbl, rows := range frame.tables {
-		t.snapshots[tbl] = &txnTable{name: tbl, rows: copyRows(rows), dirty: true}
+		t.e.mu.RLock()
+		canonical := t.e.tables[tbl]
+		t.e.mu.RUnlock()
+		t.snapshots[tbl] = &txnTable{name: tbl, rows: copyRows(rows), dirty: true, canonical: canonical}
 	}
 	// Drop savepoints created after the target.
 	t.savepoints = t.savepoints[:idx+1]
@@ -300,10 +324,11 @@ func findSavepoint(stack []savepointFrame, name string) int {
 // --- txn-scoped table wrapper ---
 
 type txnTable struct {
-	mu    sync.Mutex // guards rows / dirty (a txn is single-conn but Mutate may capture)
-	name  string
-	rows  []Row
-	dirty bool
+	mu        sync.Mutex // guards rows / dirty (a txn is single-conn but Mutate may capture)
+	name      string
+	rows      []Row
+	dirty     bool
+	canonical *table // for NextAuto pass-through
 }
 
 func (tt *txnTable) Name() string { return tt.name }
@@ -326,6 +351,13 @@ func (tt *txnTable) Mutate(mutator func([]Row) []Row) {
 	defer tt.mu.Unlock()
 	tt.rows = mutator(copyRows(tt.rows))
 	tt.dirty = true
+}
+
+// NextAuto delegates to the canonical table so SERIAL counters don't
+// reset per transaction. A rolled-back txn's allocated values are
+// gaps — same as PG's nextval.
+func (tt *txnTable) NextAuto(colIdx int) int64 {
+	return tt.canonical.NextAuto(colIdx)
 }
 
 // --- helpers ---

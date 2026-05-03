@@ -568,7 +568,7 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		cols := make([]catalog.Column, len(p.Columns))
 		var checks []catalog.Check
 		for i, c := range p.Columns {
-			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique}
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto}
 			if c.Check != nil {
 				checks = append(checks, catalog.Check{
 					Name: p.Name + "_" + c.Name + "_check",
@@ -763,8 +763,9 @@ func (i *insertOp) runOnce() error {
 	i.done = true
 	// Build and validate every row before touching storage. The
 	// transaction layer that would otherwise undo half-applied writes
-	// hasn't landed yet (it's later in M3), so the operator itself
-	// guarantees all-or-nothing.
+	// is in place but the *operator* still owes all-or-nothing on
+	// constraint failures within a single statement.
+	autoCols := autoColumnIndexes(i.ct, i.colMap)
 	built := make([]storage.Row, len(i.rows))
 	for r, exprRow := range i.rows {
 		row := make(storage.Row, len(i.ct.Columns))
@@ -775,6 +776,7 @@ func (i *insertOp) runOnce() error {
 			}
 			row[i.colMap[j]] = v
 		}
+		fillAutoColumns(row, i.ct, autoCols, i.table)
 		if err := checkNotNull(i.ct, row); err != nil {
 			return err
 		}
@@ -805,6 +807,39 @@ func (i *insertOp) runOnce() error {
 		}
 	}
 	return nil
+}
+
+// autoColumnIndexes returns the catalog column indexes that carry the
+// Auto flag *and* aren't named in the INSERT's column list — i.e. the
+// columns the engine must fill itself. colMap is the INSERT-position →
+// catalog-index mapping.
+func autoColumnIndexes(ct catalog.Table, colMap []int) []int {
+	mentioned := make(map[int]bool, len(colMap))
+	for _, idx := range colMap {
+		mentioned[idx] = true
+	}
+	var out []int
+	for idx, c := range ct.Columns {
+		if c.Auto && !mentioned[idx] {
+			out = append(out, idx)
+		}
+	}
+	return out
+}
+
+// fillAutoColumns writes the next sequence value into every Auto column
+// slot the INSERT didn't supply. SERIAL → int32 to match the column
+// type; BIGSERIAL → int64. The counter advances on the canonical table
+// so two transactions never see the same value.
+func fillAutoColumns(row storage.Row, ct catalog.Table, autoCols []int, tbl storage.Table) {
+	for _, idx := range autoCols {
+		next := tbl.NextAuto(idx)
+		if ct.Columns[idx].Type == types.Int4 {
+			row[idx] = int32(next)
+		} else {
+			row[idx] = next
+		}
+	}
 }
 
 // checkNotNull validates a fully-built insert row against the catalog's

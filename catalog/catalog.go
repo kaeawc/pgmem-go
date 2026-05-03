@@ -19,6 +19,7 @@ type Column struct {
 	Type    types.Type
 	NotNull bool
 	Unique  bool // PRIMARY KEY desugars to NotNull && Unique
+	Auto    bool // SERIAL / BIGSERIAL — engine fills missing inserts
 }
 
 // Check is one CHECK constraint attached to a table. Real PG names a
