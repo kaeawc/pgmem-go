@@ -128,6 +128,17 @@ func (p *parser) parsePrimary() (ir.Expr, error) {
 		return &ir.ParamRef{Index: idx - 1}, nil
 	case tIdent:
 		p.consume()
+		// `ident.ident` is a qualified column reference. We commit to it
+		// only after we've confirmed the dot — bare identifiers stay as
+		// unqualified column refs.
+		if p.peek().kind == tDot {
+			p.consume() // .
+			col, err := p.expect(tIdent, "qualified column name")
+			if err != nil {
+				return nil, err
+			}
+			return &ir.ColumnRef{Qualifier: t.val, Name: col.val}, nil
+		}
 		return &ir.ColumnRef{Name: t.val}, nil
 	default:
 		return nil, fmt.Errorf("parse: unexpected token %q in expression", t.val)

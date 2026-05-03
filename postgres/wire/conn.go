@@ -39,9 +39,13 @@ type prepared struct {
 }
 
 type portal struct {
-	stmt         *prepared
-	resultFormat int16
-	params       []exec.Param
+	stmt *prepared
+	// resultFormats holds Bind's ResultFormatCodes verbatim. Length 0
+	// means "all text", length 1 means "uniform across columns", and
+	// length N means per-column. We only know the column count at
+	// Describe/Execute time, so we postpone the lookup with formatFor.
+	resultFormats []int16
+	params        []exec.Param
 }
 
 func handleConn(ctx context.Context, c net.Conn, deps Deps) error {
@@ -196,7 +200,7 @@ func (c *conn) handleSimpleQuery(ctx context.Context, sql string) error {
 		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(stmt.tag)})
 		return c.writeReady()
 	}
-	if err := c.runQuery(ctx, stmt, 0 /* text */, true /* send RowDescription */, nil); err != nil {
+	if err := c.runQuery(ctx, stmt, nil /* all text */, true /* send RowDescription */, nil); err != nil {
 		if err := c.sendErrorFor(err); err != nil {
 			return err
 		}
@@ -245,9 +249,9 @@ func (c *conn) handleBind(m *pgproto3.Bind) error {
 		return c.sendError("22023", err.Error())
 	}
 	c.portal = &portal{
-		stmt:         c.stmt,
-		resultFormat: pickResultFormat(m.ResultFormatCodes),
-		params:       params,
+		stmt:          c.stmt,
+		resultFormats: append([]int16(nil), m.ResultFormatCodes...),
+		params:        params,
 	}
 	c.be.Send(&pgproto3.BindComplete{})
 	return nil
@@ -301,13 +305,6 @@ func paramType(declared []types.Type, i int) types.Type {
 	return types.Text
 }
 
-func pickResultFormat(codes []int16) int16 {
-	if len(codes) == 0 {
-		return 0
-	}
-	return codes[0]
-}
-
 func (c *conn) handleDescribe(m *pgproto3.Describe) error {
 	var stmt *prepared
 	switch m.ObjectType {
@@ -353,7 +350,7 @@ func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
 	// by the client right after Execute, drives the ReadyForQuery that
 	// closes out the failed exchange — so we don't return the error,
 	// only its wire-level rendering.
-	if err := c.runQuery(ctx, p.stmt, p.resultFormat, false, p.params); err != nil {
+	if err := c.runQuery(ctx, p.stmt, p.resultFormats, false, p.params); err != nil {
 		return c.sendErrorFor(err)
 	}
 	return nil
@@ -364,7 +361,7 @@ func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
 // runQuery builds and drains the operator pipeline for a prepared
 // statement. The simple-query path asks us to emit RowDescription up
 // front; the extended path has already sent one in response to Describe.
-func (c *conn) runQuery(ctx context.Context, stmt *prepared, format int16, sendRowDesc bool, params []exec.Param) error {
+func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, sendRowDesc bool, params []exec.Param) error {
 	txn, err := c.deps.Engine.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -387,7 +384,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, format int16, sendR
 		if len(schema) == 0 {
 			c.be.Send(&pgproto3.NoData{})
 		} else {
-			c.be.Send(rowDescription(schema, format))
+			c.be.Send(rowDescription(schema, formats))
 		}
 	}
 
@@ -404,7 +401,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, format int16, sendR
 			// DDL/DML side-effect operators emit nil row before EOF; skip.
 			continue
 		}
-		dr, err := encodeDataRow(row, schema, format)
+		dr, err := encodeDataRow(row, schema, formats)
 		if err != nil {
 			return err
 		}
@@ -450,11 +447,11 @@ func (c *conn) rowDescriptionFor(stmt *prepared) (*pgproto3.RowDescription, erro
 	if len(schema) == 0 {
 		return nil, nil
 	}
-	format := int16(0)
+	var formats []int16
 	if c.portal != nil {
-		format = c.portal.resultFormat
+		formats = c.portal.resultFormats
 	}
-	return rowDescription(schema, format), nil
+	return rowDescription(schema, formats), nil
 }
 
 // dummyParams supplies zero values of the right type so resolveExpr can
@@ -467,7 +464,7 @@ func dummyParams(decl []types.Type) []exec.Param {
 	return out
 }
 
-func rowDescription(cols []exec.Column, format int16) *pgproto3.RowDescription {
+func rowDescription(cols []exec.Column, formats []int16) *pgproto3.RowDescription {
 	fields := make([]pgproto3.FieldDescription, len(cols))
 	for i, c := range cols {
 		fields[i] = pgproto3.FieldDescription{
@@ -477,13 +474,13 @@ func rowDescription(cols []exec.Column, format int16) *pgproto3.RowDescription {
 			DataTypeOID:          c.Type.OID(),
 			DataTypeSize:         c.Type.Size(),
 			TypeModifier:         -1,
-			Format:               format,
+			Format:               formatFor(formats, i),
 		}
 	}
 	return &pgproto3.RowDescription{Fields: fields}
 }
 
-func encodeDataRow(r exec.Row, cols []exec.Column, format int16) (*pgproto3.DataRow, error) {
+func encodeDataRow(r exec.Row, cols []exec.Column, formats []int16) (*pgproto3.DataRow, error) {
 	values := make([][]byte, len(cols))
 	for i, col := range cols {
 		if i >= len(r) || r[i] == nil {
@@ -494,7 +491,7 @@ func encodeDataRow(r exec.Row, cols []exec.Column, format int16) (*pgproto3.Data
 			b   []byte
 			err error
 		)
-		if format == 1 {
+		if formatFor(formats, i) == 1 {
 			b, err = col.Type.EncodeBinary(r[i])
 		} else {
 			b, err = col.Type.EncodeText(r[i])
