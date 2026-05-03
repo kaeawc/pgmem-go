@@ -64,6 +64,9 @@ const (
 	kwJoin
 	kwInner
 	kwOn
+	kwLeft
+	kwOuter
+	kwCross
 )
 
 type token struct {
@@ -106,6 +109,9 @@ var keywords = map[string]tokenKind{
 	"join":      kwJoin,
 	"inner":     kwInner,
 	"on":        kwOn,
+	"left":      kwLeft,
+	"outer":     kwOuter,
+	"cross":     kwCross,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

@@ -270,11 +270,13 @@ func (f *filterOp) Next(ctx context.Context) (Row, error) {
 // schemas, which preserves each side's Qualifier so downstream
 // ColumnRef resolution can disambiguate same-named columns.
 //
-// CROSS / LEFT join arrive in follow-up pieces; this PR only ships
-// INNER. The IR node accepts the others so the parser can grow without
-// touching this layer.
+// Supported types: Inner, Left, Cross. M5 can swap the nested loop for
+// a hash build when performance matters; the operator interface is
+// unchanged.
 func buildJoin(p *ir.Join, env *Env) (Operator, error) {
-	if p.Type != ir.JoinInner {
+	switch p.Type {
+	case ir.JoinInner, ir.JoinLeft, ir.JoinCross:
+	default:
 		return nil, fmt.Errorf("exec: join type %d not supported yet", p.Type)
 	}
 	left, err := Build(p.Left, env)
@@ -296,25 +298,35 @@ func buildJoin(p *ir.Join, env *Env) (Operator, error) {
 			return nil, err
 		}
 	}
-	return &joinOp{left: left, right: right, cond: cond, cols: combined, params: env.Params}, nil
+	return &joinOp{
+		left:     left,
+		right:    right,
+		cond:     cond,
+		cols:     combined,
+		params:   env.Params,
+		joinType: p.Type,
+		rightWid: len(right.OutputSchema()),
+	}, nil
 }
 
 type joinOp struct {
-	left   Operator
-	right  Operator
-	cond   ir.Expr
-	cols   []Column
-	params []Param
+	left     Operator
+	right    Operator
+	cond     ir.Expr
+	cols     []Column
+	params   []Param
+	joinType ir.JoinType
+	rightWid int // width of right's row, used to NULL-pad LEFT misses
 
 	// Right side is materialized once and rewound per left row so a
 	// child operator that's only good for a single Next pass (Scan,
-	// Project, …) still works. M5 can swap this for a hash join when
-	// performance matters.
+	// Project, …) still works.
 	rightRows []Row
 	rightInit bool
 
-	curLeft Row
-	rightAt int
+	curLeft    Row
+	rightAt    int
+	curMatched bool // true if curLeft matched any right row (for LEFT)
 }
 
 func (j *joinOp) OutputSchema() []Column { return j.cols }
@@ -344,27 +356,52 @@ func (j *joinOp) Next(ctx context.Context) (Row, error) {
 			}
 			j.curLeft = next
 			j.rightAt = 0
+			j.curMatched = false
 		}
 		for j.rightAt < len(j.rightRows) {
 			right := j.rightRows[j.rightAt]
 			j.rightAt++
-			combined := make(Row, 0, len(j.curLeft)+len(right))
-			combined = append(combined, j.curLeft...)
-			combined = append(combined, right...)
-			if j.cond == nil {
-				return combined, nil
-			}
-			v, err := evalExpr(j.cond, combined, j.params)
+			combined := concatRows(j.curLeft, right)
+			match, err := j.evalCond(combined)
 			if err != nil {
 				return nil, err
 			}
-			if b, ok := v.(bool); ok && b {
+			if match {
+				j.curMatched = true
 				return combined, nil
 			}
+		}
+		// Right side exhausted for this left row.
+		if j.joinType == ir.JoinLeft && !j.curMatched {
+			padded := concatRows(j.curLeft, nullRow(j.rightWid))
+			j.curLeft = nil
+			return padded, nil
 		}
 		j.curLeft = nil
 	}
 }
+
+func (j *joinOp) evalCond(row Row) (bool, error) {
+	// CROSS or "missing ON" (treated as TRUE) emits unconditionally.
+	if j.cond == nil {
+		return true, nil
+	}
+	v, err := evalExpr(j.cond, row, j.params)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.(bool)
+	return ok && b, nil
+}
+
+func concatRows(a, b Row) Row {
+	out := make(Row, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return out
+}
+
+func nullRow(width int) Row { return make(Row, width) }
 
 // --- Sort ---
 
