@@ -71,6 +71,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildCreateTable(p, env), nil
 	case *ir.Insert:
 		return buildInsert(p, env)
+	case *ir.Delete:
+		return buildDelete(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -467,6 +469,9 @@ func CommandTag(op Operator) (string, bool) {
 	if i, ok := op.(*insertOp); ok {
 		return i.tag(), true
 	}
+	if d, ok := op.(*deleteOp); ok {
+		return d.tag(), true
+	}
 	return "", false
 }
 
@@ -729,6 +734,143 @@ func checkUnique(ct catalog.Table, existing, incoming []storage.Row) error {
 }
 
 func (i *insertOp) tag() string { return fmt.Sprintf("INSERT 0 %d", i.inserted) }
+
+// --- Delete ---
+
+func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
+	ct, ok := env.Schema.Table(p.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: unknown table %q", p.Table)
+	}
+	st, ok := env.Txn.Table(p.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: storage missing table %q", p.Table)
+	}
+	tableSchema := make([]Column, len(ct.Columns))
+	for i, c := range ct.Columns {
+		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
+	}
+	op := &deleteOp{table: st, ct: ct, params: env.Params, tableSchema: tableSchema}
+	if p.Where != nil {
+		cond, err := resolveExpr(p.Where, tableSchema, env.Params)
+		if err != nil {
+			return nil, err
+		}
+		op.where = cond
+	}
+	if len(p.Returning) > 0 {
+		op.returning = make([]ir.Expr, len(p.Returning))
+		op.returningCols = make([]Column, len(p.Returning))
+		for k, e := range p.Returning {
+			r, err := resolveExpr(e, tableSchema, env.Params)
+			if err != nil {
+				return nil, err
+			}
+			op.returning[k] = r
+			name := ""
+			if k < len(p.ReturningNames) {
+				name = p.ReturningNames[k]
+			}
+			op.returningCols[k] = Column{Name: name, Type: r.Type()}
+		}
+	}
+	return op, nil
+}
+
+type deleteOp struct {
+	table       storage.Table
+	ct          catalog.Table
+	tableSchema []Column
+	where       ir.Expr // nil → delete all
+	params      []Param
+
+	done    bool
+	deleted int
+
+	returning     []ir.Expr
+	returningCols []Column
+	pending       []Row
+	pendingPos    int
+}
+
+func (d *deleteOp) OutputSchema() []Column { return d.returningCols }
+func (d *deleteOp) Close() error           { return nil }
+
+func (d *deleteOp) Next(_ context.Context) (Row, error) {
+	if !d.done {
+		if err := d.runOnce(); err != nil {
+			return nil, err
+		}
+	}
+	if d.pendingPos < len(d.pending) {
+		r := d.pending[d.pendingPos]
+		d.pendingPos++
+		return r, nil
+	}
+	return nil, io.EOF
+}
+
+func (d *deleteOp) runOnce() error {
+	d.done = true
+	// Mutate locks the table for the duration of the predicate walk so
+	// concurrent inserts can't slip in between read and write. We keep
+	// matching rows in a local buffer for RETURNING projection. If the
+	// predicate errors mid-walk, we leave the table untouched and
+	// surface the error — partial deletes would be confusing.
+	var deleted []storage.Row
+	var evalErr error
+	d.table.Mutate(func(rows []storage.Row) []storage.Row {
+		kept := make([]storage.Row, 0, len(rows))
+		for _, row := range rows {
+			match, err := d.matches(row)
+			if err != nil {
+				evalErr = err
+				deleted = nil // throw away anything we'd queued
+				return rows   // table stays exactly as it was
+			}
+			if match {
+				deleted = append(deleted, row)
+			} else {
+				kept = append(kept, row)
+			}
+		}
+		return kept
+	})
+	if evalErr != nil {
+		return evalErr
+	}
+	d.deleted = len(deleted)
+	if len(d.returning) > 0 {
+		d.pending = make([]Row, len(deleted))
+		for i, row := range deleted {
+			out := make(Row, len(d.returning))
+			for j, e := range d.returning {
+				v, err := evalExpr(e, Row(row), d.params)
+				if err != nil {
+					return err
+				}
+				out[j] = v
+			}
+			d.pending[i] = out
+		}
+	}
+	return nil
+}
+
+func (d *deleteOp) matches(row storage.Row) (bool, error) {
+	if d.where == nil {
+		return true, nil
+	}
+	v, err := evalExpr(d.where, Row(row), d.params)
+	if err != nil {
+		return false, err
+	}
+	// SQL three-valued logic: NULL is not "true", so it doesn't match.
+	b, ok := v.(bool)
+	return ok && b, nil
+}
+
+func (d *deleteOp) tag() string { return fmt.Sprintf("DELETE %d", d.deleted) }
 
 // --- helpers ---
 

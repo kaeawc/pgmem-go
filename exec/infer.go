@@ -87,6 +87,15 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 				walkExprParams(e, expected, sch, scopeTable, hint, maxIdx)
 			}
 		}
+	case *ir.Delete:
+		// DELETE's scopeTable for inference is its target — WHERE and
+		// RETURNING expressions both reference the table's columns.
+		if p.Where != nil {
+			walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
+		}
+		for _, e := range p.Returning {
+			walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
+		}
 	case *ir.Values:
 		for _, row := range p.Rows {
 			for _, e := range row {

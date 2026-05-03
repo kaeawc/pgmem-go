@@ -39,6 +39,12 @@ type Table interface {
 	// for the executor to walk without holding any storage locks.
 	Rows() []Row
 	Insert(r Row)
+	// Mutate atomically rewrites the table's row set. mutator receives a
+	// fresh copy of the current rows and returns the desired replacement.
+	// The caller's view of the rows is the only view in flight while
+	// mutator runs (table write lock held), so DELETE / UPDATE filters
+	// won't race against concurrent inserts on the same table.
+	Mutate(mutator func([]Row) []Row)
 }
 
 // NewEngine returns an empty in-memory engine.
@@ -98,4 +104,14 @@ func (t *table) Rows() []Row {
 		out[i] = append(Row(nil), r...)
 	}
 	return out
+}
+
+func (t *table) Mutate(mutator func([]Row) []Row) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	snapshot := make([]Row, len(t.rows))
+	for i, r := range t.rows {
+		snapshot[i] = append(Row(nil), r...)
+	}
+	t.rows = mutator(snapshot)
 }
