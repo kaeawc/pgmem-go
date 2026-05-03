@@ -414,10 +414,17 @@ func (l *limitOp) Next(ctx context.Context) (Row, error) {
 func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 	return &ddlOp{tag: "CREATE TABLE", do: func() error {
 		cols := make([]catalog.Column, len(p.Columns))
+		var checks []catalog.Check
 		for i, c := range p.Columns {
 			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique}
+			if c.Check != nil {
+				checks = append(checks, catalog.Check{
+					Name: p.Name + "_" + c.Name + "_check",
+					Expr: c.Check,
+				})
+			}
 		}
-		if err := env.Schema.CreateTable(catalog.Table{Name: p.Name, Columns: cols}); err != nil {
+		if err := env.Schema.CreateTable(catalog.Table{Name: p.Name, Columns: cols, Checks: checks}); err != nil {
 			return err
 		}
 		env.Engine.CreateTable(p.Name, len(cols))
@@ -571,6 +578,9 @@ func (i *insertOp) Next(_ context.Context) (Row, error) {
 	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
 		return nil, err
 	}
+	if err := checkChecks(i.ct, built, i.params); err != nil {
+		return nil, err
+	}
 	for _, row := range built {
 		i.table.Insert(row)
 		i.inserted++
@@ -588,6 +598,40 @@ func checkNotNull(ct catalog.Table, row storage.Row) error {
 		}
 		if idx >= len(row) || row[idx] == nil {
 			return NotNullViolation(ct.Name, col.Name)
+		}
+	}
+	return nil
+}
+
+// checkChecks evaluates each CHECK constraint against every incoming
+// row. CHECKs may reference columns of the same row, so we resolve the
+// expression once against a synthetic schema built from the catalog,
+// then re-use the resolved expression across all rows in the batch.
+//
+// Per real PG: a CHECK that evaluates to NULL is treated as success
+// (only an explicit FALSE rejects). Matches sqlc-generated test code
+// expectations.
+func checkChecks(ct catalog.Table, rows []storage.Row, params []Param) error {
+	if len(ct.Checks) == 0 {
+		return nil
+	}
+	schema := make([]Column, len(ct.Columns))
+	for i, c := range ct.Columns {
+		schema[i] = Column{Name: c.Name, Type: c.Type}
+	}
+	for _, chk := range ct.Checks {
+		resolved, err := resolveExpr(chk.Expr, schema, params)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			v, err := evalExpr(resolved, Row(row), params)
+			if err != nil {
+				return err
+			}
+			if b, ok := v.(bool); ok && !b {
+				return CheckViolation(ct.Name, chk.Name)
+			}
 		}
 	}
 	return nil

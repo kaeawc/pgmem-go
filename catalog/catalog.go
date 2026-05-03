@@ -9,6 +9,7 @@ package catalog
 import (
 	"sync"
 
+	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/types"
 )
 
@@ -20,10 +21,19 @@ type Column struct {
 	Unique  bool // PRIMARY KEY desugars to NotNull && Unique
 }
 
+// Check is one CHECK constraint attached to a table. Real PG names a
+// column-level CHECK as `<table>_<col>_check` by default; we follow
+// that so error messages match.
+type Check struct {
+	Name string
+	Expr ir.Expr
+}
+
 // Table is the metadata for a single table.
 type Table struct {
 	Name    string
 	Columns []Column
+	Checks  []Check
 }
 
 // Schema is the set of named tables known to a server instance.

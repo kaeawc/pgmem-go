@@ -87,6 +87,11 @@ type ColumnDef struct {
 	Type    types.Type
 	NotNull bool
 	Unique  bool // PRIMARY KEY sets both NotNull and Unique
+	// Check is the optional CHECK (expr) constraint attached to the
+	// column. Real PG allows the expression to reference *other* columns
+	// of the same row; we follow that, with the executor resolving
+	// column refs against the table schema at INSERT time.
+	Check Expr
 }
 
 // Insert appends rows to the named table. Columns names the target
