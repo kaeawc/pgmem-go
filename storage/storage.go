@@ -39,7 +39,22 @@ type Txn interface {
 	Commit() error
 	Rollback() error
 	Table(name string) (Table, bool)
+	// Savepoint marks a sub-transaction boundary. Subsequent
+	// RollbackTo(name) restores the txn's snapshot state to this point
+	// without ending the txn. ReleaseSavepoint(name) discards the
+	// savepoint (and any inside it) without rolling back. Names are
+	// case-sensitive; reusing one shadows the older entry per PG.
+	Savepoint(name string) error
+	RollbackToSavepoint(name string) error
+	ReleaseSavepoint(name string) error
 }
+
+// SavepointError is returned by RollbackToSavepoint / ReleaseSavepoint
+// when the named savepoint isn't on the stack. The wire layer maps it
+// to SQLSTATE 3B001 ("invalid savepoint specification") to match PG.
+type SavepointError struct{ Name string }
+
+func (e *SavepointError) Error() string { return "savepoint " + e.Name + " does not exist" }
 
 // Table is an iterable, mutable collection of rows.
 type Table interface {
@@ -124,10 +139,21 @@ func (t *table) replaceLocked(rows []Row) {
 // --- transaction & per-tx snapshots ---
 
 type txn struct {
-	e         *engine
-	mu        sync.Mutex // guards snapshots and closed
-	snapshots map[string]*txnTable
-	closed    bool
+	e          *engine
+	mu         sync.Mutex // guards snapshots, savepoints and closed
+	snapshots  map[string]*txnTable
+	savepoints []savepointFrame
+	closed     bool
+}
+
+// savepointFrame is the per-table snapshot captured at SAVEPOINT time.
+// We deep-copy each touched table's rows so RollbackTo can restore
+// them. New tables touched after the savepoint disappear from the
+// snapshots map on RollbackTo (matching PG: post-savepoint work is
+// undone, including newly-touched tables).
+type savepointFrame struct {
+	name   string
+	tables map[string][]Row
 }
 
 func (t *txn) Table(name string) (Table, bool) {
@@ -193,7 +219,82 @@ func (t *txn) Rollback() error {
 	}
 	t.closed = true
 	t.snapshots = nil
+	t.savepoints = nil
 	return nil
+}
+
+// Savepoint captures the current per-table snapshot state under name.
+// Reusing a name shadows the previous entry — RollbackTo(name) finds
+// the topmost match — matching PG's semantics for SAVEPOINT inside
+// SAVEPOINT.
+func (t *txn) Savepoint(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	frame := savepointFrame{name: name, tables: make(map[string][]Row, len(t.snapshots))}
+	for tbl, snap := range t.snapshots {
+		snap.mu.Lock()
+		frame.tables[tbl] = copyRows(snap.rows)
+		snap.mu.Unlock()
+	}
+	t.savepoints = append(t.savepoints, frame)
+	return nil
+}
+
+// RollbackToSavepoint restores the per-tx state to the most recent
+// matching savepoint. Newer savepoints are discarded; the named
+// savepoint stays on the stack so a subsequent RollbackTo or RELEASE
+// can target it. Tables touched only after the savepoint are dropped
+// from the snapshot map.
+func (t *txn) RollbackToSavepoint(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	idx := findSavepoint(t.savepoints, name)
+	if idx < 0 {
+		return &SavepointError{Name: name}
+	}
+	frame := t.savepoints[idx]
+	// Restore: replace snapshots with deep copies from the frame.
+	t.snapshots = make(map[string]*txnTable, len(frame.tables))
+	for tbl, rows := range frame.tables {
+		t.snapshots[tbl] = &txnTable{name: tbl, rows: copyRows(rows), dirty: true}
+	}
+	// Drop savepoints created after the target.
+	t.savepoints = t.savepoints[:idx+1]
+	return nil
+}
+
+// ReleaseSavepoint pops the named savepoint and any newer ones. The
+// per-tx state itself is unchanged; subsequent RollbackTo can no
+// longer target a released savepoint.
+func (t *txn) ReleaseSavepoint(name string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	idx := findSavepoint(t.savepoints, name)
+	if idx < 0 {
+		return &SavepointError{Name: name}
+	}
+	t.savepoints = t.savepoints[:idx]
+	return nil
+}
+
+// findSavepoint scans from the top of the stack — PG behavior on
+// duplicate names is "match the most recent".
+func findSavepoint(stack []savepointFrame, name string) int {
+	for i := len(stack) - 1; i >= 0; i-- {
+		if stack[i].name == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // --- txn-scoped table wrapper ---

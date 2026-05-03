@@ -39,9 +39,9 @@ type conn struct {
 	txState    byte
 }
 
-// txAction tags the three transaction-control statements. They look
-// like ordinary statements over the wire but bypass the parser/exec
-// pipeline entirely — they only manipulate conn-scoped state.
+// txAction tags the transaction-control statements. They look like
+// ordinary statements over the wire but bypass the parser/exec pipeline
+// entirely — they only manipulate conn-scoped state.
 type txAction int
 
 const (
@@ -49,6 +49,9 @@ const (
 	txBegin
 	txCommit
 	txRollback
+	txSavepoint        // SAVEPOINT <name>
+	txReleaseSavepoint // RELEASE [SAVEPOINT] <name>
+	txRollbackTo       // ROLLBACK TO [SAVEPOINT] <name>
 )
 
 type prepared struct {
@@ -57,7 +60,8 @@ type prepared struct {
 	paramOIDs  []uint32 // from Parse
 	paramTypes []types.Type
 	noop       bool     // true for SET and other ignored statements
-	txAction   txAction // non-zero for BEGIN/COMMIT/ROLLBACK
+	txAction   txAction // non-zero for BEGIN/COMMIT/ROLLBACK family
+	txName     string   // savepoint identifier (only for the SAVEPOINT family)
 }
 
 type portal struct {
@@ -189,8 +193,8 @@ func (c *conn) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) error
 //  2. SET and friends — silent no-ops so client startup doesn't blow up.
 //  3. Anything else — handed to the SQL parser.
 func (c *conn) classify(sql string) (*prepared, error) {
-	if action, tag := classifyTx(sql); action != txNone {
-		return &prepared{txAction: action, tag: tag}, nil
+	if cmd, ok := classifyTx(sql); ok {
+		return &prepared{txAction: cmd.action, tag: cmd.tag, txName: cmd.name}, nil
 	}
 	if isClientNoop(sql) {
 		return &prepared{noop: true, tag: noopTag(sql)}, nil
@@ -258,8 +262,64 @@ func (c *conn) handleTxAction(ctx context.Context, stmt *prepared) error {
 		return c.commitTx(stmt.tag)
 	case txRollback:
 		return c.rollbackTx(stmt.tag)
+	case txSavepoint:
+		return c.savepointTx(stmt.tag, stmt.txName)
+	case txReleaseSavepoint:
+		return c.releaseSavepointTx(stmt.tag, stmt.txName)
+	case txRollbackTo:
+		return c.rollbackToSavepointTx(stmt.tag, stmt.txName)
 	}
 	return nil
+}
+
+// savepointTx names a sub-transaction. Outside an explicit BEGIN block
+// this is an error (PG's 25P01: no_active_sql_transaction).
+func (c *conn) savepointTx(tag, name string) error {
+	if c.currentTxn == nil {
+		return &exec.SQLError{Code: "25P01", Message: "SAVEPOINT can only be used in transaction blocks"}
+	}
+	if err := c.currentTxn.Savepoint(name); err != nil {
+		return err
+	}
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
+}
+
+func (c *conn) releaseSavepointTx(tag, name string) error {
+	if c.currentTxn == nil {
+		return &exec.SQLError{Code: "25P01", Message: "RELEASE SAVEPOINT can only be used in transaction blocks"}
+	}
+	if err := c.currentTxn.ReleaseSavepoint(name); err != nil {
+		return mapSavepointErr(err)
+	}
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
+}
+
+// rollbackToSavepointTx restores per-tx state to the named savepoint.
+// PG semantics: a successful ROLLBACK TO clears the failed-tx state,
+// so a poisoned block can recover by rolling back to a savepoint set
+// before the failure.
+func (c *conn) rollbackToSavepointTx(tag, name string) error {
+	if c.currentTxn == nil {
+		return &exec.SQLError{Code: "25P01", Message: "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"}
+	}
+	if err := c.currentTxn.RollbackToSavepoint(name); err != nil {
+		return mapSavepointErr(err)
+	}
+	c.txState = 'T'
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
+}
+
+// mapSavepointErr converts the storage layer's typed savepoint errors
+// to the SQLSTATE pgx pattern-matches on.
+func mapSavepointErr(err error) error {
+	var spErr *storage.SavepointError
+	if errors.As(err, &spErr) {
+		return &exec.SQLError{Code: "3B001", Message: err.Error()}
+	}
+	return err
 }
 
 func (c *conn) beginTx(ctx context.Context, tag string) error {
