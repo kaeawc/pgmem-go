@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Coverage / reports
+*.out
+*report.xml
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / agent scratch
+.claude/
+.idea/
+.vscode/

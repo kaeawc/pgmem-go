@@ -1,0 +1,68 @@
+version: "2"
+run:
+  tests: true
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - errcheck
+    - errorlint
+    - gocyclo
+    - gosec
+    - govet
+    - ineffassign
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    errorlint:
+      errorf: true
+    gocyclo:
+      min-complexity: 12
+    govet:
+      disable:
+        - fieldalignment
+        - shadow
+    gosec:
+      excludes:
+        - G104  # best-effort cleanup is intentional
+        - G404  # math/rand is fine for non-crypto sequence/uuid stub seeds in tests
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gocyclo
+          - gosec
+          - noctx
+          - revive
+          - unconvert
+          - unparam
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
