@@ -550,7 +550,11 @@ func (i *insertOp) Next(_ context.Context) (Row, error) {
 		return nil, io.EOF
 	}
 	i.done = true
-	for _, exprRow := range i.rows {
+	// Build and validate every row before touching storage. M3 doesn't
+	// have transactional rollback yet, so a failure mid-loop would leave
+	// rows that came before the failed one stuck in the table.
+	built := make([]storage.Row, len(i.rows))
+	for r, exprRow := range i.rows {
 		row := make(storage.Row, len(i.ct.Columns))
 		for j, e := range exprRow {
 			v, err := evalExpr(e, nil, i.params)
@@ -559,10 +563,31 @@ func (i *insertOp) Next(_ context.Context) (Row, error) {
 			}
 			row[i.colMap[j]] = v
 		}
+		if err := checkNotNull(i.ct, row); err != nil {
+			return nil, err
+		}
+		built[r] = row
+	}
+	for _, row := range built {
 		i.table.Insert(row)
 		i.inserted++
 	}
 	return nil, io.EOF
+}
+
+// checkNotNull validates a fully-built insert row against the catalog's
+// NOT NULL constraints. Catalog column order matches storage row order,
+// so we walk them in lockstep.
+func checkNotNull(ct catalog.Table, row storage.Row) error {
+	for idx, col := range ct.Columns {
+		if !col.NotNull {
+			continue
+		}
+		if idx >= len(row) || row[idx] == nil {
+			return NotNullViolation(ct.Name, col.Name)
+		}
+	}
+	return nil
 }
 
 func (i *insertOp) tag() string { return fmt.Sprintf("INSERT 0 %d", i.inserted) }

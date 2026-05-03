@@ -197,7 +197,7 @@ func (c *conn) handleSimpleQuery(ctx context.Context, sql string) error {
 		return c.writeReady()
 	}
 	if err := c.runQuery(ctx, stmt, 0 /* text */, true /* send RowDescription */, nil); err != nil {
-		if err := c.sendError("XX000", err.Error()); err != nil {
+		if err := c.sendErrorFor(err); err != nil {
 			return err
 		}
 	}
@@ -329,7 +329,7 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) error {
 	}
 	rd, err := c.rowDescriptionFor(stmt)
 	if err != nil {
-		return c.sendError("XX000", err.Error())
+		return c.sendErrorFor(err)
 	}
 	if rd == nil {
 		c.be.Send(&pgproto3.NoData{})
@@ -348,7 +348,15 @@ func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
 		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(p.stmt.tag)})
 		return nil
 	}
-	return c.runQuery(ctx, p.stmt, p.resultFormat, false, p.params)
+	// In extended-query mode, an Execute failure must surface as
+	// ErrorResponse on the wire (pgx pattern-matches on it). Sync, sent
+	// by the client right after Execute, drives the ReadyForQuery that
+	// closes out the failed exchange — so we don't return the error,
+	// only its wire-level rendering.
+	if err := c.runQuery(ctx, p.stmt, p.resultFormat, false, p.params); err != nil {
+		return c.sendErrorFor(err)
+	}
+	return nil
 }
 
 // --- execution ---
@@ -516,4 +524,16 @@ func (c *conn) sendError(sqlstate, message string) error {
 		Message:  message,
 	})
 	return c.be.Flush()
+}
+
+// sendErrorFor maps a Go error to the most specific ErrorResponse we
+// can produce. Executor SQLErrors carry the SQLSTATE the standard
+// defines for the failure; everything else falls back to XX000 with
+// the raw message body.
+func (c *conn) sendErrorFor(err error) error {
+	var sqlErr *exec.SQLError
+	if errors.As(err, &sqlErr) {
+		return c.sendError(sqlErr.Code, sqlErr.Message)
+	}
+	return c.sendError("XX000", err.Error())
 }
