@@ -6,6 +6,7 @@ package types
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 )
@@ -207,9 +208,102 @@ func (*boolType) DecodeBinary(b []byte) (any, error) {
 	return b[0] != 0, nil
 }
 
-// ByOID looks up one of the M2 types by OID. The dialect Registry
-// supersedes this once it lands; until then this is the only lookup
-// path the wire layer needs.
+// UUID is PG uuid (16 raw bytes). Internally we hold values as
+// [16]byte so they're comparable (UNIQUE / map keys).
+var UUID Type = &uuidType{}
+
+type uuidType struct{}
+
+func (*uuidType) Name() string { return "uuid" }
+func (*uuidType) OID() uint32  { return 2950 }
+func (*uuidType) Size() int16  { return 16 }
+
+func (*uuidType) EncodeText(v any) ([]byte, error) {
+	b, err := uuidBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("uuid EncodeText: %w", err)
+	}
+	return []byte(uuidFormat(b)), nil
+}
+
+func (*uuidType) EncodeBinary(v any) ([]byte, error) {
+	b, err := uuidBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("uuid EncodeBinary: %w", err)
+	}
+	out := make([]byte, 16)
+	copy(out, b[:])
+	return out, nil
+}
+
+func (*uuidType) DecodeText(b []byte) (any, error) {
+	parsed, err := uuidParse(string(b))
+	if err != nil {
+		return nil, fmt.Errorf("uuid DecodeText: %w", err)
+	}
+	return parsed, nil
+}
+
+func (*uuidType) DecodeBinary(b []byte) (any, error) {
+	if len(b) != 16 {
+		return nil, fmt.Errorf("uuid DecodeBinary: want 16 bytes, got %d", len(b))
+	}
+	var out [16]byte
+	copy(out[:], b)
+	return out, nil
+}
+
+// uuidBytes normalizes accepted Go representations of a UUID into a
+// [16]byte. We intentionally accept both the array (the canonical
+// internal form) and a string (so test code can write literals
+// without importing a uuid package).
+func uuidBytes(v any) ([16]byte, error) {
+	switch x := v.(type) {
+	case [16]byte:
+		return x, nil
+	case string:
+		return uuidParse(x)
+	case []byte:
+		if len(x) != 16 {
+			return [16]byte{}, fmt.Errorf("[]byte len %d, want 16", len(x))
+		}
+		var out [16]byte
+		copy(out[:], x)
+		return out, nil
+	default:
+		return [16]byte{}, fmt.Errorf("unsupported %T", v)
+	}
+}
+
+// uuidFormat emits the canonical 8-4-4-4-12 hyphenated form.
+func uuidFormat(b [16]byte) string {
+	digits := hex.EncodeToString(b[:])
+	return digits[0:8] + "-" + digits[8:12] + "-" + digits[12:16] + "-" + digits[16:20] + "-" + digits[20:32]
+}
+
+// uuidParse accepts the canonical hyphenated form and the bare 32-hex
+// form (PG accepts both on input).
+func uuidParse(s string) ([16]byte, error) {
+	var out [16]byte
+	stripped := make([]byte, 0, 32)
+	for i := 0; i < len(s); i++ {
+		if s[i] == '-' {
+			continue
+		}
+		stripped = append(stripped, s[i])
+	}
+	if len(stripped) != 32 {
+		return out, fmt.Errorf("expected 32 hex chars, got %d", len(stripped))
+	}
+	if _, err := hex.Decode(out[:], stripped); err != nil {
+		return out, fmt.Errorf("non-hex character in uuid: %w", err)
+	}
+	return out, nil
+}
+
+// ByOID looks up one of the supported PG types by OID. The dialect
+// Registry supersedes this once it lands; until then this is the only
+// lookup path the wire layer needs.
 func ByOID(oid uint32) (Type, bool) {
 	switch oid {
 	case 16:
@@ -220,6 +314,8 @@ func ByOID(oid uint32) (Type, bool) {
 		return Int4, true
 	case 25:
 		return Text, true
+	case 2950:
+		return UUID, true
 	default:
 		return nil, false
 	}
@@ -237,6 +333,8 @@ func ByName(name string) (Type, bool) {
 		return Text, true
 	case "bool", "boolean":
 		return Bool, true
+	case "uuid":
+		return UUID, true
 	default:
 		return nil, false
 	}

@@ -1355,6 +1355,24 @@ func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.UnaryOp{Op: x.Op, Expr: inner, T: x.T}, nil
+	case *ir.FuncCall:
+		args := make([]ir.Expr, len(x.Args))
+		for i, a := range x.Args {
+			r, err := resolveExpr(a, schema, params)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = r
+		}
+		fn, err := lookupBuiltin(x.Name)
+		if err != nil {
+			return nil, err
+		}
+		t, err := fn.ResultType(args)
+		if err != nil {
+			return nil, fmt.Errorf("function %q: %w", x.Name, err)
+		}
+		return &ir.FuncCall{Name: x.Name, Args: args, T: t}, nil
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
@@ -1378,9 +1396,31 @@ func evalExpr(e ir.Expr, in Row, params []Param) (any, error) {
 		return evalBinOp(x, in, params)
 	case *ir.UnaryOp:
 		return evalUnaryOp(x, in, params)
+	case *ir.FuncCall:
+		return evalFuncCall(x, in, params)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalFuncCall looks the builtin up by name, evaluates each argument
+// against the current row, and dispatches to the registered impl.
+// Errors from the impl bubble up unchanged so SQLError-typed failures
+// (which there aren't any of yet) reach the wire layer.
+func evalFuncCall(f *ir.FuncCall, in Row, params []Param) (any, error) {
+	fn, err := lookupBuiltin(f.Name)
+	if err != nil {
+		return nil, err
+	}
+	values := make([]any, len(f.Args))
+	for i, a := range f.Args {
+		v, err := evalExpr(a, in, params)
+		if err != nil {
+			return nil, err
+		}
+		values[i] = v
+	}
+	return fn.Eval(values)
 }
 
 func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
@@ -1519,6 +1559,21 @@ func compareValues(a, b any) (int, error) {
 		default:
 			return 1, nil
 		}
+	case [16]byte:
+		bb, ok := b.([16]byte)
+		if !ok {
+			return 0, fmt.Errorf("exec: cannot compare uuid with %T", b)
+		}
+		// Lexicographic byte order for UUIDs matches PG's collation.
+		for i := 0; i < 16; i++ {
+			if av[i] != bb[i] {
+				if av[i] < bb[i] {
+					return -1, nil
+				}
+				return 1, nil
+			}
+		}
+		return 0, nil
 	default:
 		return 0, fmt.Errorf("exec: cannot compare %T", a)
 	}
