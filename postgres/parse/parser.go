@@ -111,16 +111,42 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 	if !ok {
 		return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", typeName.val)
 	}
-	notNull := false
-	if p.accept(kwNot) {
-		if _, err := p.expect(kwNull, "NULL"); err != nil {
+	def := ir.ColumnDef{Name: name.val, Type: t}
+	for {
+		done, err := p.parseColumnConstraint(&def)
+		if err != nil {
 			return ir.ColumnDef{}, err
 		}
-		notNull = true
-	} else if p.accept(kwNull) {
-		notNull = false
+		if done {
+			return def, nil
+		}
 	}
-	return ir.ColumnDef{Name: name.val, Type: t, NotNull: notNull}, nil
+}
+
+// parseColumnConstraint consumes one column constraint (NOT NULL, NULL,
+// UNIQUE, PRIMARY KEY) and updates def. Returns done=true when no more
+// constraints follow.
+func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error) {
+	switch {
+	case p.accept(kwNot):
+		if _, err := p.expect(kwNull, "NULL"); err != nil {
+			return false, err
+		}
+		def.NotNull = true
+	case p.accept(kwNull):
+		// Explicit NULL is the default; nothing to set.
+	case p.accept(kwUnique):
+		def.Unique = true
+	case p.accept(kwPrimary):
+		if _, err := p.expect(kwKey, "KEY"); err != nil {
+			return false, err
+		}
+		def.NotNull = true
+		def.Unique = true
+	default:
+		return true, nil
+	}
+	return false, nil
 }
 
 // --- INSERT ---

@@ -29,3 +29,15 @@ func NotNullViolation(table, column string) *SQLError {
 		Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", column, table),
 	}
 }
+
+// UniqueViolation reports SQLSTATE 23505 with the message PG produces
+// for a single-column unique constraint:
+// `duplicate key value violates unique constraint "<table>_<col>_key"`.
+// The constraint name follows the implicit-name convention PG uses for
+// column-level UNIQUE; sqlc test code sometimes parses it.
+func UniqueViolation(table, column string) *SQLError {
+	return &SQLError{
+		Code:    "23505",
+		Message: fmt.Sprintf("duplicate key value violates unique constraint %q", table+"_"+column+"_key"),
+	}
+}

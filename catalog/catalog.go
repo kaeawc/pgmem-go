@@ -17,6 +17,7 @@ type Column struct {
 	Name    string
 	Type    types.Type
 	NotNull bool
+	Unique  bool // PRIMARY KEY desugars to NotNull && Unique
 }
 
 // Table is the metadata for a single table.
