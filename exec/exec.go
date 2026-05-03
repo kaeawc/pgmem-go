@@ -73,6 +73,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildInsert(p, env)
 	case *ir.Delete:
 		return buildDelete(p, env)
+	case *ir.Update:
+		return buildUpdate(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -471,6 +473,9 @@ func CommandTag(op Operator) (string, bool) {
 	}
 	if d, ok := op.(*deleteOp); ok {
 		return d.tag(), true
+	}
+	if u, ok := op.(*updateOp); ok {
+		return u.tag(), true
 	}
 	return "", false
 }
@@ -871,6 +876,200 @@ func (d *deleteOp) matches(row storage.Row) (bool, error) {
 }
 
 func (d *deleteOp) tag() string { return fmt.Sprintf("DELETE %d", d.deleted) }
+
+// --- Update ---
+
+func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
+	ct, ok := env.Schema.Table(p.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: unknown table %q", p.Table)
+	}
+	st, ok := env.Txn.Table(p.Table)
+	if !ok {
+		return nil, fmt.Errorf("exec: storage missing table %q", p.Table)
+	}
+	tableSchema := make([]Column, len(ct.Columns))
+	for i, c := range ct.Columns {
+		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
+	}
+	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, params: env.Params}
+
+	op.assigns = make([]resolvedAssign, len(p.Assignments))
+	for i, a := range p.Assignments {
+		colIdx := -1
+		for j, c := range ct.Columns {
+			if c.Name == a.Column {
+				colIdx = j
+				break
+			}
+		}
+		if colIdx < 0 {
+			return nil, fmt.Errorf("exec: update %q: unknown column %q", p.Table, a.Column)
+		}
+		expr, err := resolveExpr(a.Expr, tableSchema, env.Params)
+		if err != nil {
+			return nil, err
+		}
+		op.assigns[i] = resolvedAssign{colIdx: colIdx, expr: expr}
+	}
+
+	if p.Where != nil {
+		cond, err := resolveExpr(p.Where, tableSchema, env.Params)
+		if err != nil {
+			return nil, err
+		}
+		op.where = cond
+	}
+
+	if len(p.Returning) > 0 {
+		op.returning = make([]ir.Expr, len(p.Returning))
+		op.returningCols = make([]Column, len(p.Returning))
+		for k, e := range p.Returning {
+			r, err := resolveExpr(e, tableSchema, env.Params)
+			if err != nil {
+				return nil, err
+			}
+			op.returning[k] = r
+			name := ""
+			if k < len(p.ReturningNames) {
+				name = p.ReturningNames[k]
+			}
+			op.returningCols[k] = Column{Name: name, Type: r.Type()}
+		}
+	}
+	return op, nil
+}
+
+type resolvedAssign struct {
+	colIdx int
+	expr   ir.Expr
+}
+
+type updateOp struct {
+	table       storage.Table
+	ct          catalog.Table
+	tableSchema []Column
+	assigns     []resolvedAssign
+	where       ir.Expr
+	params      []Param
+
+	done    bool
+	updated int
+
+	returning     []ir.Expr
+	returningCols []Column
+	pending       []Row
+	pendingPos    int
+}
+
+func (u *updateOp) OutputSchema() []Column { return u.returningCols }
+func (u *updateOp) Close() error           { return nil }
+
+func (u *updateOp) Next(_ context.Context) (Row, error) {
+	if !u.done {
+		if err := u.runOnce(); err != nil {
+			return nil, err
+		}
+	}
+	if u.pendingPos < len(u.pending) {
+		r := u.pending[u.pendingPos]
+		u.pendingPos++
+		return r, nil
+	}
+	return nil, io.EOF
+}
+
+func (u *updateOp) runOnce() error {
+	u.done = true
+	var (
+		evalErr     error
+		updatedRows []storage.Row // freshly-updated rows (for RETURNING)
+	)
+	u.table.Mutate(func(rows []storage.Row) []storage.Row {
+		next := make([]storage.Row, len(rows))
+		for i, row := range rows {
+			match, err := u.matches(row)
+			if err != nil {
+				evalErr = err
+				return rows
+			}
+			if !match {
+				next[i] = row
+				continue
+			}
+			updated, err := u.applyAssignments(row)
+			if err != nil {
+				evalErr = err
+				return rows
+			}
+			if err := checkNotNull(u.ct, updated); err != nil {
+				evalErr = err
+				return rows
+			}
+			next[i] = updated
+			updatedRows = append(updatedRows, updated)
+		}
+		// Validate the post-update table as a whole: UNIQUE across all
+		// rows (existing+updated), CHECK against the new rows.
+		if err := checkUnique(u.ct, nil, next); err != nil {
+			evalErr = err
+			return rows
+		}
+		if err := checkChecks(u.ct, updatedRows, u.params); err != nil {
+			evalErr = err
+			return rows
+		}
+		return next
+	})
+	if evalErr != nil {
+		return evalErr
+	}
+	u.updated = len(updatedRows)
+	if len(u.returning) > 0 {
+		u.pending = make([]Row, len(updatedRows))
+		for i, row := range updatedRows {
+			out := make(Row, len(u.returning))
+			for j, e := range u.returning {
+				v, err := evalExpr(e, Row(row), u.params)
+				if err != nil {
+					return err
+				}
+				out[j] = v
+			}
+			u.pending[i] = out
+		}
+	}
+	return nil
+}
+
+func (u *updateOp) matches(row storage.Row) (bool, error) {
+	if u.where == nil {
+		return true, nil
+	}
+	v, err := evalExpr(u.where, Row(row), u.params)
+	if err != nil {
+		return false, err
+	}
+	b, ok := v.(bool)
+	return ok && b, nil
+}
+
+// applyAssignments returns a new row with each assignment evaluated
+// against the *original* row. PG semantics: assignments don't see each
+// other's effects within the same UPDATE.
+func (u *updateOp) applyAssignments(orig storage.Row) (storage.Row, error) {
+	out := append(storage.Row(nil), orig...)
+	for _, a := range u.assigns {
+		v, err := evalExpr(a.expr, Row(orig), u.params)
+		if err != nil {
+			return nil, err
+		}
+		out[a.colIdx] = v
+	}
+	return out, nil
+}
+
+func (u *updateOp) tag() string { return fmt.Sprintf("UPDATE %d", u.updated) }
 
 // --- helpers ---
 

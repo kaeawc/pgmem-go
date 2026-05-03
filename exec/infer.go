@@ -96,6 +96,25 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 		for _, e := range p.Returning {
 			walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
 		}
+	case *ir.Update:
+		ct, ok := sch.Table(p.Table)
+		var colTypes map[string]types.Type
+		if ok {
+			colTypes = make(map[string]types.Type, len(ct.Columns))
+			for _, c := range ct.Columns {
+				colTypes[c.Name] = c.Type
+			}
+		}
+		for _, a := range p.Assignments {
+			// `col = $N` constrains $N to col's type.
+			walkExprParams(a.Expr, colTypes[a.Column], sch, p.Table, hint, maxIdx)
+		}
+		if p.Where != nil {
+			walkExprParams(p.Where, nil, sch, p.Table, hint, maxIdx)
+		}
+		for _, e := range p.Returning {
+			walkExprParams(e, nil, sch, p.Table, hint, maxIdx)
+		}
 	case *ir.Values:
 		for _, row := range p.Rows {
 			for _, e := range row {

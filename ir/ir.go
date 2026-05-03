@@ -94,6 +94,27 @@ type ColumnDef struct {
 	Check Expr
 }
 
+// Assignment is one `column = expr` clause in an UPDATE's SET list.
+type Assignment struct {
+	Column string
+	Expr   Expr
+}
+
+// Update modifies matching rows of the named table. Each Assignment's
+// expression is evaluated against the row's pre-update values
+// (matching real PG: assignments don't see each other's effects within
+// the same UPDATE). RETURNING expressions, in contrast, see the
+// post-update row.
+type Update struct {
+	Table          string
+	Assignments    []Assignment
+	Where          Expr
+	Returning      []Expr
+	ReturningNames []string
+}
+
+func (*Update) node() {}
+
 // Delete removes rows from the named table that match Where. Where may
 // be nil, in which case every row is deleted. Returning, when set,
 // emits one row per deleted row, evaluated against the row's pre-
