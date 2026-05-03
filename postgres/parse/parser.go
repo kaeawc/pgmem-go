@@ -61,9 +61,10 @@ func (p *parser) parseStmt() (ir.Node, error) {
 	}
 }
 
-// parseFromClause reads `FROM a [INNER] JOIN b ON cond [JOIN ...]`
-// and produces a left-deep IR tree. We don't model commas in FROM yet
-// — JOINs only.
+// parseFromClause reads `FROM a [<type>] JOIN b [ON cond] [JOIN ...]`
+// and produces a left-deep IR tree. JOIN type prefixes recognized:
+// (none) / INNER / LEFT [OUTER] / CROSS. We don't model commas in FROM
+// yet — JOINs only.
 func (p *parser) parseFromClause() (ir.Node, error) {
 	left, err := p.parseTableRef()
 	if err != nil {
@@ -73,24 +74,52 @@ func (p *parser) parseFromClause() (ir.Node, error) {
 		if !p.peekIsJoin() {
 			return left, nil
 		}
-		// Optional INNER prefix; absent means INNER JOIN by default.
-		p.accept(kwInner)
-		if !p.accept(kwJoin) {
-			return nil, fmt.Errorf("parse: expected JOIN at %d", p.peek().pos)
-		}
-		right, err := p.parseTableRef()
+		j, err := p.parseJoinSuffix(left)
 		if err != nil {
 			return nil, err
 		}
+		left = j
+	}
+}
+
+// parseJoinSuffix consumes one `[<type>] JOIN b [ON cond]` clause and
+// returns the join node sitting on top of the previous left side.
+func (p *parser) parseJoinSuffix(left ir.Node) (ir.Node, error) {
+	joinType := ir.JoinInner
+	switch {
+	case p.accept(kwInner):
+		joinType = ir.JoinInner
+	case p.accept(kwLeft):
+		p.accept(kwOuter) // optional, no behavioural difference
+		joinType = ir.JoinLeft
+	case p.accept(kwCross):
+		joinType = ir.JoinCross
+	}
+	if !p.accept(kwJoin) {
+		return nil, fmt.Errorf("parse: expected JOIN at %d", p.peek().pos)
+	}
+	right, err := p.parseTableRef()
+	if err != nil {
+		return nil, err
+	}
+	var cond ir.Expr
+	if joinType == ir.JoinCross {
+		// CROSS JOIN forbids ON in standard SQL. Anything else is a parse
+		// error here so users don't accidentally write a partial CROSS
+		// JOIN with a condition we'd silently ignore.
+		if p.peek().kind == kwOn {
+			return nil, fmt.Errorf("parse: CROSS JOIN may not have ON clause (pos %d)", p.peek().pos)
+		}
+	} else {
 		if _, err := p.expect(kwOn, "ON"); err != nil {
 			return nil, err
 		}
-		cond, err := p.parseExpr()
+		cond, err = p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		left = &ir.Join{Left: left, Right: right, Cond: cond, Type: ir.JoinInner}
 	}
+	return &ir.Join{Left: left, Right: right, Cond: cond, Type: joinType}, nil
 }
 
 func (p *parser) parseTableRef() (ir.Node, error) {
@@ -101,11 +130,11 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	return &ir.Scan{Table: t.val}, nil
 }
 
-// peekIsJoin reports whether the next token starts a JOIN clause.
-// Both `JOIN` and `INNER JOIN` are recognized as the start.
+// peekIsJoin reports whether the next token starts a JOIN clause —
+// either `JOIN` directly or one of the prefix keywords.
 func (p *parser) peekIsJoin() bool {
 	switch p.peek().kind {
-	case kwJoin, kwInner:
+	case kwJoin, kwInner, kwLeft, kwCross:
 		return true
 	default:
 		return false
