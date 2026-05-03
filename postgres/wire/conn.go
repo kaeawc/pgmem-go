@@ -50,7 +50,7 @@ func handleConn(ctx context.Context, c net.Conn, deps Deps) error {
 	if err := cn.doStartup(); err != nil {
 		return err
 	}
-	if err := cn.writeReady('I'); err != nil {
+	if err := cn.writeReady(); err != nil {
 		return err
 	}
 	return cn.queryLoop(ctx)
@@ -142,7 +142,7 @@ func (c *conn) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) error
 	case *pgproto3.Execute:
 		return c.handleExecute(ctx, m)
 	case *pgproto3.Sync:
-		return c.writeReady('I')
+		return c.writeReady()
 	case *pgproto3.Flush:
 		return c.be.Flush()
 	case *pgproto3.Terminate:
@@ -190,18 +190,18 @@ func (c *conn) handleSimpleQuery(ctx context.Context, sql string) error {
 		if err := c.sendError("0A000", err.Error()); err != nil {
 			return err
 		}
-		return c.writeReady('I')
+		return c.writeReady()
 	}
 	if stmt.noop {
 		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(stmt.tag)})
-		return c.writeReady('I')
+		return c.writeReady()
 	}
 	if err := c.runQuery(ctx, stmt, 0 /* text */, true /* send RowDescription */, nil); err != nil {
 		if err := c.sendError("XX000", err.Error()); err != nil {
 			return err
 		}
 	}
-	return c.writeReady('I')
+	return c.writeReady()
 }
 
 func (c *conn) handleParse(m *pgproto3.Parse) error {
@@ -259,15 +259,15 @@ func decodeParams(declared []types.Type, formats []int16, raw [][]byte) ([]exec.
 	out := make([]exec.Param, len(raw))
 	for i, b := range raw {
 		fmtCode := formatFor(formats, i)
-		t, err := paramType(declared, i)
-		if err != nil {
-			return nil, err
-		}
+		t := paramType(declared, i)
 		if b == nil {
 			out[i] = exec.Param{Type: t, Value: nil}
 			continue
 		}
-		var v any
+		var (
+			v   any
+			err error
+		)
 		if fmtCode == 1 {
 			v, err = t.DecodeBinary(b)
 		} else {
@@ -292,13 +292,13 @@ func formatFor(codes []int16, i int) int16 {
 	}
 }
 
-func paramType(declared []types.Type, i int) (types.Type, error) {
+func paramType(declared []types.Type, i int) types.Type {
 	if i < len(declared) && declared[i] != nil {
-		return declared[i], nil
+		return declared[i]
 	}
 	// pgx normally sends OIDs in Parse; if it didn't, default to text and
 	// hope for the best. M5 widens this with type inference.
-	return types.Text, nil
+	return types.Text
 }
 
 func pickResultFormat(codes []int16) int16 {
@@ -361,7 +361,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, format int16, sendR
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 
 	op, err := exec.Build(stmt.plan, &exec.Env{
 		Schema: c.deps.Schema,
@@ -425,7 +425,7 @@ func (c *conn) rowDescriptionFor(stmt *prepared) (*pgproto3.RowDescription, erro
 	if err != nil {
 		return nil, err
 	}
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 	// Build with empty params just to learn the output schema. Real
 	// param values aren't bound yet at Describe('S') time.
 	op, err := exec.Build(stmt.plan, &exec.Env{
@@ -501,8 +501,11 @@ func encodeDataRow(r exec.Row, cols []exec.Column, format int16) (*pgproto3.Data
 
 // --- shared helpers ---
 
-func (c *conn) writeReady(txStatus byte) error {
-	c.be.Send(&pgproto3.ReadyForQuery{TxStatus: txStatus})
+// writeReady emits ReadyForQuery. The TxStatus byte is hard-coded to
+// 'I' (idle, no transaction) until M3 introduces real transactions —
+// at which point this regrows a status parameter.
+func (c *conn) writeReady() error {
+	c.be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
 	return c.be.Flush()
 }
 

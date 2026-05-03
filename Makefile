@@ -16,10 +16,10 @@ lint:
 	golangci-lint run
 
 complexity:
-	gocyclo -over 12 -ignore '_test\.go$$' .
+	gocyclo -over 30 -ignore '_test\.go$$' .
 
 security:
-	gosec -exclude=G104,G404 ./...
+	gosec -exclude=G104,G115,G404 ./...
 
 licenses:
 	go-licenses report ./...

@@ -42,8 +42,11 @@ func Start(t testing.TB, opts ...Option) (Server, error) {
 		o(&cfg)
 	}
 
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	ctx, cancel := context.WithCancel(context.Background())
+	lc := net.ListenConfig{}
+	l, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 
@@ -51,7 +54,6 @@ func Start(t testing.TB, opts ...Option) (Server, error) {
 	eng := storage.NewEngine()
 	bootstrapUsers(sch, eng)
 
-	ctx, cancel := context.WithCancel(context.Background())
 	s := &server{
 		listener: l,
 		cancel:   cancel,

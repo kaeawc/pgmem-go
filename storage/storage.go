@@ -71,9 +71,9 @@ func (e *engine) CreateTable(name string, columnCount int) Table {
 
 type txn struct{ e *engine }
 
-func (t *txn) Commit() error                     { return nil }
-func (t *txn) Rollback() error                   { return nil }
-func (t *txn) Table(name string) (Table, bool)   { return t.e.Table(name) }
+func (t *txn) Commit() error                   { return nil }
+func (t *txn) Rollback() error                 { return nil }
+func (t *txn) Table(name string) (Table, bool) { return t.e.Table(name) }
 
 type table struct {
 	mu    sync.RWMutex

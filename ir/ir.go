@@ -116,7 +116,7 @@ type Literal struct {
 	T     types.Type
 }
 
-func (*Literal) expr()             {}
+func (*Literal) expr()              {}
 func (l *Literal) Type() types.Type { return l.T }
 
 // ColumnRef refers to a column in the input row by zero-based index.
@@ -131,7 +131,7 @@ type ColumnRef struct {
 	T     types.Type
 }
 
-func (*ColumnRef) expr()             {}
+func (*ColumnRef) expr()              {}
 func (c *ColumnRef) Type() types.Type { return c.T }
 
 // ParamRef is a $N placeholder. Index is zero-based ($1 → 0). The type
@@ -142,7 +142,7 @@ type ParamRef struct {
 	T     types.Type
 }
 
-func (*ParamRef) expr()             {}
+func (*ParamRef) expr()              {}
 func (p *ParamRef) Type() types.Type { return p.T }
 
 // BinOp is a binary operator on two expressions. Op is the SQL token
@@ -154,7 +154,7 @@ type BinOp struct {
 	T     types.Type
 }
 
-func (*BinOp) expr()             {}
+func (*BinOp) expr()              {}
 func (b *BinOp) Type() types.Type { return b.T }
 
 // UnaryOp covers NOT and (eventually) unary minus.
@@ -164,5 +164,5 @@ type UnaryOp struct {
 	T    types.Type
 }
 
-func (*UnaryOp) expr()             {}
+func (*UnaryOp) expr()              {}
 func (u *UnaryOp) Type() types.Type { return u.T }

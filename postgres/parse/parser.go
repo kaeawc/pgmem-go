@@ -24,11 +24,12 @@ func (p *parser) consume() token {
 	return t
 }
 
-func (p *parser) accept(k tokenKind) (token, bool) {
+func (p *parser) accept(k tokenKind) bool {
 	if p.peek().kind == k {
-		return p.consume(), true
+		p.pos++
+		return true
 	}
-	return token{}, false
+	return false
 }
 
 func (p *parser) expect(k tokenKind, ctx string) (token, error) {
@@ -77,7 +78,7 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 			return nil, err
 		}
 		cols = append(cols, col)
-		if _, ok := p.accept(tComma); ok {
+		if p.accept(tComma) {
 			continue
 		}
 		break
@@ -98,7 +99,7 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 		return ir.ColumnDef{}, err
 	}
 	// VARCHAR(N): consume and discard the length.
-	if _, ok := p.accept(tLParen); ok {
+	if p.accept(tLParen) {
 		if _, err := p.expect(tNumber, "type length"); err != nil {
 			return ir.ColumnDef{}, err
 		}
@@ -111,12 +112,12 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 		return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", typeName.val)
 	}
 	notNull := false
-	if _, ok := p.accept(kwNot); ok {
+	if p.accept(kwNot) {
 		if _, err := p.expect(kwNull, "NULL"); err != nil {
 			return ir.ColumnDef{}, err
 		}
 		notNull = true
-	} else if _, ok := p.accept(kwNull); ok {
+	} else if p.accept(kwNull) {
 		notNull = false
 	}
 	return ir.ColumnDef{Name: name.val, Type: t, NotNull: notNull}, nil
@@ -134,14 +135,14 @@ func (p *parser) parseInsert() (ir.Node, error) {
 		return nil, err
 	}
 	stmt := &ir.Insert{Table: name.val}
-	if _, ok := p.accept(tLParen); ok {
+	if p.accept(tLParen) {
 		for {
 			col, err := p.expect(tIdent, "column name")
 			if err != nil {
 				return nil, err
 			}
 			stmt.Columns = append(stmt.Columns, col.val)
-			if _, ok := p.accept(tComma); ok {
+			if p.accept(tComma) {
 				continue
 			}
 			break
@@ -159,7 +160,7 @@ func (p *parser) parseInsert() (ir.Node, error) {
 			return nil, err
 		}
 		stmt.Rows = append(stmt.Rows, row)
-		if _, ok := p.accept(tComma); ok {
+		if p.accept(tComma) {
 			continue
 		}
 		break
@@ -178,7 +179,7 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 			return nil, err
 		}
 		out = append(out, e)
-		if _, ok := p.accept(tComma); ok {
+		if p.accept(tComma) {
 			continue
 		}
 		break
@@ -199,14 +200,14 @@ func (p *parser) parseSelect() (ir.Node, error) {
 	}
 
 	var input ir.Node = &ir.Values{Rows: [][]ir.Expr{{}}}
-	if _, ok := p.accept(kwFrom); ok {
+	if p.accept(kwFrom) {
 		t, err := p.expect(tIdent, "table name")
 		if err != nil {
 			return nil, err
 		}
 		input = &ir.Scan{Table: t.val}
 	}
-	if _, ok := p.accept(kwWhere); ok {
+	if p.accept(kwWhere) {
 		cond, err := p.parseExpr()
 		if err != nil {
 			return nil, err
@@ -216,7 +217,7 @@ func (p *parser) parseSelect() (ir.Node, error) {
 
 	plan := ir.Node(&ir.Project{Input: input, Exprs: exprs, OutputNames: names})
 
-	if _, ok := p.accept(kwOrder); ok {
+	if p.accept(kwOrder) {
 		if _, err := p.expect(kwBy, "BY"); err != nil {
 			return nil, err
 		}
@@ -247,7 +248,7 @@ func (p *parser) parseSelectList() ([]ir.Expr, []string, error) {
 		}
 		exprs = append(exprs, e)
 		names = append(names, name)
-		if _, ok := p.accept(tComma); ok {
+		if p.accept(tComma) {
 			continue
 		}
 		break
@@ -261,7 +262,7 @@ func (p *parser) parseSelectItem() (ir.Expr, string, error) {
 		return nil, "", err
 	}
 	name := defaultColName(e)
-	if _, ok := p.accept(kwAs); ok {
+	if p.accept(kwAs) {
 		t, err := p.expect(tIdent, "alias")
 		if err != nil {
 			return nil, "", err
@@ -290,13 +291,13 @@ func (p *parser) parseSortKeys() ([]ir.SortKey, error) {
 			return nil, err
 		}
 		desc := false
-		if _, ok := p.accept(kwDesc); ok {
+		if p.accept(kwDesc) {
 			desc = true
-		} else if _, ok := p.accept(kwAsc); ok {
+		} else if p.accept(kwAsc) {
 			desc = false
 		}
 		out = append(out, ir.SortKey{Expr: e, Desc: desc})
-		if _, ok := p.accept(tComma); ok {
+		if p.accept(tComma) {
 			continue
 		}
 		break
@@ -329,4 +330,3 @@ func (p *parser) parseLimitOffset(plan ir.Node) (ir.Node, error) {
 	}
 	return &ir.Limit{Input: plan, Count: count, Offset: offset}, nil
 }
-

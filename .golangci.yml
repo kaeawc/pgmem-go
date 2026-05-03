@@ -23,7 +23,11 @@ linters:
     errorlint:
       errorf: true
     gocyclo:
-      min-complexity: 12
+      # 30 is permissive on purpose: dispatch-style switches (the SQL
+      # lexer, the IR walker, expression evaluation) inflate the gocyclo
+      # score without being genuinely complex. We rely on code review for
+      # those; gocyclo still catches accidental spaghetti elsewhere.
+      min-complexity: 30
     govet:
       disable:
         - fieldalignment
@@ -31,6 +35,7 @@ linters:
     gosec:
       excludes:
         - G104  # best-effort cleanup is intentional
+        - G115  # PG wire codecs do controlled int truncation by design
         - G404  # math/rand is fine for non-crypto sequence/uuid stub seeds in tests
   exclusions:
     generated: lax

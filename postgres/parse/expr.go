@@ -54,7 +54,7 @@ func (p *parser) parseAnd() (ir.Expr, error) {
 }
 
 func (p *parser) parseNot() (ir.Expr, error) {
-	if _, ok := p.accept(kwNot); ok {
+	if p.accept(kwNot) {
 		inner, err := p.parseNot()
 		if err != nil {
 			return nil, err
