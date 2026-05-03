@@ -244,6 +244,13 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 		walkExprParams(x.Right, lt, sch, scopeTable, hint, maxIdx)
 	case *ir.UnaryOp:
 		walkExprParams(x.Expr, expected, sch, scopeTable, hint, maxIdx)
+	case *ir.FuncCall:
+		// We don't know the arg types of an arbitrary builtin from here,
+		// so descend without an `expected` hint. Specific functions can
+		// constrain types via dedicated cases when that matters.
+		for _, a := range x.Args {
+			walkExprParams(a, nil, sch, scopeTable, hint, maxIdx)
+		}
 	case *ir.Literal, nil:
 		// nothing to record.
 	case *ir.ColumnRef:

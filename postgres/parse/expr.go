@@ -128,10 +128,14 @@ func (p *parser) parsePrimary() (ir.Expr, error) {
 		return &ir.ParamRef{Index: idx - 1}, nil
 	case tIdent:
 		p.consume()
-		// `ident.ident` is a qualified column reference. We commit to it
-		// only after we've confirmed the dot — bare identifiers stay as
-		// unqualified column refs.
-		if p.peek().kind == tDot {
+		// `ident(args)` is a function call. `ident.ident` is a qualified
+		// column reference. Bare identifiers stay as unqualified column
+		// refs. We commit to each shape only after the disambiguating
+		// token shows up.
+		switch p.peek().kind {
+		case tLParen:
+			return p.parseFuncCall(t.val)
+		case tDot:
 			p.consume() // .
 			col, err := p.expect(tIdent, "qualified column name")
 			if err != nil {
@@ -155,6 +159,32 @@ func (p *parser) parseParenExpr() (ir.Expr, error) {
 		return nil, err
 	}
 	return e, nil
+}
+
+// parseFuncCall consumes `(arg [, arg ...])`. Empty arg list is fine.
+// The function name has already been consumed by the caller.
+func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	var args []ir.Expr
+	if p.peek().kind != tRParen {
+		for {
+			a, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, a)
+			if p.accept(tComma) {
+				continue
+			}
+			break
+		}
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &ir.FuncCall{Name: name, Args: args}, nil
 }
 
 // parseNumberLiteral picks int4 if the value fits, otherwise int8.

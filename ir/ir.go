@@ -248,3 +248,16 @@ type UnaryOp struct {
 
 func (*UnaryOp) expr()              {}
 func (u *UnaryOp) Type() types.Type { return u.T }
+
+// FuncCall is a builtin function invocation (now(), gen_random_uuid(),
+// coalesce(), …). Name is lower-cased by the parser. Type is filled in
+// at exec.Build time from the function registry — the parser doesn't
+// know what each builtin returns.
+type FuncCall struct {
+	Name string
+	Args []Expr
+	T    types.Type
+}
+
+func (*FuncCall) expr()              {}
+func (f *FuncCall) Type() types.Type { return f.T }
