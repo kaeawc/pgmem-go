@@ -52,11 +52,61 @@ func (p *parser) parseStmt() (ir.Node, error) {
 		return p.parseInsert()
 	case kwDelete:
 		return p.parseDelete()
+	case kwUpdate:
+		return p.parseUpdate()
 	case kwCreate:
 		return p.parseCreateTable()
 	default:
 		return nil, fmt.Errorf("parse: unsupported leading token %q", tok.val)
 	}
+}
+
+// --- UPDATE ---
+
+func (p *parser) parseUpdate() (ir.Node, error) {
+	p.consume() // UPDATE
+	name, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	stmt := &ir.Update{Table: name.val}
+	if _, err := p.expect(kwSet, "SET"); err != nil {
+		return nil, err
+	}
+	for {
+		col, err := p.expect(tIdent, "column name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tEq, "="); err != nil {
+			return nil, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Assignments = append(stmt.Assignments, ir.Assignment{Column: col.val, Expr: e})
+		if p.accept(tComma) {
+			continue
+		}
+		break
+	}
+	if p.accept(kwWhere) {
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Where = cond
+	}
+	if p.accept(kwReturning) {
+		exprs, names, err := p.parseSelectList()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Returning = exprs
+		stmt.ReturningNames = names
+	}
+	return stmt, nil
 }
 
 // --- DELETE ---

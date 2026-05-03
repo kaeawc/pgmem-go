@@ -58,6 +58,8 @@ const (
 	kwUnique
 	kwCheck
 	kwDelete
+	kwUpdate
+	kwSet
 )
 
 type token struct {
@@ -95,6 +97,8 @@ var keywords = map[string]tokenKind{
 	"unique":    kwUnique,
 	"check":     kwCheck,
 	"delete":    kwDelete,
+	"update":    kwUpdate,
+	"set":       kwSet,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
