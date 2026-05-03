@@ -111,6 +111,12 @@ type ColumnDef struct {
 	Type    types.Type
 	NotNull bool
 	Unique  bool // PRIMARY KEY sets both NotNull and Unique
+	// Auto means the column is filled by the engine when an INSERT
+	// doesn't supply a value (SERIAL / BIGSERIAL). Real PG implements
+	// this via a separate sequence object and a DEFAULT nextval(...);
+	// we condense it to a single boolean since we don't model
+	// sequences as first-class catalog objects yet.
+	Auto bool
 	// Check is the optional CHECK (expr) constraint attached to the
 	// column. Real PG allows the expression to reference *other* columns
 	// of the same row; we follow that, with the executor resolving

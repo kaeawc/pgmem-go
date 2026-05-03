@@ -269,11 +269,21 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 			return ir.ColumnDef{}, err
 		}
 	}
-	t, ok := types.ByName(typeName.val)
-	if !ok {
-		return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", typeName.val)
+	def := ir.ColumnDef{Name: name.val}
+	if t, auto, ok := resolveSerial(typeName.val); ok {
+		// SERIAL / BIGSERIAL: Postgres desugars these to (int4|int8) +
+		// NOT NULL + DEFAULT nextval(...). We squash that into Auto +
+		// NotNull on the catalog column.
+		def.Type = t
+		def.Auto = auto
+		def.NotNull = true
+	} else {
+		t, ok := types.ByName(typeName.val)
+		if !ok {
+			return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", typeName.val)
+		}
+		def.Type = t
 	}
-	def := ir.ColumnDef{Name: name.val, Type: t}
 	for {
 		done, err := p.parseColumnConstraint(&def)
 		if err != nil {
@@ -282,6 +292,20 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 		if done {
 			return def, nil
 		}
+	}
+}
+
+// resolveSerial recognizes the SERIAL / BIGSERIAL pseudo-types and
+// returns the underlying integer type plus the Auto flag so the
+// caller can flatten them into a regular ColumnDef.
+func resolveSerial(name string) (types.Type, bool, bool) {
+	switch name {
+	case "serial":
+		return types.Int4, true, true
+	case "bigserial":
+		return types.Int8, true, true
+	default:
+		return nil, false, false
 	}
 }
 
