@@ -12,6 +12,7 @@ import (
 	"github.com/kaeawc/pgmem-go/exec"
 	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/postgres/parse"
+	"github.com/kaeawc/pgmem-go/storage"
 	"github.com/kaeawc/pgmem-go/types"
 )
 
@@ -24,18 +25,39 @@ type conn struct {
 
 	// Prepared statements and portals. M2 keeps a single anonymous
 	// statement and portal — pgx names them, but for the unparameter-
-	// ized queries we recognize there is no observable difference. M3
-	// turns these into real maps when transactions arrive.
+	// ized queries we recognize there is no observable difference.
 	stmt   *prepared
 	portal *portal
+
+	// Conn-scoped transaction state. currentTxn is non-nil when the
+	// client is inside an explicit BEGIN block; statements while it's
+	// set reuse the same txn rather than creating per-statement ones.
+	// txState is the byte we emit in ReadyForQuery: 'I' (idle), 'T' (in
+	// transaction), 'E' (in failed transaction). pgx uses it to decide
+	// whether to issue ROLLBACK on its own.
+	currentTxn storage.Txn
+	txState    byte
 }
+
+// txAction tags the three transaction-control statements. They look
+// like ordinary statements over the wire but bypass the parser/exec
+// pipeline entirely — they only manipulate conn-scoped state.
+type txAction int
+
+const (
+	txNone txAction = iota
+	txBegin
+	txCommit
+	txRollback
+)
 
 type prepared struct {
 	plan       ir.Node
 	tag        string
 	paramOIDs  []uint32 // from Parse
 	paramTypes []types.Type
-	noop       bool // true for SET and other ignored statements
+	noop       bool     // true for SET and other ignored statements
+	txAction   txAction // non-zero for BEGIN/COMMIT/ROLLBACK
 }
 
 type portal struct {
@@ -49,7 +71,7 @@ type portal struct {
 }
 
 func handleConn(ctx context.Context, c net.Conn, deps Deps) error {
-	cn := &conn{be: pgproto3.NewBackend(c, c), tc: c, deps: deps}
+	cn := &conn{be: pgproto3.NewBackend(c, c), tc: c, deps: deps, txState: 'I'}
 
 	if err := cn.doStartup(); err != nil {
 		return err
@@ -161,10 +183,15 @@ func (c *conn) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) error
 
 // --- statement handling ---
 
-// classify turns SQL into something we can run. Statements pgx issues
-// for connection setup that we don't model (SET, BEGIN, COMMIT) become
-// recognized no-ops so client startup doesn't blow up.
+// classify turns SQL into something we can run. Recognition order:
+//  1. Transaction control (BEGIN / COMMIT / ROLLBACK) — handled at the
+//     wire layer because they manipulate conn state, not table state.
+//  2. SET and friends — silent no-ops so client startup doesn't blow up.
+//  3. Anything else — handed to the SQL parser.
 func (c *conn) classify(sql string) (*prepared, error) {
+	if action, tag := classifyTx(sql); action != txNone {
+		return &prepared{txAction: action, tag: tag}, nil
+	}
 	if isClientNoop(sql) {
 		return &prepared{noop: true, tag: noopTag(sql)}, nil
 	}
@@ -196,16 +223,93 @@ func (c *conn) handleSimpleQuery(ctx context.Context, sql string) error {
 		}
 		return c.writeReady()
 	}
-	if stmt.noop {
-		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(stmt.tag)})
-		return c.writeReady()
-	}
-	if err := c.runQuery(ctx, stmt, nil /* all text */, true /* send RowDescription */, nil); err != nil {
+	if err := c.runStatement(ctx, stmt, nil /* all text */, true /* send RowDescription */, nil); err != nil {
 		if err := c.sendErrorFor(err); err != nil {
 			return err
 		}
 	}
 	return c.writeReady()
+}
+
+// runStatement is the dispatch that branches on what `classify`
+// produced: transaction control, ack-only no-op, or a real query.
+func (c *conn) runStatement(ctx context.Context, stmt *prepared, formats []int16, sendRowDesc bool, params []exec.Param) error {
+	switch {
+	case stmt.txAction != txNone:
+		return c.handleTxAction(ctx, stmt)
+	case stmt.noop:
+		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(stmt.tag)})
+		return nil
+	}
+	// "Current transaction is aborted" — once a statement inside an
+	// explicit BEGIN block fails, subsequent statements until ROLLBACK
+	// must error with 25P02. PG behavior; pgx relies on it.
+	if c.txState == 'E' {
+		return &exec.SQLError{Code: "25P02", Message: "current transaction is aborted, commands ignored until end of transaction block"}
+	}
+	return c.runQuery(ctx, stmt, formats, sendRowDesc, params)
+}
+
+func (c *conn) handleTxAction(ctx context.Context, stmt *prepared) error {
+	switch stmt.txAction {
+	case txBegin:
+		return c.beginTx(ctx, stmt.tag)
+	case txCommit:
+		return c.commitTx(stmt.tag)
+	case txRollback:
+		return c.rollbackTx(stmt.tag)
+	}
+	return nil
+}
+
+func (c *conn) beginTx(ctx context.Context, tag string) error {
+	if c.currentTxn != nil {
+		// Real PG emits a warning notice and continues; we just ack.
+		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+		return nil
+	}
+	t, err := c.deps.Engine.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	c.currentTxn = t
+	c.txState = 'T'
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
+}
+
+func (c *conn) commitTx(tag string) error {
+	if c.currentTxn == nil {
+		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+		return nil
+	}
+	// PG behavior: COMMIT after a failed statement acts like ROLLBACK.
+	if c.txState == 'E' {
+		_ = c.currentTxn.Rollback()
+		c.currentTxn = nil
+		c.txState = 'I'
+		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
+		return nil
+	}
+	if err := c.currentTxn.Commit(); err != nil {
+		c.currentTxn = nil
+		c.txState = 'I'
+		return err
+	}
+	c.currentTxn = nil
+	c.txState = 'I'
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
+}
+
+func (c *conn) rollbackTx(tag string) error {
+	if c.currentTxn != nil {
+		_ = c.currentTxn.Rollback()
+		c.currentTxn = nil
+	}
+	c.txState = 'I'
+	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag)})
+	return nil
 }
 
 func (c *conn) handleParse(m *pgproto3.Parse) error {
@@ -341,16 +445,12 @@ func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
 	if p == nil || p.stmt == nil {
 		return c.sendError("26000", "no portal bound")
 	}
-	if p.stmt.noop {
-		c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(p.stmt.tag)})
-		return nil
-	}
 	// In extended-query mode, an Execute failure must surface as
 	// ErrorResponse on the wire (pgx pattern-matches on it). Sync, sent
 	// by the client right after Execute, drives the ReadyForQuery that
 	// closes out the failed exchange — so we don't return the error,
 	// only its wire-level rendering.
-	if err := c.runQuery(ctx, p.stmt, p.resultFormats, false, p.params); err != nil {
+	if err := c.runStatement(ctx, p.stmt, p.resultFormats, false, p.params); err != nil {
 		return c.sendErrorFor(err)
 	}
 	return nil
@@ -361,12 +461,26 @@ func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
 // runQuery builds and drains the operator pipeline for a prepared
 // statement. The simple-query path asks us to emit RowDescription up
 // front; the extended path has already sent one in response to Describe.
+//
+// Transaction handling: if the connection is inside an explicit BEGIN
+// block we reuse that transaction; otherwise we start an implicit one
+// and commit on success / rollback on failure. The behaviour matches
+// PG's auto-commit mode for stand-alone statements.
 func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, sendRowDesc bool, params []exec.Param) error {
-	txn, err := c.deps.Engine.Begin(ctx)
+	txn, ownsTxn, err := c.acquireTxn(ctx)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return err
 	}
-	defer func() { _ = txn.Rollback() }()
+	commit := false
+	defer func() {
+		if ownsTxn {
+			if commit {
+				_ = txn.Commit()
+			} else {
+				_ = txn.Rollback()
+			}
+		}
+	}()
 
 	op, err := exec.Build(stmt.plan, &exec.Env{
 		Schema: c.deps.Schema,
@@ -375,6 +489,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 		Params: params,
 	})
 	if err != nil {
+		c.markTxFailedIfInBlock()
 		return err
 	}
 	defer op.Close()
@@ -395,6 +510,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 			break
 		}
 		if err != nil {
+			c.markTxFailedIfInBlock()
 			return err
 		}
 		if len(schema) == 0 {
@@ -403,13 +519,40 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 		}
 		dr, err := encodeDataRow(row, schema, formats)
 		if err != nil {
+			c.markTxFailedIfInBlock()
 			return err
 		}
 		c.be.Send(dr)
 		count++
 	}
 	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(commandTag(op, stmt.tag, count))})
+	commit = true
 	return nil
+}
+
+// markTxFailedIfInBlock flips the conn into the "transaction aborted"
+// state when a statement fails inside an explicit BEGIN block. Outside
+// such a block (auto-commit) failures don't poison anything; the
+// implicit txn is rolled back and we stay 'I'.
+func (c *conn) markTxFailedIfInBlock() {
+	if c.currentTxn != nil {
+		c.txState = 'E'
+	}
+}
+
+// acquireTxn returns the txn the current statement should run against.
+// Inside an explicit BEGIN block the conn-scoped txn is reused and
+// ownsTxn is false; otherwise we begin a fresh implicit txn and the
+// caller commits/rolls back per its outcome.
+func (c *conn) acquireTxn(ctx context.Context) (txn storage.Txn, ownsTxn bool, err error) {
+	if c.currentTxn != nil {
+		return c.currentTxn, false, nil
+	}
+	t, err := c.deps.Engine.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("begin: %w", err)
+	}
+	return t, true, nil
 }
 
 // commandTag picks the right CommandComplete payload. Side-effect
@@ -506,11 +649,15 @@ func encodeDataRow(r exec.Row, cols []exec.Column, formats []int16) (*pgproto3.D
 
 // --- shared helpers ---
 
-// writeReady emits ReadyForQuery. The TxStatus byte is hard-coded to
-// 'I' (idle, no transaction) until M3 introduces real transactions —
-// at which point this regrows a status parameter.
+// writeReady emits ReadyForQuery with the conn's current transaction
+// status. pgx pattern-matches on this byte to decide whether to issue
+// ROLLBACK / COMMIT on its own.
 func (c *conn) writeReady() error {
-	c.be.Send(&pgproto3.ReadyForQuery{TxStatus: 'I'})
+	state := c.txState
+	if state == 0 {
+		state = 'I'
+	}
+	c.be.Send(&pgproto3.ReadyForQuery{TxStatus: state})
 	return c.be.Flush()
 }
 

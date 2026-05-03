@@ -43,7 +43,7 @@ func updateFixture(t *testing.T) (catalog.Schema, storage.Engine) {
 func runUpdatePlan(t *testing.T, sch catalog.Schema, eng storage.Engine, plan *ir.Update) ([]exec.Row, error) {
 	t.Helper()
 	txn, _ := eng.Begin(context.Background())
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
 		return nil, err
@@ -53,7 +53,7 @@ func runUpdatePlan(t *testing.T, sch catalog.Schema, eng storage.Engine, plan *i
 	for {
 		row, err := op.Next(context.Background())
 		if errors.Is(err, io.EOF) {
-			return rows, nil
+			return rows, txn.Commit()
 		}
 		if err != nil {
 			return rows, err

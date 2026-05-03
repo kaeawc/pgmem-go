@@ -2,9 +2,18 @@
 // transaction overlay that gives us snapshot isolation without a
 // full MVCC implementation.
 //
-// See DESIGN.md §3 for the storage model. M1 ships only the trivial
-// shape (rows behind RWMutex, no transactions); the snapshot/COW
-// overlay lands with M3.
+// See DESIGN.md §3 for the storage model. Each transaction takes a
+// per-table snapshot on first access; writes go into that snapshot
+// only; Commit replaces the engine's canonical rows under the table
+// write lock.
+//
+// What we deliberately don't do (yet):
+//   - Concurrent-tx conflict detection. Two simultaneous transactions
+//     that touch the same table will both commit — last writer wins.
+//     Real PG SI rejects the second commit with a serialization error;
+//     a follow-up piece adds that.
+//   - Per-row version chains. Snapshots are whole-table copies; fine
+//     at the M3 row counts test suites use.
 package storage
 
 import (
@@ -23,9 +32,9 @@ type Engine interface {
 	CreateTable(name string, columnCount int) Table
 }
 
-// Txn is a transaction handle. The executor never sees a snapshot
-// directly — it goes through Txn. M1's implementation is a no-op
-// passthrough; real snapshot isolation arrives in M3.
+// Txn is a transaction handle. The executor only ever sees Tables
+// through Txn — the canonical engine state is reachable only via
+// Begin.
 type Txn interface {
 	Commit() error
 	Rollback() error
@@ -41,9 +50,7 @@ type Table interface {
 	Insert(r Row)
 	// Mutate atomically rewrites the table's row set. mutator receives a
 	// fresh copy of the current rows and returns the desired replacement.
-	// The caller's view of the rows is the only view in flight while
-	// mutator runs (table write lock held), so DELETE / UPDATE filters
-	// won't race against concurrent inserts on the same table.
+	// Inside a Txn this only mutates the per-tx snapshot; Commit applies.
 	Mutate(mutator func([]Row) []Row)
 }
 
@@ -55,7 +62,9 @@ type engine struct {
 	tables map[string]*table
 }
 
-func (e *engine) Begin(_ context.Context) (Txn, error) { return &txn{e: e}, nil }
+func (e *engine) Begin(_ context.Context) (Txn, error) {
+	return &txn{e: e, snapshots: map[string]*txnTable{}}, nil
+}
 
 func (e *engine) Table(name string) (Table, bool) {
 	e.mu.RLock()
@@ -75,11 +84,7 @@ func (e *engine) CreateTable(name string, columnCount int) Table {
 	return t
 }
 
-type txn struct{ e *engine }
-
-func (t *txn) Commit() error                   { return nil }
-func (t *txn) Rollback() error                 { return nil }
-func (t *txn) Table(name string) (Table, bool) { return t.e.Table(name) }
+// --- canonical (committed) table ---
 
 type table struct {
 	mu    sync.RWMutex
@@ -96,22 +101,147 @@ func (t *table) Insert(r Row) {
 	t.rows = append(t.rows, append(Row(nil), r...))
 }
 
-func (t *table) Rows() []Row {
+func (t *table) Rows() []Row { return copyRows(t.lockedRows()) }
+
+func (t *table) lockedRows() []Row {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	out := make([]Row, len(t.rows))
-	for i, r := range t.rows {
-		out[i] = append(Row(nil), r...)
-	}
-	return out
+	return t.rows
 }
 
 func (t *table) Mutate(mutator func([]Row) []Row) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	snapshot := make([]Row, len(t.rows))
-	for i, r := range t.rows {
-		snapshot[i] = append(Row(nil), r...)
+	t.rows = mutator(copyRows(t.rows))
+}
+
+// replaceLocked is used by Commit to overwrite canonical state from a
+// txn snapshot. The caller holds t.mu.
+func (t *table) replaceLocked(rows []Row) {
+	t.rows = rows
+}
+
+// --- transaction & per-tx snapshots ---
+
+type txn struct {
+	e         *engine
+	mu        sync.Mutex // guards snapshots and closed
+	snapshots map[string]*txnTable
+	closed    bool
+}
+
+func (t *txn) Table(name string) (Table, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil, false
 	}
-	t.rows = mutator(snapshot)
+	if cached, ok := t.snapshots[name]; ok {
+		return cached, true
+	}
+	t.e.mu.RLock()
+	canonical, ok := t.e.tables[name]
+	t.e.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	wrap := &txnTable{name: name, rows: copyRows(canonical.lockedRows())}
+	t.snapshots[name] = wrap
+	return wrap, true
+}
+
+// Commit applies dirty per-tx snapshots back to the engine. Tables we
+// only read (dirty == false) are skipped. We acquire each canonical
+// table's write lock in deterministic name order to avoid the trivial
+// deadlock of two txns committing two tables in opposite orders.
+func (t *txn) Commit() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	dirty := make([]*txnTable, 0, len(t.snapshots))
+	for _, snap := range t.snapshots {
+		if snap.dirty {
+			dirty = append(dirty, snap)
+		}
+	}
+	t.mu.Unlock()
+	sortByName(dirty)
+	for _, snap := range dirty {
+		t.e.mu.RLock()
+		canonical := t.e.tables[snap.name]
+		t.e.mu.RUnlock()
+		if canonical == nil {
+			continue // table was dropped between snapshot and commit
+		}
+		canonical.mu.Lock()
+		canonical.replaceLocked(copyRows(snap.rows))
+		canonical.mu.Unlock()
+	}
+	return nil
+}
+
+// Rollback drops the snapshot set. No engine state is touched because
+// no engine state was ever modified.
+func (t *txn) Rollback() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		return nil
+	}
+	t.closed = true
+	t.snapshots = nil
+	return nil
+}
+
+// --- txn-scoped table wrapper ---
+
+type txnTable struct {
+	mu    sync.Mutex // guards rows / dirty (a txn is single-conn but Mutate may capture)
+	name  string
+	rows  []Row
+	dirty bool
+}
+
+func (tt *txnTable) Name() string { return tt.name }
+
+func (tt *txnTable) Insert(r Row) {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	tt.rows = append(tt.rows, append(Row(nil), r...))
+	tt.dirty = true
+}
+
+func (tt *txnTable) Rows() []Row {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	return copyRows(tt.rows)
+}
+
+func (tt *txnTable) Mutate(mutator func([]Row) []Row) {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	tt.rows = mutator(copyRows(tt.rows))
+	tt.dirty = true
+}
+
+// --- helpers ---
+
+func copyRows(in []Row) []Row {
+	out := make([]Row, len(in))
+	for i, r := range in {
+		out[i] = append(Row(nil), r...)
+	}
+	return out
+}
+
+func sortByName(ts []*txnTable) {
+	// Tiny insertion sort — typical txns touch a handful of tables.
+	for i := 1; i < len(ts); i++ {
+		for j := i; j > 0 && ts[j-1].name > ts[j].name; j-- {
+			ts[j-1], ts[j] = ts[j], ts[j-1]
+		}
+	}
 }

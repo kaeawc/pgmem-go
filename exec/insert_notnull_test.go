@@ -111,7 +111,7 @@ func TestInsert_NotNull_AllowsNullableColumn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
@@ -121,6 +121,9 @@ func TestInsert_NotNull_AllowsNullableColumn(t *testing.T) {
 
 	if _, err := op.Next(context.Background()); err != nil && !errors.Is(err, io.EOF) {
 		t.Fatalf("Next: %v", err)
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
 	}
 
 	st, _ := eng.Table("notes")

@@ -38,7 +38,7 @@ func deleteFixture(t *testing.T) (catalog.Schema, storage.Engine) {
 func runPlan(t *testing.T, sch catalog.Schema, eng storage.Engine, plan ir.Node) ([]exec.Row, error) {
 	t.Helper()
 	txn, _ := eng.Begin(context.Background())
-	defer txn.Rollback()
+	defer func() { _ = txn.Rollback() }()
 	op, err := exec.Build(plan, &exec.Env{Schema: sch, Engine: eng, Txn: txn})
 	if err != nil {
 		return nil, err
@@ -48,7 +48,7 @@ func runPlan(t *testing.T, sch catalog.Schema, eng storage.Engine, plan ir.Node)
 	for {
 		row, err := op.Next(context.Background())
 		if errors.Is(err, io.EOF) {
-			return out, nil
+			return out, txn.Commit()
 		}
 		if err != nil {
 			return out, err
