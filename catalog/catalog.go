@@ -20,6 +20,16 @@ type Column struct {
 	NotNull bool
 	Unique  bool // PRIMARY KEY desugars to NotNull && Unique
 	Auto    bool // SERIAL / BIGSERIAL — engine fills missing inserts
+	// References, when set, names the parent table+column this column
+	// FK-references. Empty Table means no FK on this column.
+	References ColumnRef
+}
+
+// ColumnRef names a (table, column) pair on the catalog. Used by
+// FOREIGN KEY declarations.
+type ColumnRef struct {
+	Table  string
+	Column string
 }
 
 // Check is one CHECK constraint attached to a table. Real PG names a
@@ -41,6 +51,10 @@ type Table struct {
 type Schema interface {
 	Table(name string) (Table, bool)
 	CreateTable(t Table) error
+	// Tables returns every table currently in the schema, in
+	// insertion order. Used by the FK enforcer to find referencers
+	// when a parent row is being deleted.
+	Tables() []Table
 }
 
 // NewSchema returns an empty in-memory schema.
@@ -49,6 +63,7 @@ func NewSchema() Schema { return &schema{tables: map[string]Table{}} }
 type schema struct {
 	mu     sync.RWMutex
 	tables map[string]Table
+	order  []string // table names in CreateTable order — Tables() uses this
 }
 
 func (s *schema) Table(name string) (Table, bool) {
@@ -61,6 +76,19 @@ func (s *schema) Table(name string) (Table, bool) {
 func (s *schema) CreateTable(t Table) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, exists := s.tables[t.Name]; !exists {
+		s.order = append(s.order, t.Name)
+	}
 	s.tables[t.Name] = t
 	return nil
+}
+
+func (s *schema) Tables() []Table {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Table, 0, len(s.order))
+	for _, name := range s.order {
+		out = append(out, s.tables[name])
+	}
+	return out
 }

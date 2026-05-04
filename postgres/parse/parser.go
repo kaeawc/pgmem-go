@@ -335,10 +335,36 @@ func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error)
 			return false, err
 		}
 		def.Check = expr
+	case p.accept(kwReferences):
+		ref, err := p.parseReferencesClause()
+		if err != nil {
+			return false, err
+		}
+		def.References = ref
 	default:
 		return true, nil
 	}
 	return false, nil
+}
+
+// parseReferencesClause consumes `<table>(<col>)`. The REFERENCES
+// keyword has already been consumed by the caller.
+func (p *parser) parseReferencesClause() (*ir.ColumnRefSpec, error) {
+	tbl, err := p.expect(tIdent, "referenced table")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	col, err := p.expect(tIdent, "referenced column")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &ir.ColumnRefSpec{Table: tbl.val, Column: col.val}, nil
 }
 
 // --- INSERT ---

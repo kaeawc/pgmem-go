@@ -122,6 +122,18 @@ type ColumnDef struct {
 	// of the same row; we follow that, with the executor resolving
 	// column refs against the table schema at INSERT time.
 	Check Expr
+	// References, when non-nil, declares a single-column FOREIGN KEY:
+	// `REFERENCES <table>(<column>)`. ON DELETE behavior follows in a
+	// later slice — for now the constraint is implicitly RESTRICT.
+	References *ColumnRefSpec
+}
+
+// ColumnRefSpec is the (table, column) pair a FOREIGN KEY references.
+// We use a struct rather than embedding the catalog type so the IR
+// stays catalog-package-free.
+type ColumnRefSpec struct {
+	Table  string
+	Column string
 }
 
 // Assignment is one `column = expr` clause in an UPDATE's SET list.
