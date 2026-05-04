@@ -2137,6 +2137,10 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 		return evalArith(b.Op, l, r, b.T)
 	case "||":
 		return evalConcat(l, r)
+	case "like":
+		return evalLike(l, r, false)
+	case "ilike":
+		return evalLike(l, r, true)
 	}
 	cmp, err := compareValues(l, r)
 	if err != nil {
@@ -2176,6 +2180,73 @@ func arithResultType(l, r types.Type) types.Type {
 		return types.Int8
 	}
 	return types.Int4
+}
+
+// evalLike implements PG's LIKE / ILIKE pattern matching: `_` matches
+// any single char, `%` matches any (possibly empty) substring, and `\`
+// escapes the next char in the pattern (so `\%` is a literal `%`).
+// ILIKE folds to lower-case before matching — fine for ASCII; full
+// Unicode case folding is a follow-up.
+func evalLike(l, r any, fold bool) (any, error) {
+	s, ok := l.(string)
+	if !ok {
+		return nil, fmt.Errorf("exec: LIKE left operand must be text, got %T", l)
+	}
+	pat, ok := r.(string)
+	if !ok {
+		return nil, fmt.Errorf("exec: LIKE pattern must be text, got %T", r)
+	}
+	if fold {
+		s = strings.ToLower(s)
+		pat = strings.ToLower(pat)
+	}
+	return likeMatch(s, pat), nil
+}
+
+// likeMatch is a straightforward recursive matcher: `%` consumes
+// substrings via a tail-search, `_` consumes one char, `\` escapes the
+// next pattern char. We accept zero-width matches like real PG.
+func likeMatch(s, pat string) bool {
+	for i := 0; i < len(pat); i++ {
+		c := pat[i]
+		switch c {
+		case '%':
+			// Coalesce runs of `%` so we don't recurse needlessly.
+			for i+1 < len(pat) && pat[i+1] == '%' {
+				i++
+			}
+			rest := pat[i+1:]
+			if rest == "" {
+				return true
+			}
+			for j := 0; j <= len(s); j++ {
+				if likeMatch(s[j:], rest) {
+					return true
+				}
+			}
+			return false
+		case '_':
+			if len(s) == 0 {
+				return false
+			}
+			s = s[1:]
+		case '\\':
+			if i+1 >= len(pat) {
+				return false
+			}
+			i++
+			if len(s) == 0 || s[0] != pat[i] {
+				return false
+			}
+			s = s[1:]
+		default:
+			if len(s) == 0 || s[0] != c {
+				return false
+			}
+			s = s[1:]
+		}
+	}
+	return len(s) == 0
 }
 
 // evalConcat is `text || text`. Either side NULL was filtered upstream.

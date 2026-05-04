@@ -87,7 +87,40 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		p.consume() // NOT
 		return p.parseInClause(left, true)
 	}
+	if op, ok := likeOp(p.peek().kind); ok {
+		p.consume()
+		right, err := p.parseAdditive()
+		if err != nil {
+			return nil, err
+		}
+		return &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool}, nil
+	}
+	if p.peek().kind == kwNot {
+		if op, ok := likeOp(p.lookahead(1).kind); ok {
+			p.consume() // NOT
+			p.consume() // LIKE/ILIKE
+			right, err := p.parseAdditive()
+			if err != nil {
+				return nil, err
+			}
+			return &ir.UnaryOp{
+				Op:   "not",
+				Expr: &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool},
+				T:    types.Bool,
+			}, nil
+		}
+	}
 	return left, nil
+}
+
+func likeOp(k tokenKind) (string, bool) {
+	switch k {
+	case kwLike:
+		return "like", true
+	case kwIlike:
+		return "ilike", true
+	}
+	return "", false
 }
 
 // lookahead peeks N tokens ahead without consuming. Used to confirm
