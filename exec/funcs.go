@@ -415,6 +415,50 @@ var builtins = map[string]builtinFunc{
 		ResultType: variadicSameType("least"),
 		Eval:       variadicReduce(func(cmp int) bool { return cmp < 0 }),
 	},
+	"current_setting": {
+		// current_setting(name [, missing_ok]) — returns the GUC value as
+		// text. We don't yet model PG's full configuration system, so we
+		// answer from a small static table of values ORMs typically
+		// probe at connect time. Unknown names error unless missing_ok
+		// is true (returns NULL).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 && len(args) != 2 {
+				return nil, fmt.Errorf("current_setting: takes 1 or 2 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			name, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("current_setting: name must be text, got %T", args[0])
+			}
+			if v, ok := defaultGUC(name); ok {
+				return v, nil
+			}
+			missingOK := false
+			if len(args) == 2 {
+				if b, ok := args[1].(bool); ok {
+					missingOK = b
+				}
+			}
+			if missingOK {
+				return nil, nil
+			}
+			return nil, &SQLError{
+				Code:    "42704",
+				Message: fmt.Sprintf("unrecognized configuration parameter %q", name),
+			}
+		},
+	},
+	"version": {
+		ResultType: noArgs(types.Text),
+		Eval: func(_ *Env, _ []any) (any, error) {
+			return "PostgreSQL 16.0 (pgmem-go) on " + runtimeArch() + ", compiled by Go", nil
+		},
+	},
 	"interval": {
 		// interval('1 day') / interval('5 hours') — parses a small
 		// subset of the PG interval string. Returns time.Duration; the
@@ -519,6 +563,35 @@ var builtins = map[string]builtinFunc{
 		},
 	},
 }
+
+// defaultGUC returns the canned value we serve for a small set of PG
+// configuration parameters that ORMs and pgx commonly probe at
+// connect time. Names are matched case-insensitively (PG GUCs are).
+func defaultGUC(name string) (string, bool) {
+	switch strings.ToLower(name) {
+	case "server_version":
+		return "16.0", true
+	case "server_version_num":
+		return "160000", true
+	case "search_path":
+		return "public", true
+	case "standard_conforming_strings", "integer_datetimes":
+		return "on", true
+	case "timezone":
+		return "UTC", true
+	case "client_encoding", "server_encoding":
+		return "UTF8", true
+	case "application_name":
+		return "", true
+	}
+	return "", false
+}
+
+// runtimeArch returns a human label for version()'s formatted output.
+// We don't pull runtime.GOARCH here because adding the runtime import
+// for a single string isn't worth it; "x86_64-pc-linux-gnu" is what
+// most clients expect to see anyway.
+func runtimeArch() string { return "x86_64-pc-linux-gnu" }
 
 // parseInterval handles the small subset of PG interval text we need:
 // one or more `<n> <unit>` pairs separated by whitespace, where unit
