@@ -425,6 +425,14 @@ func comparisonOp(k tokenKind) (string, bool) {
 		return "<=", true
 	case tGte:
 		return ">=", true
+	case tRegex:
+		return "~", true
+	case tRegexI:
+		return "~*", true
+	case tNRegex:
+		return "!~", true
+	case tNRegexI:
+		return "!~*", true
 	default:
 		return "", false
 	}
