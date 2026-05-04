@@ -307,6 +307,11 @@ type Insert struct {
 	Returning      []Expr
 	ReturningNames []string
 	OnConflict     *OnConflict
+	// Source, when non-nil, replaces Rows: each row produced by the
+	// inner plan supplies one INSERT tuple. Column count of the inner
+	// plan must match Columns (or the table's full column list when
+	// Columns is empty). Rows and Source are mutually exclusive.
+	Source Node
 }
 
 func (*Insert) node() {}
