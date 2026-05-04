@@ -6,11 +6,13 @@ package db
 
 import (
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Category struct {
 	ID       int64
-	ParentID *int64
+	ParentID pgtype.Int8
 	Name     string
 }
 

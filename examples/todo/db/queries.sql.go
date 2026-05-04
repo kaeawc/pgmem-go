@@ -48,7 +48,7 @@ RETURNING id, list_id, title, done, due_at, created_at, deleted_at
 type AddItemParams struct {
 	ListID    int64
 	Title     string
-	DueAt     **time.Time
+	DueAt     *time.Time
 	CreatedAt time.Time
 }
 
@@ -85,11 +85,11 @@ const itemsDueWithin = `-- name: ItemsDueWithin :many
 SELECT id, list_id, title, done, due_at, created_at, deleted_at FROM items
 WHERE deleted_at IS NULL
   AND due_at IS NOT NULL
-  AND due_at <= $1 + interval '1 day'
+  AND due_at <= $1::timestamptz + interval '1 day'
 ORDER BY due_at
 `
 
-func (q *Queries) ItemsDueWithin(ctx context.Context, dollar_1 interface{}) ([]Item, error) {
+func (q *Queries) ItemsDueWithin(ctx context.Context, dollar_1 time.Time) ([]Item, error) {
 	rows, err := q.db.Query(ctx, itemsDueWithin, dollar_1)
 	if err != nil {
 		return nil, err
@@ -156,7 +156,7 @@ UPDATE lists SET deleted_at = $1 WHERE id = $2
 `
 
 type SoftDeleteListParams struct {
-	DeletedAt **time.Time
+	DeletedAt *time.Time
 	ID        int64
 }
 

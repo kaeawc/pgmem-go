@@ -26,7 +26,7 @@ UPDATE items SET done = true WHERE id = $1;
 SELECT * FROM items
 WHERE deleted_at IS NULL
   AND due_at IS NOT NULL
-  AND due_at <= $1 + interval '1 day'
+  AND due_at <= $1::timestamptz + interval '1 day'
 ORDER BY due_at;
 
 -- name: ListCompletion :many

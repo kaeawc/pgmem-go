@@ -8,6 +8,8 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const addProduct = `-- name: AddProduct :one
@@ -41,7 +43,7 @@ const childCategories = `-- name: ChildCategories :many
 SELECT id, parent_id, name FROM categories WHERE parent_id = $1 ORDER BY name
 `
 
-func (q *Queries) ChildCategories(ctx context.Context, parentID *int64) ([]Category, error) {
+func (q *Queries) ChildCategories(ctx context.Context, parentID pgtype.Int8) ([]Category, error) {
 	rows, err := q.db.Query(ctx, childCategories, parentID)
 	if err != nil {
 		return nil, err
