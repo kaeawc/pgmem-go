@@ -58,6 +58,13 @@ type Env struct {
 	Txn    storage.Txn
 	Params []Param
 	Now    func() time.Time
+	// OuterSchema and OuterRow are set when running a correlated
+	// subquery: the inner operator's resolveColumnRef falls back to
+	// OuterSchema when a ColumnRef can't be resolved against the
+	// inner schema, and per-row evaluation reads outer-scope values
+	// from OuterRow.
+	OuterSchema []Column
+	OuterRow    Row
 }
 
 // Operator is the runtime instantiation of an ir.Node.
@@ -2380,11 +2387,31 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	case *ir.Literal:
 		return x, nil
 	case *ir.ColumnRef:
-		idx, err := resolveColumnRef(x, schema)
-		if err != nil {
-			return nil, err
+		// Already-resolved Outer refs pass through unchanged — they
+		// were tagged when the surrounding subquery was resolved
+		// against its outer scope.
+		if x.Outer {
+			return x, nil
 		}
-		return &ir.ColumnRef{Qualifier: x.Qualifier, Name: x.Name, Index: idx, T: schema[idx].Type}, nil
+		idx, err := resolveColumnRef(x, schema)
+		if err == nil {
+			return &ir.ColumnRef{Qualifier: x.Qualifier, Name: x.Name, Index: idx, T: schema[idx].Type}, nil
+		}
+		// Fall through to outer scope when the inner schema can't
+		// resolve the ref; that's how correlated subqueries find
+		// `r.id` referenced inside an EXISTS body.
+		if env != nil && len(env.OuterSchema) > 0 {
+			if oidx, oerr := resolveColumnRef(x, env.OuterSchema); oerr == nil {
+				return &ir.ColumnRef{
+					Qualifier: x.Qualifier,
+					Name:      x.Name,
+					Index:     oidx,
+					T:         env.OuterSchema[oidx].Type,
+					Outer:     true,
+				}, nil
+			}
+		}
+		return nil, err
 	case *ir.ParamRef:
 		params := envParams(env)
 		if x.Index < 0 || x.Index >= len(params) {
@@ -2448,7 +2475,7 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	case *ir.Case:
 		return resolveCase(x, schema, env)
 	case *ir.ExistsExpr:
-		return evalExists(x, env)
+		return resolveExists(x, schema, env)
 	case *ir.AnyExpr:
 		return resolveAny(x, schema, env)
 	default:
@@ -2456,12 +2483,115 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	}
 }
 
-// evalExists eagerly runs the inner plan and replaces the EXISTS
-// expression with a literal bool — true iff the plan produced at
-// least one row. Treating it like ScalarSubquery keeps the per-row
-// evaluator simple; the trade-off is that EXISTS is uncorrelated.
-// Correlated EXISTS would need a per-row execution.
-func evalExists(x *ir.ExistsExpr, env *Env) (ir.Expr, error) {
+// resolveExists captures the outer schema on the ExistsExpr so the
+// per-row evaluator can stamp it on env.OuterSchema for the inner
+// Build. Pre-evaluation only happens when the inner plan has no
+// outer-scope references — that's the uncorrelated fast path the
+// previous evalExists used.
+func resolveExists(x *ir.ExistsExpr, schema []Column, env *Env) (ir.Expr, error) {
+	if !planReferencesOuter(x.Plan, schema) {
+		return evalExistsUncorrelated(x, env)
+	}
+	outer := make([]ir.OuterField, len(schema))
+	for i, c := range schema {
+		outer[i] = ir.OuterField{Qualifier: c.Qualifier, Name: c.Name, T: c.Type}
+	}
+	return &ir.ExistsExpr{Plan: x.Plan, OuterSchema: outer}, nil
+}
+
+// planReferencesOuter walks the plan tree and returns true if any
+// expression contains a ColumnRef whose name+qualifier resolves
+// against the outer schema. Uncorrelated subqueries answer false and
+// take the pre-evaluated fast path.
+func planReferencesOuter(n ir.Node, outer []Column) bool {
+	if len(outer) == 0 {
+		return false
+	}
+	found := false
+	var walkExpr func(e ir.Expr)
+	walkExpr = func(e ir.Expr) {
+		if found {
+			return
+		}
+		switch v := e.(type) {
+		case *ir.ColumnRef:
+			if _, err := resolveColumnRef(v, outer); err == nil {
+				found = true
+			}
+		case *ir.BinOp:
+			walkExpr(v.Left)
+			walkExpr(v.Right)
+		case *ir.UnaryOp:
+			walkExpr(v.Expr)
+		case *ir.FuncCall:
+			for _, a := range v.Args {
+				walkExpr(a)
+			}
+		case *ir.Cast:
+			walkExpr(v.Expr)
+		case *ir.Case:
+			walkExpr(v.Operand)
+			for _, w := range v.Whens {
+				walkExpr(w.Match)
+				walkExpr(w.Result)
+			}
+			walkExpr(v.Else)
+		case *ir.InListExpr:
+			walkExpr(v.Probe)
+			for _, item := range v.List {
+				walkExpr(item)
+			}
+		case *ir.AnyExpr:
+			walkExpr(v.Probe)
+			walkExpr(v.Array)
+		}
+	}
+	var walk func(n ir.Node)
+	walk = func(n ir.Node) {
+		if found {
+			return
+		}
+		switch x := n.(type) {
+		case *ir.Filter:
+			walkExpr(x.Cond)
+			walk(x.Input)
+		case *ir.Project:
+			for _, e := range x.Exprs {
+				walkExpr(e)
+			}
+			walk(x.Input)
+		case *ir.Sort:
+			for _, k := range x.Keys {
+				walkExpr(k.Expr)
+			}
+			walk(x.Input)
+		case *ir.Limit:
+			walk(x.Input)
+		case *ir.Aggregate:
+			walk(x.Input)
+		case *ir.Distinct:
+			walk(x.Input)
+		case *ir.Join:
+			walk(x.Left)
+			walk(x.Right)
+			walkExpr(x.Cond)
+		case *ir.SubqueryAlias:
+			walk(x.Inner)
+		case *ir.Union:
+			walk(x.Left)
+			walk(x.Right)
+		case *ir.Window:
+			walk(x.Input)
+		}
+	}
+	walk(n)
+	return found
+}
+
+// evalExistsUncorrelated runs the inner plan once and returns a
+// constant Literal — the original fast path for an EXISTS that
+// doesn't reference any outer-scope columns.
+func evalExistsUncorrelated(x *ir.ExistsExpr, env *Env) (ir.Expr, error) {
 	if env == nil {
 		return nil, fmt.Errorf("exec: EXISTS requires execution environment")
 	}
@@ -2652,6 +2782,12 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 	case *ir.Literal:
 		return x.Value, nil
 	case *ir.ColumnRef:
+		if x.Outer {
+			if env == nil || x.Index < 0 || x.Index >= len(env.OuterRow) {
+				return nil, fmt.Errorf("exec: outer column ref %q (idx %d) out of range", x.Name, x.Index)
+			}
+			return env.OuterRow[x.Index], nil
+		}
 		if x.Index < 0 || x.Index >= len(in) {
 			return nil, fmt.Errorf("exec: column ref %q (idx %d) out of range (row width %d)", x.Name, x.Index, len(in))
 		}
@@ -2680,9 +2816,40 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 		return evalCase(x, in, env)
 	case *ir.AnyExpr:
 		return evalAny(x, in, env)
+	case *ir.ExistsExpr:
+		return evalCorrelatedExists(x, in, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalCorrelatedExists builds the inner plan with env.OuterSchema /
+// OuterRow set so the inner operator's resolveColumnRef can fall
+// back to outer columns and the per-row evaluator returns their
+// current value. Uncorrelated EXISTS is pre-evaluated to a Literal
+// during resolveExpr — only the correlated case lands here.
+func evalCorrelatedExists(x *ir.ExistsExpr, in Row, env *Env) (any, error) {
+	outer := make([]Column, len(x.OuterSchema))
+	for i, f := range x.OuterSchema {
+		outer[i] = Column{Qualifier: f.Qualifier, Name: f.Name, Type: f.T}
+	}
+	childEnv := *env
+	childEnv.OuterSchema = outer
+	childEnv.OuterRow = in
+	op, err := Build(x.Plan, &childEnv)
+	if err != nil {
+		return nil, fmt.Errorf("correlated EXISTS: %w", err)
+	}
+	defer op.Close()
+	row, err := op.Next(context.Background())
+	if errors.Is(err, io.EOF) {
+		return false, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("correlated EXISTS: %w", err)
+	}
+	_ = row
+	return true, nil
 }
 
 // evalAny implements `probe op ANY (array)`. Currently only `=` is

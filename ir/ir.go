@@ -394,6 +394,11 @@ type ColumnRef struct {
 	Name  string
 	Index int
 	T     types.Type
+	// Outer is true when this column reference resolves against the
+	// surrounding query's row rather than the inner operator's input.
+	// Used by correlated EXISTS / subqueries so the per-row evaluator
+	// reads the outer-scope value via env.OuterRow[Index].
+	Outer bool
 }
 
 func (*ColumnRef) expr()              {}
@@ -493,12 +498,24 @@ type ScalarSubquery struct {
 func (*ScalarSubquery) expr()              {}
 func (s *ScalarSubquery) Type() types.Type { return s.T }
 
+// OuterField describes a single column from the surrounding query's
+// scope. Captured on a subquery expression at resolve time so the
+// inner operator's resolveColumnRef can fall back to the outer
+// schema for correlated references.
+type OuterField struct {
+	Qualifier string
+	Name      string
+	T         types.Type
+}
+
 // ExistsExpr is `EXISTS (SELECT ...)` — true when the inner plan
-// produces at least one row, false otherwise. The inner plan's column
-// list is irrelevant (we never read it), so the parser may build a
-// vanilla SELECT node and it just works.
+// produces at least one row, false otherwise. OuterSchema, when
+// non-nil, lets the inner plan's expressions reference outer-scope
+// columns (`r.id` in `WHERE EXISTS (SELECT … WHERE s.room_id =
+// r.id)`); ColumnRefs that resolve against it are tagged Outer.
 type ExistsExpr struct {
-	Plan Node
+	Plan        Node
+	OuterSchema []OuterField
 }
 
 func (*ExistsExpr) expr()            {}

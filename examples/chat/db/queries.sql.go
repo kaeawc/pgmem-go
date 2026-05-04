@@ -200,17 +200,14 @@ func (q *Queries) Subscribe(ctx context.Context, arg SubscribeParams) error {
 }
 
 const subscribedRooms = `-- name: SubscribedRooms :many
-SELECT DISTINCT r.id, r.name FROM rooms r
-JOIN subscriptions s ON s.room_id = r.id
-WHERE s.user_id = $1
+SELECT r.id, r.name FROM rooms r
+WHERE EXISTS (
+    SELECT 1 FROM subscriptions s
+    WHERE s.user_id = $1 AND s.room_id = r.id
+)
 ORDER BY r.name
 `
 
-// The natural shape here is `WHERE EXISTS (SELECT 1 FROM
-// subscriptions WHERE user_id = $1 AND room_id = r.id)`, but
-// pgmem-go's EXISTS is uncorrelated only — the inner query can't
-// reference the outer row. A DISTINCT join produces the same
-// result and exercises JOIN + DISTINCT instead.
 func (q *Queries) SubscribedRooms(ctx context.Context, userID int64) ([]Room, error) {
 	rows, err := q.db.Query(ctx, subscribedRooms, userID)
 	if err != nil {
