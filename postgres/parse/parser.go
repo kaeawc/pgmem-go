@@ -2,6 +2,7 @@ package parse
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/kaeawc/pgmem-go/ir"
@@ -939,19 +940,16 @@ func (p *parser) skipLockingClause() error {
 	return nil
 }
 
-// parseGroupByList consumes `expr [, expr ...]`. Each entry must be a
-// bare column reference for now — non-trivial GROUP BY expressions
-// (e.g. `GROUP BY a + b`) need expression-equality matching in the
-// Project step that wraps the Aggregate, which is a follow-up.
+// parseGroupByList consumes `expr [, expr ...]`. Bare column refs and
+// arbitrary expressions are both accepted — the SELECT-list rewriter
+// matches expressions structurally so `GROUP BY date_trunc('hour',
+// created_at)` works alongside the simple `GROUP BY col` form.
 func (p *parser) parseGroupByList() ([]ir.Expr, error) {
 	var out []ir.Expr
 	for {
 		e, err := p.parseExpr()
 		if err != nil {
 			return nil, err
-		}
-		if _, ok := e.(*ir.ColumnRef); !ok {
-			return nil, fmt.Errorf("parse: GROUP BY supports only bare column references for now")
 		}
 		out = append(out, e)
 		if p.accept(tComma) {
@@ -1003,11 +1001,12 @@ func buildScalarOrPlainSelect(input ir.Node, exprs []ir.Expr, names []string) (i
 
 func buildGroupedSelect(input ir.Node, exprs []ir.Expr, names []string, groupBy []ir.Expr, having ir.Expr) (ir.Node, error) {
 	groupBySet := make(map[string]int, len(groupBy))
+	rw := &aggRewriter{groupBySet: groupBySet, groupByExprs: groupBy}
 	for i, e := range groupBy {
-		c := e.(*ir.ColumnRef)
-		groupBySet[columnRefKey(c)] = i
+		if c, ok := e.(*ir.ColumnRef); ok {
+			groupBySet[columnRefKey(c)] = i
+		}
 	}
-	rw := &aggRewriter{groupBySet: groupBySet}
 	projectExprs, err := rw.rewriteSelectList(exprs)
 	if err != nil {
 		return nil, err
@@ -1034,8 +1033,45 @@ func buildGroupedSelect(input ir.Node, exprs []ir.Expr, names []string, groupBy 
 // the SELECT list still get added to calls so the Aggregate node
 // computes them — they just don't appear in the final Project.
 type aggRewriter struct {
-	groupBySet map[string]int
-	calls      []ir.AggregateCall
+	groupBySet   map[string]int
+	groupByExprs []ir.Expr
+	calls        []ir.AggregateCall
+}
+
+// matchGroupByExpr returns the synthetic output name (and true) when
+// e is structurally equal to one of the GROUP BY expressions. Used so
+// `SELECT date_trunc('hour', ts) … GROUP BY date_trunc('hour', ts)`
+// produces a ColumnRef to the aggregate's group-output column rather
+// than recursing into ts and complaining that ts isn't in GROUP BY.
+func (r *aggRewriter) matchGroupByExpr(e ir.Expr) (string, bool) {
+	if c, ok := e.(*ir.ColumnRef); ok {
+		if _, in := r.groupBySet[columnRefKey(c)]; in {
+			return c.Name, true
+		}
+	}
+	for i, g := range r.groupByExprs {
+		if exprStructEqual(e, g) {
+			if c, ok := g.(*ir.ColumnRef); ok {
+				return c.Name, true
+			}
+			return groupExprName(i), true
+		}
+	}
+	return "", false
+}
+
+// groupExprName is the synthetic output name an arbitrary GROUP BY
+// expression takes when it isn't a bare column ref. exec/aggregate
+// uses the same shape via ir.Aggregate.GroupBy ordering.
+func groupExprName(i int) string { return fmt.Sprintf("__group_%d", i) }
+
+// exprStructEqual is a shallow structural equality on the IR
+// expression tree — enough to spot "select-list expression is the
+// same as a GROUP BY entry." reflect.DeepEqual works because parser-
+// emitted expressions don't carry resolved-only fields yet (those
+// land in resolveExpr later).
+func exprStructEqual(a, b ir.Expr) bool {
+	return reflect.DeepEqual(a, b)
 }
 
 func (r *aggRewriter) rewriteSelectList(exprs []ir.Expr) ([]ir.Expr, error) {
@@ -1065,6 +1101,12 @@ func (r *aggRewriter) rewriteSelectList(exprs []ir.Expr) ([]ir.Expr, error) {
 // with synthetic ColumnRefs while validating that any non-aggregated
 // column reference appears in GROUP BY.
 func (r *aggRewriter) rewriteSelectExpr(e ir.Expr) (ir.Expr, error) {
+	// If the whole expression matches a GROUP BY entry structurally,
+	// the aggregate already emits its value as one of the group output
+	// columns — replace with a ColumnRef pointing at that slot.
+	if name, ok := r.matchGroupByExpr(e); ok {
+		return &ir.ColumnRef{Name: name}, nil
+	}
 	switch v := e.(type) {
 	case *ir.ColumnRef:
 		if _, ok := r.groupBySet[columnRefKey(v)]; !ok {

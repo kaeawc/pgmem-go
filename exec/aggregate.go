@@ -41,10 +41,16 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 			return nil, err
 		}
 		groupKeys[i] = resolved
-		// Group output columns inherit the original column name and type
-		// so the planning Project can rewire them by name.
-		c := e.(*ir.ColumnRef)
-		groupCols[i] = Column{Qualifier: c.Qualifier, Name: c.Name, Type: resolved.Type()}
+		// Group output columns inherit the original column name and
+		// type when the GROUP BY entry is a bare ColumnRef so the
+		// planning Project can rewire them by name. Arbitrary
+		// expressions get a synthetic name matching the parser-side
+		// rewriter.
+		if c, ok := e.(*ir.ColumnRef); ok {
+			groupCols[i] = Column{Qualifier: c.Qualifier, Name: c.Name, Type: resolved.Type()}
+		} else {
+			groupCols[i] = Column{Name: fmt.Sprintf("__group_%d", i), Type: resolved.Type()}
+		}
 	}
 
 	resolvedArgs := make([][]ir.Expr, len(p.Calls))

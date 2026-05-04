@@ -8,8 +8,6 @@ package db
 import (
 	"context"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const errorEvents = `-- name: ErrorEvents :many
@@ -45,16 +43,19 @@ func (q *Queries) ErrorEvents(ctx context.Context) ([]Event, error) {
 }
 
 const eventEpochs = `-- name: EventEpochs :many
-SELECT id, extract(epoch FROM created_at) AS epoch
+SELECT id, extract(epoch FROM created_at)::bigint AS epoch
 FROM events
 ORDER BY id
 `
 
 type EventEpochsRow struct {
 	ID    int64
-	Epoch pgtype.Numeric
+	Epoch int64
 }
 
+// sqlc infers `extract(epoch FROM …)` as numeric (matching real PG),
+// but pgmem-go's date_part returns int8 today — the type clash makes
+// the generated scan fail. Cast to bigint so both sides agree.
 func (q *Queries) EventEpochs(ctx context.Context) ([]EventEpochsRow, error) {
 	rows, err := q.db.Query(ctx, eventEpochs)
 	if err != nil {
@@ -147,15 +148,15 @@ func (q *Queries) EventsByPayloadKey(ctx context.Context, dollar_1 []byte) ([]Ev
 }
 
 const eventsPerHour = `-- name: EventsPerHour :many
-SELECT date_trunc('hour', created_at) AS hour,
+SELECT date_trunc('hour', created_at)::timestamptz AS hour,
        count(*) AS n
 FROM events
-GROUP BY hour
+GROUP BY date_trunc('hour', created_at)
 ORDER BY hour
 `
 
 type EventsPerHourRow struct {
-	Hour pgtype.Interval
+	Hour time.Time
 	N    int64
 }
 
