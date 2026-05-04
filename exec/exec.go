@@ -5,6 +5,7 @@ package exec
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1720,7 +1721,7 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 		}
 		t := x.T
 		if t == nil {
-			t = arithResultType(l.Type(), r.Type())
+			t = binOpResultType(x.Op, l.Type(), r.Type())
 		}
 		return &ir.BinOp{Op: x.Op, Left: l, Right: r, T: t}, nil
 	case *ir.UnaryOp:
@@ -2238,6 +2239,10 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 		return evalLike(l, r, false)
 	case "ilike":
 		return evalLike(l, r, true)
+	case "->":
+		return evalJSONArrow(l, r, false)
+	case "->>":
+		return evalJSONArrow(l, r, true)
 	}
 	cmp, err := compareValues(l, r)
 	if err != nil {
@@ -2261,6 +2266,20 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 	}
 }
 
+// binOpResultType returns the static result type for a binary op given
+// its resolved operand types. Most ops fall through to arithResultType,
+// but a few (jsonb's `->` / `->>`) have a fixed result type independent
+// of operand types.
+func binOpResultType(op string, l, r types.Type) types.Type {
+	switch op {
+	case "->":
+		return types.JSONB
+	case "->>":
+		return types.Text
+	}
+	return arithResultType(l, r)
+}
+
 // arithResultType picks the output type of a binary additive/
 // multiplicative op based on its operands.
 //   - || is text concatenation; result type is text.
@@ -2277,6 +2296,85 @@ func arithResultType(l, r types.Type) types.Type {
 		return types.Int8
 	}
 	return types.Int4
+}
+
+// evalJSONArrow implements jsonb's `->` (asText=false) and `->>`
+// (asText=true) operators. Either form takes a jsonb on the left and
+// either a text key (for objects) or an integer index (for arrays) on
+// the right. Missing keys / out-of-range indices yield NULL, matching
+// real PG.
+//
+// `->` re-marshals the extracted value back to jsonb bytes.
+// `->>` returns text: strings unwrap to their value, scalars are
+// formatted with Go's default JSON-style stringification, and JSON
+// null returns NULL (not the literal "null").
+func evalJSONArrow(l, r any, asText bool) (any, error) {
+	raw, ok := l.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("exec: jsonb arrow: left operand must be jsonb, got %T", l)
+	}
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("exec: jsonb arrow: invalid jsonb: %w", err)
+	}
+	got, found := jsonArrowSelect(doc, r)
+	if !found {
+		return nil, nil
+	}
+	if asText {
+		if got == nil {
+			return nil, nil
+		}
+		if s, ok := got.(string); ok {
+			return s, nil
+		}
+		out, err := json.Marshal(got)
+		if err != nil {
+			return nil, fmt.Errorf("exec: jsonb ->>: %w", err)
+		}
+		return string(out), nil
+	}
+	out, err := json.Marshal(got)
+	if err != nil {
+		return nil, fmt.Errorf("exec: jsonb ->: %w", err)
+	}
+	return out, nil
+}
+
+// jsonArrowSelect resolves the `->` / `->>` index against the decoded
+// jsonb value. Returns (value, true) on success — value may be nil for
+// JSON null. (nil, false) means "no such key/index", which surfaces as
+// SQL NULL.
+func jsonArrowSelect(doc any, idx any) (any, bool) {
+	switch d := doc.(type) {
+	case map[string]any:
+		key, ok := idx.(string)
+		if !ok {
+			return nil, false
+		}
+		v, ok := d[key]
+		return v, ok
+	case []any:
+		var i int
+		switch n := idx.(type) {
+		case int32:
+			i = int(n)
+		case int64:
+			i = int(n)
+		case int:
+			i = n
+		default:
+			return nil, false
+		}
+		if i < 0 {
+			i += len(d)
+		}
+		if i < 0 || i >= len(d) {
+			return nil, false
+		}
+		return d[i], true
+	}
+	return nil, false
 }
 
 // evalLike implements PG's LIKE / ILIKE pattern matching: `_` matches

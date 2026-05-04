@@ -267,6 +267,10 @@ func additiveOp(k tokenKind) (string, bool) {
 		return "-", true
 	case tConcat:
 		return "||", true
+	case tArrow:
+		return "->", true
+	case tArrowText:
+		return "->>", true
 	}
 	return "", false
 }
