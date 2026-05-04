@@ -12,8 +12,11 @@ import (
 //   OR
 //   AND
 //   NOT       (unary)
-//   = != < > <= >=
-//   primary   (literal, ident, $N, parenthesized)
+//   = != < > <= >=     (comparison; chained → no, single)
+//   IN / NOT IN        (handled inside comparison)
+//   + -                (additive)
+//   * / %              (multiplicative)
+//   primary            (literal, ident, $N, parenthesized, func call)
 //
 // A precedence-climbing parser would be more compact, but this layout
 // makes it obvious which operators bind tighter when something looks
@@ -65,13 +68,13 @@ func (p *parser) parseNot() (ir.Expr, error) {
 }
 
 func (p *parser) parseComparison() (ir.Expr, error) {
-	left, err := p.parsePrimary()
+	left, err := p.parseAdditive()
 	if err != nil {
 		return nil, err
 	}
 	if op, ok := comparisonOp(p.peek().kind); ok {
 		p.consume()
-		right, err := p.parsePrimary()
+		right, err := p.parseAdditive()
 		if err != nil {
 			return nil, err
 		}
@@ -94,6 +97,70 @@ func (p *parser) lookahead(n int) token {
 		return p.toks[len(p.toks)-1]
 	}
 	return p.toks[p.pos+n]
+}
+
+// parseAdditive: left-associative + and -. Result type matches the
+// wider operand (int4 + int8 → int8); resolved at exec.Build.
+func (p *parser) parseAdditive() (ir.Expr, error) {
+	left, err := p.parseMultiplicative()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		op, ok := additiveOp(p.peek().kind)
+		if !ok {
+			return left, nil
+		}
+		p.consume()
+		right, err := p.parseMultiplicative()
+		if err != nil {
+			return nil, err
+		}
+		left = &ir.BinOp{Op: op, Left: left, Right: right}
+	}
+}
+
+func additiveOp(k tokenKind) (string, bool) {
+	switch k {
+	case tPlus:
+		return "+", true
+	case tMinus:
+		return "-", true
+	}
+	return "", false
+}
+
+// parseMultiplicative: left-associative *, /, %. Same precedence
+// family.
+func (p *parser) parseMultiplicative() (ir.Expr, error) {
+	left, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		op, ok := multiplicativeOp(p.peek().kind)
+		if !ok {
+			return left, nil
+		}
+		p.consume()
+		right, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		left = &ir.BinOp{Op: op, Left: left, Right: right}
+	}
+}
+
+func multiplicativeOp(k tokenKind) (string, bool) {
+	switch k {
+	case tStar:
+		return "*", true
+	case tSlash:
+		return "/", true
+	case tPercent:
+		return "%", true
+	}
+	return "", false
 }
 
 // parseInClause consumes IN ( <list-or-subquery> ). negate wraps the

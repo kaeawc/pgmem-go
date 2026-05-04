@@ -24,6 +24,10 @@ const (
 	tSemi
 	tStar
 	tDot
+	tPlus
+	tMinus
+	tSlash
+	tPercent
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -118,6 +122,22 @@ var keywords = map[string]tokenKind{
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
 // always small enough (one statement) that streaming buys nothing.
+// singleByteTokens is the punctuation that has no two-character form:
+// every entry is a single-byte token kind. Pulled out of lex's switch
+// so the dispatch stays small (gocyclo).
+var singleByteTokens = map[byte]tokenKind{
+	'(': tLParen,
+	')': tRParen,
+	',': tComma,
+	';': tSemi,
+	'*': tStar,
+	'.': tDot,
+	'+': tPlus,
+	'/': tSlash,
+	'%': tPercent,
+	'=': tEq,
+}
+
 func lex(src string) ([]token, error) {
 	var out []token
 	i := 0
@@ -128,26 +148,8 @@ func lex(src string) ([]token, error) {
 			i++
 		case c == '-' && i+1 < len(src) && src[i+1] == '-':
 			i = skipLineComment(src, i)
-		case c == '(':
-			out = append(out, token{tLParen, "(", i})
-			i++
-		case c == ')':
-			out = append(out, token{tRParen, ")", i})
-			i++
-		case c == ',':
-			out = append(out, token{tComma, ",", i})
-			i++
-		case c == ';':
-			out = append(out, token{tSemi, ";", i})
-			i++
-		case c == '*':
-			out = append(out, token{tStar, "*", i})
-			i++
-		case c == '.':
-			out = append(out, token{tDot, ".", i})
-			i++
-		case c == '=':
-			out = append(out, token{tEq, "=", i})
+		case c == '-':
+			out = append(out, token{tMinus, "-", i})
 			i++
 		case c == '<':
 			tok, n := lexLt(src, i)
@@ -158,47 +160,49 @@ func lex(src string) ([]token, error) {
 			out = append(out, tok)
 			i += n
 		case c == '!':
-			if i+1 < len(src) && src[i+1] == '=' {
-				out = append(out, token{tNeq, "!=", i})
-				i += 2
-			} else {
+			if i+1 >= len(src) || src[i+1] != '=' {
 				return nil, fmt.Errorf("lex: stray '!' at %d", i)
 			}
-		case c == '\'':
-			tok, n, err := lexString(src, i)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, tok)
-			i += n
-		case c == '$':
-			tok, n, err := lexParam(src, i)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, tok)
-			i += n
-		case c == '"':
-			tok, n, err := lexQuotedIdent(src, i)
-			if err != nil {
-				return nil, err
-			}
-			out = append(out, tok)
-			i += n
-		case isDigit(c):
-			tok, n := lexNumber(src, i)
-			out = append(out, tok)
-			i += n
-		case isIdentStart(c):
-			tok, n := lexIdent(src, i)
-			out = append(out, tok)
-			i += n
+			out = append(out, token{tNeq, "!=", i})
+			i += 2
 		default:
-			return nil, fmt.Errorf("lex: unexpected %q at %d", c, i)
+			tok, n, err := lexDefault(src, i)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, tok)
+			i += n
 		}
 	}
 	out = append(out, token{tEOF, "", len(src)})
 	return out, nil
+}
+
+// lexDefault handles the lex cases that don't have unique two-character
+// followups: single-byte punctuation (via singleByteTokens), strings,
+// quoted idents, parameters, numbers, idents/keywords. Returns the
+// token plus the number of source bytes consumed.
+func lexDefault(src string, i int) (token, int, error) {
+	c := src[i]
+	if k, ok := singleByteTokens[c]; ok {
+		return token{k, string(c), i}, 1, nil
+	}
+	switch {
+	case c == '\'':
+		return lexString(src, i)
+	case c == '$':
+		return lexParam(src, i)
+	case c == '"':
+		return lexQuotedIdent(src, i)
+	case isDigit(c):
+		tok, n := lexNumber(src, i)
+		return tok, n, nil
+	case isIdentStart(c):
+		tok, n := lexIdent(src, i)
+		return tok, n, nil
+	default:
+		return token{}, 0, fmt.Errorf("lex: unexpected %q at %d", c, i)
+	}
 }
 
 func skipLineComment(src string, i int) int {

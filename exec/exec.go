@@ -1363,7 +1363,11 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ir.BinOp{Op: x.Op, Left: l, Right: r, T: x.T}, nil
+		t := x.T
+		if t == nil {
+			t = arithResultType(l.Type(), r.Type())
+		}
+		return &ir.BinOp{Op: x.Op, Left: l, Right: r, T: t}, nil
 	case *ir.UnaryOp:
 		inner, err := resolveExpr(x.Expr, schema, env)
 		if err != nil {
@@ -1594,6 +1598,10 @@ func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
 	if l == nil || r == nil {
 		return nil, nil
 	}
+	switch b.Op {
+	case "+", "-", "*", "/", "%":
+		return evalArith(b.Op, l, r, b.T)
+	}
 	cmp, err := compareValues(l, r)
 	if err != nil {
 		return nil, err
@@ -1614,6 +1622,56 @@ func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
 	default:
 		return nil, fmt.Errorf("exec: unsupported binary op %q", b.Op)
 	}
+}
+
+// arithResultType picks the output type of an integer arithmetic op
+// based on its operands. If either side is int8 (BIGINT), the result
+// widens to int8; otherwise int4. Unknown operand types fall back to
+// int4 — they'll fail in evalArith if they're not actually integers.
+func arithResultType(l, r types.Type) types.Type {
+	if l == types.Int8 || r == types.Int8 {
+		return types.Int8
+	}
+	return types.Int4
+}
+
+// evalArith does integer arithmetic in int64-space, then narrows to
+// int32 if the static result type says int4. Division by zero matches
+// PG behaviour: SQLSTATE 22012.
+func evalArith(op string, l, r any, resultT types.Type) (any, error) {
+	li, err := toInt64(l)
+	if err != nil {
+		return nil, err
+	}
+	ri, err := toInt64(r)
+	if err != nil {
+		return nil, err
+	}
+	var out int64
+	switch op {
+	case "+":
+		out = li + ri
+	case "-":
+		out = li - ri
+	case "*":
+		out = li * ri
+	case "/":
+		if ri == 0 {
+			return nil, &SQLError{Code: "22012", Message: "division by zero"}
+		}
+		out = li / ri
+	case "%":
+		if ri == 0 {
+			return nil, &SQLError{Code: "22012", Message: "division by zero"}
+		}
+		out = li % ri
+	default:
+		return nil, fmt.Errorf("exec: unsupported arith op %q", op)
+	}
+	if resultT == types.Int4 {
+		return int32(out), nil
+	}
+	return out, nil
 }
 
 func evalAnd(b *ir.BinOp, in Row, params []Param) (any, error) {
