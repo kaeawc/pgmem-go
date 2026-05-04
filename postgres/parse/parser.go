@@ -566,10 +566,45 @@ func (p *parser) parseOnConflict() (*ir.OnConflict, error) {
 	if !p.acceptIdent("do") {
 		return nil, fmt.Errorf("parse: expected DO at %d", p.peek().pos)
 	}
-	if !p.acceptIdent("nothing") {
-		return nil, fmt.Errorf("parse: only ON CONFLICT DO NOTHING is supported (got %q)", p.peek().val)
+	if p.acceptIdent("nothing") {
+		return &ir.OnConflict{Columns: cols, DoNothing: true}, nil
 	}
-	return &ir.OnConflict{Columns: cols, DoNothing: true}, nil
+	if p.accept(kwUpdate) {
+		if _, err := p.expect(kwSet, "SET"); err != nil {
+			return nil, err
+		}
+		assigns, err := p.parseAssignmentList()
+		if err != nil {
+			return nil, err
+		}
+		return &ir.OnConflict{Columns: cols, DoUpdate: assigns}, nil
+	}
+	return nil, fmt.Errorf("parse: expected NOTHING or UPDATE after DO at %d", p.peek().pos)
+}
+
+// parseAssignmentList parses `col = expr [, col = expr ...]` for
+// UPDATE / ON CONFLICT DO UPDATE.
+func (p *parser) parseAssignmentList() ([]ir.Assignment, error) {
+	var out []ir.Assignment
+	for {
+		col, err := p.expect(tIdent, "column name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tEq, "="); err != nil {
+			return nil, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ir.Assignment{Column: col.val, Expr: e})
+		if p.accept(tComma) {
+			continue
+		}
+		break
+	}
+	return out, nil
 }
 
 func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
