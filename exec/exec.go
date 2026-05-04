@@ -867,11 +867,19 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		resolvedRows[i] = out
 	}
 	op := &insertOp{
-		table:  st,
-		ct:     ct,
-		colMap: colMap,
-		rows:   resolvedRows,
-		env:    env,
+		table:      st,
+		ct:         ct,
+		colMap:     colMap,
+		rows:       resolvedRows,
+		env:        env,
+		onConflict: p.OnConflict,
+	}
+	if p.OnConflict != nil {
+		idxs, err := resolveConflictColumns(ct, p.OnConflict.Columns)
+		if err != nil {
+			return nil, err
+		}
+		op.conflictColIdx = idxs
 	}
 	if len(p.Returning) > 0 {
 		// RETURNING expressions see the post-INSERT row, so their column
@@ -897,6 +905,64 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		}
 	}
 	return op, nil
+}
+
+// resolveConflictColumns maps each ON CONFLICT target column name to
+// its index in the catalog. Errors if any name is unknown.
+func resolveConflictColumns(ct catalog.Table, cols []string) ([]int, error) {
+	out := make([]int, len(cols))
+	for k, name := range cols {
+		idx := -1
+		for j, c := range ct.Columns {
+			if c.Name == name {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("exec: ON CONFLICT: unknown column %q", name)
+		}
+		out[k] = idx
+	}
+	return out, nil
+}
+
+// filterConflicts drops every built row that already has a matching
+// row in `existing` on the conflict-target columns (DO NOTHING).
+// Equality uses compareValues so we ride the same coercion table as
+// `=`. Rows whose conflict column is NULL are kept — NULL ≠ NULL
+// matches PG's IS-DISTINCT-FROM treatment for unique constraints.
+func filterConflicts(built []storage.Row, existing []storage.Row, idxs []int) []storage.Row {
+	out := make([]storage.Row, 0, len(built))
+	for _, row := range built {
+		if rowConflicts(row, existing, idxs) {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+func rowConflicts(row storage.Row, existing []storage.Row, idxs []int) bool {
+	for _, ex := range existing {
+		match := true
+		for _, idx := range idxs {
+			a, b := row[idx], ex[idx]
+			if a == nil || b == nil {
+				match = false
+				break
+			}
+			cmp, err := compareValues(a, b)
+			if err != nil || cmp != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
 }
 
 // buildInsertColumnMap returns the mapping from VALUES-tuple position
@@ -928,13 +994,15 @@ func buildInsertColumnMap(ct catalog.Table, cols []string) ([]int, error) {
 }
 
 type insertOp struct {
-	table    storage.Table
-	ct       catalog.Table
-	colMap   []int
-	rows     [][]ir.Expr
-	env      *Env
-	done     bool
-	inserted int
+	table          storage.Table
+	ct             catalog.Table
+	colMap         []int
+	rows           [][]ir.Expr
+	env            *Env
+	onConflict     *ir.OnConflict
+	conflictColIdx []int
+	done           bool
+	inserted       int
 
 	// Optional RETURNING projection. Non-nil iff the INSERT has a
 	// RETURNING clause; in that case OutputSchema is non-empty and
@@ -987,6 +1055,9 @@ func (i *insertOp) runOnce() error {
 			return err
 		}
 		built[r] = row
+	}
+	if i.onConflict != nil && i.onConflict.DoNothing {
+		built = filterConflicts(built, i.table.Rows(), i.conflictColIdx)
 	}
 	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
 		return err
