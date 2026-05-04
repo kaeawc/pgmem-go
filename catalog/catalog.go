@@ -26,11 +26,23 @@ type Column struct {
 }
 
 // ColumnRef names a (table, column) pair on the catalog. Used by
-// FOREIGN KEY declarations.
+// FOREIGN KEY declarations along with the ON DELETE action.
 type ColumnRef struct {
-	Table  string
-	Column string
+	Table    string
+	Column   string
+	OnDelete OnDeleteAction
 }
+
+// OnDeleteAction mirrors ir.OnDeleteAction (the catalog stays
+// ir-package-free so it can be consumed by adapters that don't
+// import ir).
+type OnDeleteAction int
+
+const (
+	OnDeleteRestrict OnDeleteAction = iota
+	OnDeleteCascade
+	OnDeleteSetNull
+)
 
 // Check is one CHECK constraint attached to a table. Real PG names a
 // column-level CHECK as `<table>_<col>_check` by default; we follow
