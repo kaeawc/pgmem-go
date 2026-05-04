@@ -128,6 +128,157 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(s))), nil
 		},
 	},
+	"trim": {
+		ResultType: oneArg(types.Text),
+		// trim(s) — PG default is "trim BOTH whitespace from s". Other
+		// variants (LEADING / TRAILING / custom-character set) require
+		// keyword syntax we don't parse yet.
+		Eval: evalUnaryString(strings.TrimSpace),
+	},
+	"replace": {
+		// replace(s, from, to) replaces *every* non-overlapping
+		// occurrence of from with to. Three text args; returns text.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 3 {
+				return nil, fmt.Errorf("replace: takes 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil || args[2] == nil {
+				return nil, nil
+			}
+			return strings.ReplaceAll(textArg(args[0]), textArg(args[1]), textArg(args[2])), nil
+		},
+	},
+	"substring": {
+		// substring(s, from[, length]) — 1-indexed character offsets,
+		// matching PG. Two- and three-arg forms supported.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 && len(args) != 3 {
+				return nil, fmt.Errorf("substring: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil || (len(args) == 3 && args[2] == nil) {
+				return nil, nil
+			}
+			s := []rune(textArg(args[0]))
+			from, err := substringIntArg(args[1])
+			if err != nil {
+				return nil, err
+			}
+			// PG substring is 1-indexed. A from < 1 doesn't shift the
+			// start *backwards* into negative territory — it shortens
+			// the captured slice instead. So `substring('abc', 0, 2)`
+			// is `'a'`, not `'ab'`. We mimic that by treating count as
+			// "characters between from and from+count-1, intersected
+			// with positions [1, len]".
+			//
+			// Without a count (2-arg form) the upper bound is "to the
+			// end of the string".
+			if len(args) == 3 {
+				count, err := substringIntArg(args[2])
+				if err != nil {
+					return nil, err
+				}
+				if count < 0 {
+					return nil, &SQLError{Code: "22011", Message: "negative substring length not allowed"}
+				}
+				start, end := clampSubstringRange(from, count, len(s))
+				return string(s[start:end]), nil
+			}
+			start := from - 1
+			if start < 0 {
+				start = 0
+			}
+			if start > len(s) {
+				start = len(s)
+			}
+			return string(s[start:]), nil
+		},
+	},
+	"strpos": {
+		// strpos(haystack, needle) — 1-indexed position of needle in
+		// haystack, or 0 when not found. Function-form alias for
+		// `position(needle in haystack)` which uses keyword syntax we
+		// don't parse yet.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("strpos: takes 2 arguments, got %d", len(args))
+			}
+			return types.Int4, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			haystack := textArg(args[0])
+			needle := textArg(args[1])
+			if needle == "" {
+				return int32(1), nil
+			}
+			byteIdx := strings.Index(haystack, needle)
+			if byteIdx < 0 {
+				return int32(0), nil
+			}
+			// PG returns a 1-indexed *character* position; convert from
+			// byte offset by counting runes in the prefix.
+			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
+		},
+	},
+}
+
+// textArg is the soft cast every string-shaped builtin uses on its
+// already-non-nil argument. Plain strings pass through; everything
+// else gets fmt.Sprint as a forgiving fallback.
+func textArg(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
+// clampSubstringRange computes the [start, end) rune-index slice for
+// substring(s, from, count) under PG's "1-indexed; from<1 shortens the
+// captured slice rather than shifting it" rule. length is len([]rune(s)).
+//
+// Examples (from, count, length) → (start, end):
+//
+//	(7, 5, 11) → (6, 11)   `substring('hello world', 7, 5)` = "world"
+//	(0, 2, 3)  → (0, 1)    `substring('abc', 0, 2)`         = "a"
+//	(2, 100, 3) → (1, 3)   `substring('abc', 2, 100)`       = "bc"
+func clampSubstringRange(from, count, length int) (int, int) {
+	upper := from + count - 1 // 1-indexed inclusive upper bound
+	if from < 1 {
+		from = 1
+	}
+	start := from - 1
+	end := upper
+	if end > length {
+		end = length
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
+}
+
+// substringIntArg coerces a substring offset/length into a Go int.
+// substring's int args are int4 in PG so we accept int32, int64, and
+// int for ergonomics.
+func substringIntArg(v any) (int, error) {
+	switch n := v.(type) {
+	case int32:
+		return int(n), nil
+	case int64:
+		return int(n), nil
+	case int:
+		return n, nil
+	default:
+		return 0, fmt.Errorf("substring: int arg got %T", v)
+	}
 }
 
 // firstNonNilType returns the first arg's non-nil Type, falling back
