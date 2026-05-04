@@ -244,6 +244,34 @@ type CreateTable struct {
 
 func (*CreateTable) node() {}
 
+// AlterTableAction tags one of the schema-mutation forms our ALTER
+// TABLE accepts: add a column, drop a column, rename a column. PG
+// allows comma-separated mixes; we model each as its own statement
+// today.
+type AlterTableAction int
+
+const (
+	AlterTableAddColumn AlterTableAction = iota
+	AlterTableDropColumn
+	AlterTableRenameColumn
+)
+
+// AlterTable mutates a table's schema in place. AddCol carries the
+// new column when Action is AlterTableAddColumn; DropName /
+// IfExistsCol applies to AlterTableDropColumn; RenameOldName /
+// RenameNewName apply to AlterTableRenameColumn.
+type AlterTable struct {
+	Table       string
+	Action      AlterTableAction
+	AddCol      ColumnDef
+	DropName    string
+	IfExistsCol bool
+	RenameOld   string
+	RenameNew   string
+}
+
+func (*AlterTable) node() {}
+
 // CreateIndex is a no-op DDL — pgmem-go has no real index machinery,
 // so CREATE INDEX is accepted purely for migration-tool / sqlc-init
 // compatibility. The Name / Table / Concurrently / IfNotExists

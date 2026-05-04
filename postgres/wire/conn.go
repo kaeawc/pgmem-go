@@ -223,6 +223,8 @@ func defaultTag(plan ir.Node) string {
 		return "CREATE VIEW"
 	case *ir.DropView:
 		return "DROP VIEW"
+	case *ir.AlterTable:
+		return "ALTER TABLE"
 	case *ir.CreateIndex:
 		return "CREATE INDEX"
 	case *ir.DropIndex:
