@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
@@ -533,6 +534,10 @@ func ByOID(oid uint32) (Type, bool) {
 		return UUID, true
 	case 3802:
 		return JSONB, true
+	case 700:
+		return Float4, true
+	case 701:
+		return Float8, true
 	case 1007:
 		return Int4Array, true
 	case 1009:
@@ -541,6 +546,110 @@ func ByOID(oid uint32) (Type, bool) {
 		return Int8Array, true
 	default:
 		return nil, false
+	}
+}
+
+// Float8 is PG `double precision` (OID 701, 8 bytes IEEE-754 BE).
+var Float8 Type = &float8Type{}
+
+type float8Type struct{}
+
+func (*float8Type) Name() string { return "float8" }
+func (*float8Type) OID() uint32  { return 701 }
+func (*float8Type) Size() int16  { return 8 }
+
+func (*float8Type) EncodeText(v any) ([]byte, error) {
+	f, ok := asFloat64(v)
+	if !ok {
+		return nil, fmt.Errorf("float8 EncodeText: unsupported %T", v)
+	}
+	return strconv.AppendFloat(nil, f, 'g', -1, 64), nil
+}
+
+func (*float8Type) EncodeBinary(v any) ([]byte, error) {
+	f, ok := asFloat64(v)
+	if !ok {
+		return nil, fmt.Errorf("float8 EncodeBinary: unsupported %T", v)
+	}
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, math.Float64bits(f))
+	return b, nil
+}
+
+func (*float8Type) DecodeText(b []byte) (any, error) {
+	f, err := strconv.ParseFloat(string(b), 64)
+	if err != nil {
+		return nil, fmt.Errorf("float8 DecodeText: %w", err)
+	}
+	return f, nil
+}
+
+func (*float8Type) DecodeBinary(b []byte) (any, error) {
+	if len(b) != 8 {
+		return nil, fmt.Errorf("float8 DecodeBinary: want 8 bytes, got %d", len(b))
+	}
+	return math.Float64frombits(binary.BigEndian.Uint64(b)), nil
+}
+
+// Float4 is PG `real` (OID 700, 4 bytes IEEE-754 BE).
+var Float4 Type = &float4Type{}
+
+type float4Type struct{}
+
+func (*float4Type) Name() string { return "float4" }
+func (*float4Type) OID() uint32  { return 700 }
+func (*float4Type) Size() int16  { return 4 }
+
+func (*float4Type) EncodeText(v any) ([]byte, error) {
+	f, ok := asFloat64(v)
+	if !ok {
+		return nil, fmt.Errorf("float4 EncodeText: unsupported %T", v)
+	}
+	return strconv.AppendFloat(nil, f, 'g', -1, 32), nil
+}
+
+func (*float4Type) EncodeBinary(v any) ([]byte, error) {
+	f, ok := asFloat64(v)
+	if !ok {
+		return nil, fmt.Errorf("float4 EncodeBinary: unsupported %T", v)
+	}
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, math.Float32bits(float32(f)))
+	return b, nil
+}
+
+func (*float4Type) DecodeText(b []byte) (any, error) {
+	f, err := strconv.ParseFloat(string(b), 32)
+	if err != nil {
+		return nil, fmt.Errorf("float4 DecodeText: %w", err)
+	}
+	return float32(f), nil
+}
+
+func (*float4Type) DecodeBinary(b []byte) (any, error) {
+	if len(b) != 4 {
+		return nil, fmt.Errorf("float4 DecodeBinary: want 4 bytes, got %d", len(b))
+	}
+	return math.Float32frombits(binary.BigEndian.Uint32(b)), nil
+}
+
+// asFloat64 normalises numeric inputs into a single channel for the
+// float encoders. Decoders return the canonical Go type (float32 or
+// float64).
+func asFloat64(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case float32:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case int32:
+		return float64(x), true
+	case int:
+		return float64(x), true
+	default:
+		return 0, false
 	}
 }
 
@@ -960,6 +1069,10 @@ func ByName(name string) (Type, bool) {
 		return Timestamptz, true
 	case "jsonb":
 		return JSONB, true
+	case "float8", "double precision":
+		return Float8, true
+	case "float4", "real":
+		return Float4, true
 	case "int[]", "integer[]", "int4[]":
 		return Int4Array, true
 	case "bigint[]", "int8[]":

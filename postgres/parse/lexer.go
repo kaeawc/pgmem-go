@@ -415,6 +415,27 @@ func lexNumber(src string, i int) (token, int) {
 	for i < len(src) && isDigit(src[i]) {
 		i++
 	}
+	// Optional fractional part. We require at least one digit after the
+	// `.` so `42.` doesn't lex as a number-then-punct.
+	if i+1 < len(src) && src[i] == '.' && isDigit(src[i+1]) {
+		i++
+		for i < len(src) && isDigit(src[i]) {
+			i++
+		}
+	}
+	// Optional exponent: e / E, optional sign, then digits.
+	if i < len(src) && (src[i] == 'e' || src[i] == 'E') {
+		j := i + 1
+		if j < len(src) && (src[j] == '+' || src[j] == '-') {
+			j++
+		}
+		if j < len(src) && isDigit(src[j]) {
+			i = j
+			for i < len(src) && isDigit(src[i]) {
+				i++
+			}
+		}
+	}
 	return token{tNumber, src[start:i], start}, i - start
 }
 

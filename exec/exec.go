@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -3075,6 +3076,18 @@ func castValue(v any, target types.Type) (any, error) {
 		// (the wire codec decodes parameters into the right Go slice
 		// type before the cast runs).
 		return v, nil
+	case types.Float8:
+		f, err := toFloat64(v)
+		if err != nil {
+			return nil, fmt.Errorf("cast to float8: %w", err)
+		}
+		return f, nil
+	case types.Float4:
+		f, err := toFloat64(v)
+		if err != nil {
+			return nil, fmt.Errorf("cast to float4: %w", err)
+		}
+		return float32(f), nil
 	default:
 		return nil, fmt.Errorf("cast to %s: unsupported", target.Name())
 	}
@@ -3337,6 +3350,60 @@ func binOpResultType(op string, l, r types.Type) types.Type {
 	return arithResultType(l, r)
 }
 
+func isFloatish(v any) bool {
+	switch v.(type) {
+	case float64, float32:
+		return true
+	}
+	return false
+}
+
+func toFloat64(v any) (float64, error) {
+	switch n := v.(type) {
+	case float64:
+		return n, nil
+	case float32:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	case int32:
+		return float64(n), nil
+	case int:
+		return float64(n), nil
+	}
+	return 0, fmt.Errorf("exec: not a number: %T", v)
+}
+
+func evalFloatArith(op string, l, r any) (any, error) {
+	lf, err := toFloat64(l)
+	if err != nil {
+		return nil, err
+	}
+	rf, err := toFloat64(r)
+	if err != nil {
+		return nil, err
+	}
+	switch op {
+	case "+":
+		return lf + rf, nil
+	case "-":
+		return lf - rf, nil
+	case "*":
+		return lf * rf, nil
+	case "/":
+		if rf == 0 {
+			return nil, &SQLError{Code: "22012", Message: "division by zero"}
+		}
+		return lf / rf, nil
+	case "%":
+		if rf == 0 {
+			return nil, &SQLError{Code: "22012", Message: "division by zero"}
+		}
+		return math.Mod(lf, rf), nil
+	}
+	return nil, fmt.Errorf("exec: unsupported float arith op %q", op)
+}
+
 // tryTimeArith handles timestamp ± interval arithmetic. Returns the
 // computed value with ok=true on a match, ok=false otherwise so
 // evalArith falls through to the integer path.
@@ -3373,6 +3440,14 @@ func arithResultType(l, r types.Type) types.Type {
 	}
 	if l == types.Text || r == types.Text {
 		return types.Text
+	}
+	if l == types.Float8 || r == types.Float8 {
+		return types.Float8
+	}
+	if l == types.Float4 || r == types.Float4 {
+		// Mixed float4/integer also widens to float8 in real PG
+		// because integer literals are int4. Stay close to that.
+		return types.Float8
 	}
 	if l == types.Int8 || r == types.Int8 {
 		return types.Int8
@@ -3715,6 +3790,9 @@ func evalArith(op string, l, r any, resultT types.Type) (any, error) {
 	if v, ok := tryTimeArith(op, l, r); ok {
 		return v, nil
 	}
+	if isFloatish(l) || isFloatish(r) || resultT == types.Float8 || resultT == types.Float4 {
+		return evalFloatArith(op, l, r)
+	}
 	li, err := toInt64(l)
 	if err != nil {
 		return nil, err
@@ -3834,6 +3912,23 @@ func evalUnaryOp(u *ir.UnaryOp, in Row, env *Env) (any, error) {
 // We compare on Go's native ordering for the integer/text types M2
 // supports. NULL handling is the caller's job.
 func compareValues(a, b any) (int, error) {
+	if isFloatish(a) || isFloatish(b) {
+		af, err := toFloat64(a)
+		if err != nil {
+			return 0, err
+		}
+		bf, err := toFloat64(b)
+		if err != nil {
+			return 0, err
+		}
+		switch {
+		case af < bf:
+			return -1, nil
+		case af > bf:
+			return 1, nil
+		}
+		return 0, nil
+	}
 	switch av := a.(type) {
 	case int32:
 		bv, err := toInt64(b)

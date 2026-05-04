@@ -510,6 +510,17 @@ func (p *parser) parsePrimary() (ir.Expr, error) {
 			return nil, err
 		}
 		name := typeName.val
+		// `double precision` and `character varying` are two-word
+		// types in real PG. If the next token is also an ident and
+		// "name word" forms a known type, consume it as part of the
+		// name. Otherwise fall through with the single-word name.
+		if p.peek().kind == tIdent {
+			combined := name + " " + p.peek().val
+			if _, ok := types.ByName(combined); ok {
+				p.consume()
+				name = combined
+			}
+		}
 		if p.accept(tLBracket) {
 			if !p.accept(tRBracket) {
 				return nil, fmt.Errorf("parse: expected ']' after '[' at %d", p.peek().pos)
@@ -730,10 +741,18 @@ func (p *parser) parseWindowSpec() (ir.WindowSpec, error) {
 	return spec, nil
 }
 
-// parseNumberLiteral picks int4 if the value fits, otherwise int8.
-// Floating-point literals land with the numeric type in M5.
+// parseNumberLiteral picks int4 / int8 / float8 based on the token's
+// shape. Tokens with a `.` or exponent land as float8; integers
+// outside the int4 range widen to int8.
 func (p *parser) parseNumberLiteral() (ir.Expr, error) {
 	t := p.consume()
+	if strings.ContainsAny(t.val, ".eE") {
+		f, err := strconv.ParseFloat(t.val, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse: bad float %q: %w", t.val, err)
+		}
+		return &ir.Literal{Value: f, T: types.Float8}, nil
+	}
 	n, err := strconv.ParseInt(t.val, 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("parse: bad integer %q: %w", t.val, err)
