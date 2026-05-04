@@ -95,6 +95,18 @@ type Limit struct {
 
 func (*Limit) node() {}
 
+// Union concatenates Left's and Right's rows in order. With All true
+// duplicates pass through; with All false the output is deduplicated
+// (UNION = UNION DISTINCT). Both sides must produce the same number
+// of columns; column names come from Left.
+type Union struct {
+	Left  Node
+	Right Node
+	All   bool
+}
+
+func (*Union) node() {}
+
 // Distinct keeps only one row per unique tuple of Input's columns.
 // Equivalent to wrapping a SELECT DISTINCT in a hash-set deduplicator.
 // Output schema matches Input.

@@ -47,7 +47,7 @@ func (p *parser) parseStmt() (ir.Node, error) {
 	tok := p.peek()
 	switch tok.kind {
 	case kwSelect:
-		return p.parseSelect()
+		return p.parseSelectMaybeUnion()
 	case kwInsert:
 		return p.parseInsert()
 	case kwDelete:
@@ -492,6 +492,32 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 }
 
 // --- SELECT ---
+
+// parseSelectMaybeUnion parses a SELECT, then any chain of
+// `UNION [ALL] SELECT ...`. Members are left-associated: the first
+// becomes the deepest Left in the resulting Union tree. ORDER BY /
+// LIMIT remain consumed by the inner parseSelect — applying them to
+// the whole union (real PG behaviour) needs grammar reshuffling that
+// we'll ship if a sqlc pattern needs it.
+func (p *parser) parseSelectMaybeUnion() (ir.Node, error) {
+	left, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	for p.peek().kind == kwUnion {
+		p.consume() // UNION
+		all := p.accept(kwAll)
+		if p.peek().kind != kwSelect {
+			return nil, fmt.Errorf("parse: expected SELECT after UNION at %d", p.peek().pos)
+		}
+		right, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		left = &ir.Union{Left: left, Right: right, All: all}
+	}
+	return left, nil
+}
 
 func (p *parser) parseSelect() (ir.Node, error) {
 	p.consume() // SELECT
