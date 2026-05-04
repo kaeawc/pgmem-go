@@ -128,13 +128,25 @@ type ColumnDef struct {
 	References *ColumnRefSpec
 }
 
-// ColumnRefSpec is the (table, column) pair a FOREIGN KEY references.
-// We use a struct rather than embedding the catalog type so the IR
-// stays catalog-package-free.
+// ColumnRefSpec is the (table, column) pair a FOREIGN KEY references,
+// plus the ON DELETE action. We use a struct rather than embedding the
+// catalog type so the IR stays catalog-package-free.
 type ColumnRefSpec struct {
-	Table  string
-	Column string
+	Table    string
+	Column   string
+	OnDelete OnDeleteAction
 }
+
+// OnDeleteAction enumerates the FK ON DELETE behaviours we model. The
+// zero value is RESTRICT, which matches PG's default when the clause
+// is omitted.
+type OnDeleteAction int
+
+const (
+	OnDeleteRestrict OnDeleteAction = iota // default; reject delete with 23503
+	OnDeleteCascade                        // delete the dependent rows too
+	OnDeleteSetNull                        // null out the FK column on dependents
+)
 
 // Assignment is one `column = expr` clause in an UPDATE's SET list.
 type Assignment struct {

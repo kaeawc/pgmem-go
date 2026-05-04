@@ -73,6 +73,7 @@ const (
 	kwCross
 	kwIn
 	kwReferences
+	kwCascade
 )
 
 type token struct {
@@ -120,6 +121,7 @@ var keywords = map[string]tokenKind{
 	"cross":      kwCross,
 	"in":         kwIn,
 	"references": kwReferences,
+	"cascade":    kwCascade,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

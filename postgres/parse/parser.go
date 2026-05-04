@@ -347,8 +347,8 @@ func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error)
 	return false, nil
 }
 
-// parseReferencesClause consumes `<table>(<col>)`. The REFERENCES
-// keyword has already been consumed by the caller.
+// parseReferencesClause consumes `<table>(<col>) [ON DELETE <action>]`.
+// The REFERENCES keyword has already been consumed by the caller.
 func (p *parser) parseReferencesClause() (*ir.ColumnRefSpec, error) {
 	tbl, err := p.expect(tIdent, "referenced table")
 	if err != nil {
@@ -364,7 +364,33 @@ func (p *parser) parseReferencesClause() (*ir.ColumnRefSpec, error) {
 	if _, err := p.expect(tRParen, ")"); err != nil {
 		return nil, err
 	}
-	return &ir.ColumnRefSpec{Table: tbl.val, Column: col.val}, nil
+	spec := &ir.ColumnRefSpec{Table: tbl.val, Column: col.val}
+	if p.peek().kind == kwOn && p.lookahead(1).kind == kwDelete {
+		p.consume() // ON
+		p.consume() // DELETE
+		action, err := p.parseOnDeleteAction()
+		if err != nil {
+			return nil, err
+		}
+		spec.OnDelete = action
+	}
+	return spec, nil
+}
+
+// parseOnDeleteAction reads CASCADE / SET NULL / RESTRICT (NO ACTION
+// is treated as the default and not parsed in this slice).
+func (p *parser) parseOnDeleteAction() (ir.OnDeleteAction, error) {
+	switch {
+	case p.accept(kwCascade):
+		return ir.OnDeleteCascade, nil
+	case p.accept(kwSet):
+		if _, err := p.expect(kwNull, "NULL"); err != nil {
+			return 0, err
+		}
+		return ir.OnDeleteSetNull, nil
+	default:
+		return 0, fmt.Errorf("parse: expected CASCADE or SET NULL after ON DELETE at %d", p.peek().pos)
+	}
 }
 
 // --- INSERT ---

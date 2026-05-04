@@ -571,7 +571,11 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		for i, c := range p.Columns {
 			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto}
 			if c.References != nil {
-				cols[i].References = catalog.ColumnRef{Table: c.References.Table, Column: c.References.Column}
+				cols[i].References = catalog.ColumnRef{
+					Table:    c.References.Table,
+					Column:   c.References.Column,
+					OnDelete: catalog.OnDeleteAction(c.References.OnDelete),
+				}
 			}
 			if c.Check != nil {
 				checks = append(checks, catalog.Check{
@@ -930,13 +934,17 @@ func rowExistsWithValue(rows []storage.Row, colIdx int, want any) bool {
 	return false
 }
 
-// checkReferencingTables enforces "ON DELETE RESTRICT" — refusing to
-// delete a parent row if any other table references it. Walks every
-// table in the schema, finds columns whose References point at ct, and
-// scans for rows pointing at any of the deleted rows. RESTRICT is the
-// default and the only mode this slice supports; CASCADE / SET NULL
-// land in a follow-up.
-func checkReferencingTables(parent catalog.Table, deleted []storage.Row, env *Env) error {
+// applyDeleteCascades walks every other table that references parent
+// and dispatches on each FK column's OnDelete action:
+//   - RESTRICT (default): if any surviving child row points at a
+//     deleted parent row, abort with SQLSTATE 23503.
+//   - CASCADE: delete the matching child rows from their table. May
+//     recursively cascade if those rows are themselves referenced.
+//   - SET NULL: rewrite the child column to NULL on matching rows.
+//
+// All work goes through the txn snapshots so cascades roll back
+// cleanly with the surrounding transaction.
+func applyDeleteCascades(parent catalog.Table, deleted []storage.Row, env *Env) error {
 	if env == nil || len(deleted) == 0 {
 		return nil
 	}
@@ -956,28 +964,114 @@ func checkReferencingTables(parent catalog.Table, deleted []storage.Row, env *En
 			if !ok {
 				continue
 			}
-			childTbl, _ := env.Txn.Table(child.Name)
-			if childTbl == nil {
-				continue
-			}
-			childRows := childTbl.Rows()
-			for _, deletedRow := range deleted {
-				if pIdx >= len(deletedRow) || deletedRow[pIdx] == nil {
-					continue
-				}
-				for _, cr := range childRows {
-					if childColIdx >= len(cr) || cr[childColIdx] == nil {
-						continue
-					}
-					cmp, err := compareValues(cr[childColIdx], deletedRow[pIdx])
-					if err == nil && cmp == 0 {
-						return FKViolationOnDelete(parent.Name, child.Name)
-					}
-				}
+			if err := applyChildAction(parent, deleted, pIdx, child, childCol, childColIdx, env); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// applyChildAction handles one (parent, child, childCol) triple. It
+// scans child rows for matches against the deleted parent values and
+// dispatches by action.
+func applyChildAction(parent catalog.Table, deleted []storage.Row, pIdx int,
+	child catalog.Table, childCol catalog.Column, childColIdx int, env *Env) error {
+	childTbl, _ := env.Txn.Table(child.Name)
+	if childTbl == nil {
+		return nil
+	}
+	parentVals := collectNonNullValues(deleted, pIdx)
+	if len(parentVals) == 0 {
+		return nil
+	}
+	matches := matchingChildRowIndexes(childTbl.Rows(), childColIdx, parentVals)
+	if len(matches) == 0 {
+		return nil
+	}
+	switch childCol.References.OnDelete {
+	case catalog.OnDeleteRestrict:
+		return FKViolationOnDelete(parent.Name, child.Name)
+	case catalog.OnDeleteCascade:
+		return cascadeChildDelete(child, childTbl, matches, env)
+	case catalog.OnDeleteSetNull:
+		setChildColumnNull(childTbl, matches, childColIdx)
+		return nil
+	default:
+		return fmt.Errorf("exec: unknown FK OnDelete action %d", childCol.References.OnDelete)
+	}
+}
+
+func collectNonNullValues(rows []storage.Row, idx int) []any {
+	var out []any
+	for _, r := range rows {
+		if idx >= len(r) || r[idx] == nil {
+			continue
+		}
+		out = append(out, r[idx])
+	}
+	return out
+}
+
+func matchingChildRowIndexes(rows []storage.Row, colIdx int, vals []any) []int {
+	var out []int
+	for i, r := range rows {
+		if colIdx >= len(r) || r[colIdx] == nil {
+			continue
+		}
+		for _, v := range vals {
+			if cmp, err := compareValues(r[colIdx], v); err == nil && cmp == 0 {
+				out = append(out, i)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// cascadeChildDelete drops the matched rows from the child table and
+// recursively applies cascades to anything that referenced *them*.
+func cascadeChildDelete(child catalog.Table, childTbl storage.Table, drop []int, env *Env) error {
+	dropSet := make(map[int]bool, len(drop))
+	for _, i := range drop {
+		dropSet[i] = true
+	}
+	var removed []storage.Row
+	childTbl.Mutate(func(rows []storage.Row) []storage.Row {
+		kept := make([]storage.Row, 0, len(rows))
+		for i, r := range rows {
+			if dropSet[i] {
+				removed = append(removed, r)
+				continue
+			}
+			kept = append(kept, r)
+		}
+		return kept
+	})
+	return applyDeleteCascades(child, removed, env)
+}
+
+// setChildColumnNull rewrites colIdx to nil on each matched row. NULL
+// on a NOT NULL column would be caught by a re-validation pass, but we
+// rely on the user to have declared the FK column nullable when they
+// chose SET NULL — matching PG's runtime error in that misconfigured
+// case is a follow-up.
+func setChildColumnNull(childTbl storage.Table, matches []int, colIdx int) {
+	matchSet := make(map[int]bool, len(matches))
+	for _, i := range matches {
+		matchSet[i] = true
+	}
+	childTbl.Mutate(func(rows []storage.Row) []storage.Row {
+		for i := range rows {
+			if !matchSet[i] {
+				continue
+			}
+			if colIdx < len(rows[i]) {
+				rows[i][colIdx] = nil
+			}
+		}
+		return rows
+	})
 }
 
 // checkChecks evaluates each CHECK constraint against every incoming
@@ -1146,9 +1240,9 @@ func (d *deleteOp) runOnce() error {
 				kept = append(kept, row)
 			}
 		}
-		// FK RESTRICT: if any child table still references rows we're
-		// about to delete, abort and leave the parent table unchanged.
-		if err := checkReferencingTables(d.ct, deleted, d.env); err != nil {
+		// FK enforcement: RESTRICT aborts, CASCADE recursively deletes
+		// child rows, SET NULL nulls out the FK column on dependents.
+		if err := applyDeleteCascades(d.ct, deleted, d.env); err != nil {
 			evalErr = err
 			deleted = nil
 			return rows
