@@ -1151,6 +1151,14 @@ func (p *parser) parseSelectItem() (ir.Expr, string, error) {
 		p.consume()
 		return &ir.StarRef{}, "", nil
 	}
+	// `SELECT t.*` — expand to all columns from `t`. The qualified
+	// form requires the followers in this order: ident, dot, star.
+	if p.peek().kind == tIdent && p.peekNext().kind == tDot && p.pos+2 < len(p.toks) && p.toks[p.pos+2].kind == tStar {
+		t := p.consume()
+		p.consume() // .
+		p.consume() // *
+		return &ir.StarRef{Qualifier: t.val}, "", nil
+	}
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, "", err

@@ -204,8 +204,11 @@ func expandStarRefs(exprs []ir.Expr, names []string, schema []Column) ([]ir.Expr
 	outExprs := make([]ir.Expr, 0, len(exprs)+len(schema))
 	outNames := make([]string, 0, len(exprs)+len(schema))
 	for i, e := range exprs {
-		if _, ok := e.(*ir.StarRef); ok {
+		if star, ok := e.(*ir.StarRef); ok {
 			for _, c := range schema {
+				if star.Qualifier != "" && star.Qualifier != c.Qualifier {
+					continue
+				}
 				outExprs = append(outExprs, &ir.ColumnRef{Qualifier: c.Qualifier, Name: c.Name})
 				outNames = append(outNames, c.Name)
 			}

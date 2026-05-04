@@ -404,8 +404,12 @@ func (u *UnaryOp) Type() types.Type { return u.T }
 
 // StarRef is the `*` placeholder in a SELECT list. Planning expands
 // it to the full set of input-schema columns (`expand` in
-// exec/project.go) — it never reaches evaluation time.
-type StarRef struct{}
+// exec/project.go) — it never reaches evaluation time. Qualifier,
+// when set, restricts expansion to columns whose schema entry has a
+// matching qualifier — that's the `t.*` form.
+type StarRef struct {
+	Qualifier string
+}
 
 func (*StarRef) expr()            {}
 func (*StarRef) Type() types.Type { return nil }
