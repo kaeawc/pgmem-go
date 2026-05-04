@@ -67,6 +67,9 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 		}
 	case *ir.Distinct:
 		walkParams(p.Input, sch, scopeFor(p.Input, scopeTable), hint, maxIdx)
+	case *ir.Union:
+		walkParams(p.Left, sch, scopeTable, hint, maxIdx)
+		walkParams(p.Right, sch, scopeTable, hint, maxIdx)
 	case *ir.Insert:
 		walkParamsInsert(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Delete:

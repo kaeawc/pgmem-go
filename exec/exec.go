@@ -98,6 +98,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildAggregate(p, env)
 	case *ir.Distinct:
 		return buildDistinct(p, env)
+	case *ir.Union:
+		return buildUnion(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -490,6 +492,72 @@ func (d *distinctOp) Next(ctx context.Context) (Row, error) {
 		d.seen[key] = struct{}{}
 		return row, nil
 	}
+}
+
+// --- Union ---
+
+// buildUnion compiles `Left UNION [ALL] Right`. Output schema is taken
+// from Left; if the two sides disagree on column count we error at
+// build time. UNION (without ALL) wraps the result in a distinct op.
+func buildUnion(p *ir.Union, env *Env) (Operator, error) {
+	left, err := Build(p.Left, env)
+	if err != nil {
+		return nil, err
+	}
+	right, err := Build(p.Right, env)
+	if err != nil {
+		left.Close()
+		return nil, err
+	}
+	if len(left.OutputSchema()) != len(right.OutputSchema()) {
+		left.Close()
+		right.Close()
+		return nil, fmt.Errorf("exec: UNION column count mismatch: %d vs %d",
+			len(left.OutputSchema()), len(right.OutputSchema()))
+	}
+	var out Operator = &unionOp{left: left, right: right, cols: left.OutputSchema()}
+	if !p.All {
+		out = &distinctOp{in: out, seen: map[string]struct{}{}}
+	}
+	return out, nil
+}
+
+type unionOp struct {
+	left      Operator
+	right     Operator
+	cols      []Column
+	leftDone  bool
+	rightDone bool
+}
+
+func (u *unionOp) OutputSchema() []Column { return u.cols }
+func (u *unionOp) Close() error {
+	lerr := u.left.Close()
+	rerr := u.right.Close()
+	if lerr != nil {
+		return lerr
+	}
+	return rerr
+}
+
+func (u *unionOp) Next(ctx context.Context) (Row, error) {
+	if !u.leftDone {
+		row, err := u.left.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			u.leftDone = true
+		} else {
+			return row, err
+		}
+	}
+	if !u.rightDone {
+		row, err := u.right.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			u.rightDone = true
+			return nil, io.EOF
+		}
+		return row, err
+	}
+	return nil, io.EOF
 }
 
 // --- Sort ---
