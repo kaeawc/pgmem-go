@@ -3,6 +3,7 @@ package exec
 import (
 	"crypto/rand"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kaeawc/pgmem-go/ir"
@@ -44,6 +45,55 @@ var builtins = map[string]builtinFunc{
 		// §5) will replace time.Now once it lands.
 		Eval: func(_ []any) (any, error) { return time.Now().UTC(), nil },
 	},
+	"lower": {
+		ResultType: oneArg(types.Text),
+		Eval:       evalUnaryString(strings.ToLower),
+	},
+	"upper": {
+		ResultType: oneArg(types.Text),
+		Eval:       evalUnaryString(strings.ToUpper),
+	},
+	"length": {
+		ResultType: oneArg(types.Int4),
+		// PG length() on text returns int (int4) and counts characters
+		// — UTF-8 code points, not bytes. We use rune count for the
+		// same behaviour.
+		Eval: func(args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("length: want text, got %T", args[0])
+			}
+			return int32(len([]rune(s))), nil
+		},
+	},
+}
+
+// oneArg is a ResultType for fixed-1-arg functions returning t.
+func oneArg(t types.Type) func([]ir.Expr) (types.Type, error) {
+	return func(args []ir.Expr) (types.Type, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("function takes 1 argument, got %d", len(args))
+		}
+		return t, nil
+	}
+}
+
+// evalUnaryString lifts a string→string function into the builtin
+// Eval shape. NULL input → NULL output. Non-string input is rejected.
+func evalUnaryString(fn func(string) string) func([]any) (any, error) {
+	return func(args []any) (any, error) {
+		if args[0] == nil {
+			return nil, nil
+		}
+		s, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("want text, got %T", args[0])
+		}
+		return fn(s), nil
+	}
 }
 
 // noArgs returns a ResultType that errors unless the call has zero

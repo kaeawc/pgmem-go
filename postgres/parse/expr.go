@@ -126,6 +126,8 @@ func additiveOp(k tokenKind) (string, bool) {
 		return "+", true
 	case tMinus:
 		return "-", true
+	case tConcat:
+		return "||", true
 	}
 	return "", false
 }
