@@ -835,7 +835,57 @@ func (p *parser) parseSelect() (ir.Node, error) {
 			return nil, err
 		}
 	}
+	if err := p.skipLockingClause(); err != nil {
+		return nil, err
+	}
 	return plan, nil
+}
+
+// skipLockingClause swallows `FOR UPDATE`, `FOR SHARE`, `FOR NO KEY
+// UPDATE`, `FOR KEY SHARE` plus optional `OF ident,...` and trailing
+// `NOWAIT` / `SKIP LOCKED`. We don't model row locks, so the syntax
+// is accepted as a no-op — sqlc-generated transactional reads stop
+// rejecting at parse time.
+func (p *parser) skipLockingClause() error {
+	if !p.accept(kwFor) {
+		return nil
+	}
+	switch {
+	case p.accept(kwUpdate):
+	case p.acceptIdent("share"):
+	case p.accept(kwKey):
+		if !p.acceptIdent("share") {
+			return fmt.Errorf("parse: expected SHARE after FOR KEY at %d", p.peek().pos)
+		}
+	case p.acceptIdent("no"):
+		if !p.accept(kwKey) {
+			return fmt.Errorf("parse: expected KEY after FOR NO at %d", p.peek().pos)
+		}
+		if !p.accept(kwUpdate) {
+			return fmt.Errorf("parse: expected UPDATE after FOR NO KEY at %d", p.peek().pos)
+		}
+	default:
+		return fmt.Errorf("parse: unexpected token %q after FOR", p.peek().val)
+	}
+	if p.acceptIdent("of") {
+		for {
+			if _, err := p.expect(tIdent, "table name"); err != nil {
+				return err
+			}
+			if !p.accept(tComma) {
+				break
+			}
+		}
+	}
+	if p.acceptIdent("nowait") {
+		return nil
+	}
+	if p.acceptIdent("skip") {
+		if !p.acceptIdent("locked") {
+			return fmt.Errorf("parse: expected LOCKED after SKIP at %d", p.peek().pos)
+		}
+	}
+	return nil
 }
 
 // parseGroupByList consumes `expr [, expr ...]`. Each entry must be a

@@ -103,6 +103,7 @@ const (
 	kwUnion
 	kwAll
 	kwWith
+	kwFor
 )
 
 type token struct {
@@ -169,6 +170,7 @@ var keywords = map[string]tokenKind{
 	"union":      kwUnion,
 	"all":        kwAll,
 	"with":       kwWith,
+	"for":        kwFor,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
