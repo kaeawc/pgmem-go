@@ -607,6 +607,7 @@ func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
 		}
 		return &ir.FuncCall{Name: name, Args: nil, Star: true}, nil
 	}
+	distinct := p.accept(kwDistinct)
 	var args []ir.Expr
 	if p.peek().kind != tRParen {
 		for {
@@ -624,7 +625,7 @@ func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
 	if _, err := p.expect(tRParen, ")"); err != nil {
 		return nil, err
 	}
-	return &ir.FuncCall{Name: name, Args: args}, nil
+	return &ir.FuncCall{Name: name, Args: args, Distinct: distinct}, nil
 }
 
 // parseNumberLiteral picks int4 if the value fits, otherwise int8.

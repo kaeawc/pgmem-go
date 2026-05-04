@@ -984,7 +984,7 @@ func buildScalarOrPlainSelect(input ir.Node, exprs []ir.Expr, names []string) (i
 		if !fc.Star {
 			args = fc.Args
 		}
-		calls[i] = ir.AggregateCall{Func: fc.Name, Args: args, Output: names[i]}
+		calls[i] = ir.AggregateCall{Func: fc.Name, Args: args, Output: names[i], Distinct: fc.Distinct}
 	}
 	return &ir.Aggregate{Input: input, Calls: calls}, nil
 }
@@ -1084,7 +1084,7 @@ func (r *aggRewriter) replaceAggregate(fc *ir.FuncCall) ir.Expr {
 	if !fc.Star {
 		args = fc.Args
 	}
-	r.calls = append(r.calls, ir.AggregateCall{Func: fc.Name, Args: args, Output: synth})
+	r.calls = append(r.calls, ir.AggregateCall{Func: fc.Name, Args: args, Output: synth, Distinct: fc.Distinct})
 	return &ir.ColumnRef{Name: synth}
 }
 
