@@ -32,6 +32,10 @@ const (
 	tCast      // ::
 	tArrow     // ->
 	tArrowText // ->>
+	tRegex     // ~
+	tRegexI    // ~*
+	tNRegex    // !~
+	tNRegexI   // !~*
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -210,11 +214,16 @@ func lex(src string) ([]token, error) {
 			out = append(out, tok)
 			i += n
 		case c == '!':
-			if i+1 >= len(src) || src[i+1] != '=' {
-				return nil, fmt.Errorf("lex: stray '!' at %d", i)
+			tok, n, err := lexBang(src, i)
+			if err != nil {
+				return nil, err
 			}
-			out = append(out, token{tNeq, "!=", i})
-			i += 2
+			out = append(out, tok)
+			i += n
+		case c == '~':
+			tok, n := lexTilde(src, i)
+			out = append(out, tok)
+			i += n
 		case c == '|':
 			if i+1 >= len(src) || src[i+1] != '|' {
 				return nil, fmt.Errorf("lex: stray '|' at %d (expected ||)", i)
@@ -272,6 +281,25 @@ func skipLineComment(src string, i int) int {
 		i++
 	}
 	return i
+}
+
+func lexBang(src string, i int) (token, int, error) {
+	switch {
+	case i+1 < len(src) && src[i+1] == '=':
+		return token{tNeq, "!=", i}, 2, nil
+	case i+2 < len(src) && src[i+1] == '~' && src[i+2] == '*':
+		return token{tNRegexI, "!~*", i}, 3, nil
+	case i+1 < len(src) && src[i+1] == '~':
+		return token{tNRegex, "!~", i}, 2, nil
+	}
+	return token{}, 0, fmt.Errorf("lex: stray '!' at %d", i)
+}
+
+func lexTilde(src string, i int) (token, int) {
+	if i+1 < len(src) && src[i+1] == '*' {
+		return token{tRegexI, "~*", i}, 2
+	}
+	return token{tRegex, "~", i}, 1
 }
 
 func lexLt(src string, i int) (token, int) {

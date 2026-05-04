@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -2700,6 +2701,14 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 		return evalJSONArrow(l, r, false)
 	case "->>":
 		return evalJSONArrow(l, r, true)
+	case "~":
+		return evalRegex(l, r, false, false)
+	case "~*":
+		return evalRegex(l, r, true, false)
+	case "!~":
+		return evalRegex(l, r, false, true)
+	case "!~*":
+		return evalRegex(l, r, true, true)
 	}
 	cmp, err := compareValues(l, r)
 	if err != nil {
@@ -2856,6 +2865,34 @@ func jsonArrowSelect(doc any, idx any) (any, bool) {
 		return d[i], true
 	}
 	return nil, false
+}
+
+// evalRegex implements PG's `~`, `~*`, `!~`, `!~*` regex match
+// operators. Patterns compile per-call — caching by Expr identity is
+// a follow-up. Compilation errors surface to the caller; PG would
+// raise SQLSTATE 22023 here, but our tests don't yet inspect the
+// code so a plain error suffices.
+func evalRegex(l, r any, ignoreCase, negate bool) (any, error) {
+	s, ok := l.(string)
+	if !ok {
+		return nil, fmt.Errorf("exec: regex left operand must be text, got %T", l)
+	}
+	p, ok := r.(string)
+	if !ok {
+		return nil, fmt.Errorf("exec: regex pattern must be text, got %T", r)
+	}
+	if ignoreCase {
+		p = "(?i)" + p
+	}
+	re, err := regexp.Compile(p)
+	if err != nil {
+		return nil, fmt.Errorf("exec: invalid regex %q: %w", p, err)
+	}
+	matched := re.MatchString(s)
+	if negate {
+		return !matched, nil
+	}
+	return matched, nil
 }
 
 // evalLike implements PG's LIKE / ILIKE pattern matching: `_` matches
