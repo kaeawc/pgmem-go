@@ -324,6 +324,16 @@ func mapSavepointErr(err error) error {
 	return err
 }
 
+// mapSerializationErr converts storage.SerializationError to SQLSTATE
+// 40001. Returned only by Commit; surfaces at COMMIT time.
+func mapSerializationErr(err error) error {
+	var sErr *storage.SerializationError
+	if errors.As(err, &sErr) {
+		return &exec.SQLError{Code: "40001", Message: err.Error()}
+	}
+	return err
+}
+
 func (c *conn) beginTx(ctx context.Context, tag string) error {
 	if c.currentTxn != nil {
 		// Real PG emits a warning notice and continues; we just ack.
@@ -356,7 +366,7 @@ func (c *conn) commitTx(tag string) error {
 	if err := c.currentTxn.Commit(); err != nil {
 		c.currentTxn = nil
 		c.txState = 'I'
-		return err
+		return mapSerializationErr(err)
 	}
 	c.currentTxn = nil
 	c.txState = 'I'
@@ -533,14 +543,14 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 	if err != nil {
 		return err
 	}
-	commit := false
+	committed := false
 	defer func() {
-		if ownsTxn {
-			if commit {
-				_ = txn.Commit()
-			} else {
-				_ = txn.Rollback()
-			}
+		// Rollback is the safety net for the panic / early-return path.
+		// On the happy auto-commit path runQuery commits explicitly
+		// before returning so commit-time errors (SerializationError on
+		// concurrent writes) propagate to the caller.
+		if ownsTxn && !committed {
+			_ = txn.Rollback()
 		}
 	}()
 
@@ -588,8 +598,13 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 		c.be.Send(dr)
 		count++
 	}
+	if ownsTxn {
+		if err := mapSerializationErr(txn.Commit()); err != nil {
+			return err
+		}
+		committed = true
+	}
 	c.be.Send(&pgproto3.CommandComplete{CommandTag: []byte(commandTag(op, stmt.tag, count))})
-	commit = true
 	return nil
 }
 
