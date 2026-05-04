@@ -1182,7 +1182,7 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		cols := make([]catalog.Column, len(p.Columns))
 		var checks []catalog.Check
 		for i, c := range p.Columns {
-			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto}
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto, Default: c.Default}
 			if c.References != nil {
 				cols[i].References = catalog.ColumnRef{
 					Table:    c.References.Table,
@@ -1246,7 +1246,7 @@ func alterTableAdd(env *Env, tbl catalog.Table, def ir.ColumnDef) error {
 	if def.NotNull && len(rows) > 0 {
 		return &SQLError{Code: "23502", Message: fmt.Sprintf("column %q contains null values", def.Name)}
 	}
-	newCol := catalog.Column{Name: def.Name, Type: def.Type, NotNull: def.NotNull, Unique: def.Unique, Auto: def.Auto}
+	newCol := catalog.Column{Name: def.Name, Type: def.Type, NotNull: def.NotNull, Unique: def.Unique, Auto: def.Auto, Default: def.Default}
 	if def.References != nil {
 		newCol.References = catalog.ColumnRef{
 			Table:    def.References.Table,
@@ -1761,6 +1761,10 @@ func (i *insertOp) runOnce() error {
 	// is in place but the *operator* still owes all-or-nothing on
 	// constraint failures within a single statement.
 	autoCols := autoColumnIndexes(i.ct, i.colMap)
+	defaultCols, err := resolveDefaultColumns(i.ct, i.colMap, i.env)
+	if err != nil {
+		return err
+	}
 	rawRows, err := i.collectInputRows()
 	if err != nil {
 		return err
@@ -1772,6 +1776,9 @@ func (i *insertOp) runOnce() error {
 			row[i.colMap[j]] = v
 		}
 		fillAutoColumns(row, i.ct, autoCols, i.table)
+		if err := fillDefaultColumns(row, defaultCols, i.env); err != nil {
+			return err
+		}
 		if err := checkNotNull(i.ct, row); err != nil {
 			return err
 		}
@@ -1962,6 +1969,54 @@ func autoColumnIndexes(ct catalog.Table, colMap []int) []int {
 		}
 	}
 	return out
+}
+
+// defaultColumn pairs a catalog column index with its resolved
+// DEFAULT expression. Used by insertOp to fill columns the INSERT
+// didn't mention (and that aren't Auto).
+type defaultColumn struct {
+	idx  int
+	expr ir.Expr
+}
+
+// resolveDefaultColumns returns one entry per catalog column that has
+// a DEFAULT and was not in colMap (and is not Auto, since Auto wins).
+// The expression is resolved once against an empty schema — DEFAULTs
+// can't reference other columns of the same row in pgmem-go today.
+func resolveDefaultColumns(ct catalog.Table, colMap []int, env *Env) ([]defaultColumn, error) {
+	mentioned := make(map[int]bool, len(colMap))
+	for _, idx := range colMap {
+		mentioned[idx] = true
+	}
+	var out []defaultColumn
+	for idx, c := range ct.Columns {
+		if c.Default == nil || mentioned[idx] || c.Auto {
+			continue
+		}
+		expr, err := resolveExpr(c.Default, nil, env)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, defaultColumn{idx: idx, expr: expr})
+	}
+	return out, nil
+}
+
+// fillDefaultColumns evaluates each resolved default and writes the
+// result into the row's slot. Skipped if the slot already holds a
+// non-nil value (Auto column path may have populated it).
+func fillDefaultColumns(row storage.Row, defaults []defaultColumn, env *Env) error {
+	for _, d := range defaults {
+		if d.idx < len(row) && row[d.idx] != nil {
+			continue
+		}
+		v, err := evalExpr(d.expr, nil, env)
+		if err != nil {
+			return err
+		}
+		row[d.idx] = v
+	}
+	return nil
 }
 
 // fillAutoColumns writes the next sequence value into every Auto column

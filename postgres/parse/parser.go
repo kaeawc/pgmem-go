@@ -918,6 +918,12 @@ func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error)
 			return false, err
 		}
 		def.References = ref
+	case p.acceptIdent("default"):
+		expr, err := p.parseExpr()
+		if err != nil {
+			return false, err
+		}
+		def.Default = expr
 	default:
 		return true, nil
 	}
