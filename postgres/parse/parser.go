@@ -388,7 +388,7 @@ func (p *parser) parseReferencesClause() (*ir.ColumnRefSpec, error) {
 		return nil, err
 	}
 	spec := &ir.ColumnRefSpec{Table: tbl.val, Column: col.val}
-	if p.peek().kind == kwOn && p.lookahead(1).kind == kwDelete {
+	if p.peek().kind == kwOn && p.peekNext().kind == kwDelete {
 		p.consume() // ON
 		p.consume() // DELETE
 		action, err := p.parseOnDeleteAction()

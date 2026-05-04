@@ -83,12 +83,19 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	if p.peek().kind == kwIn {
 		return p.parseInClause(left, false)
 	}
-	if p.peek().kind == kwNot && p.lookahead(1).kind == kwIn {
+	if p.peek().kind == kwNot && p.peekNext().kind == kwIn {
 		p.consume() // NOT
 		return p.parseInClause(left, true)
 	}
 	if p.peek().kind == kwIs {
 		return p.parseIsNull(left)
+	}
+	if p.peek().kind == kwBetween {
+		return p.parseBetween(left, false)
+	}
+	if p.peek().kind == kwNot && p.peekNext().kind == kwBetween {
+		p.consume() // NOT
+		return p.parseBetween(left, true)
 	}
 	if op, ok := likeOp(p.peek().kind); ok {
 		p.consume()
@@ -99,7 +106,7 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		return &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool}, nil
 	}
 	if p.peek().kind == kwNot {
-		if op, ok := likeOp(p.lookahead(1).kind); ok {
+		if op, ok := likeOp(p.peekNext().kind); ok {
 			p.consume() // NOT
 			p.consume() // LIKE/ILIKE
 			right, err := p.parseAdditive()
@@ -114,6 +121,39 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		}
 	}
 	return left, nil
+}
+
+// parseBetween desugars `x BETWEEN a AND b` into `x >= a AND x <= b`,
+// and `x NOT BETWEEN a AND b` into `x < a OR x > b`. The bounds are
+// parsed at parseAdditive precedence so the inner AND is the keyword
+// terminator, not a logical-AND combinator over them.
+func (p *parser) parseBetween(probe ir.Expr, negate bool) (ir.Expr, error) {
+	p.consume() // BETWEEN
+	lo, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if !p.accept(kwAnd) {
+		return nil, fmt.Errorf("parse: expected AND in BETWEEN at %d", p.peek().pos)
+	}
+	hi, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if negate {
+		return &ir.BinOp{
+			Op:    "or",
+			Left:  &ir.BinOp{Op: "<", Left: probe, Right: lo, T: types.Bool},
+			Right: &ir.BinOp{Op: ">", Left: probe, Right: hi, T: types.Bool},
+			T:     types.Bool,
+		}, nil
+	}
+	return &ir.BinOp{
+		Op:    "and",
+		Left:  &ir.BinOp{Op: ">=", Left: probe, Right: lo, T: types.Bool},
+		Right: &ir.BinOp{Op: "<=", Left: probe, Right: hi, T: types.Bool},
+		T:     types.Bool,
+	}, nil
 }
 
 // parseIsNull consumes `IS NULL` or `IS NOT NULL` after `left`. We
@@ -143,13 +183,13 @@ func likeOp(k tokenKind) (string, bool) {
 	return "", false
 }
 
-// lookahead peeks N tokens ahead without consuming. Used to confirm
-// the NOT IN bigram before committing.
-func (p *parser) lookahead(n int) token {
-	if p.pos+n >= len(p.toks) {
+// peekNext returns the token after p.peek() without consuming. Used
+// to confirm two-token leading combinations like NOT IN / NOT BETWEEN.
+func (p *parser) peekNext() token {
+	if p.pos+1 >= len(p.toks) {
 		return p.toks[len(p.toks)-1]
 	}
-	return p.toks[p.pos+n]
+	return p.toks[p.pos+1]
 }
 
 // parseAdditive: left-associative + and -. Result type matches the
