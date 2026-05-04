@@ -38,6 +38,43 @@ var builtins = map[string]builtinFunc{
 			return b, nil
 		},
 	},
+	"current_timestamp": {
+		// SQL-standard synonym for now(). Real PG returns the
+		// transaction start time; we use the engine clock.
+		ResultType: noArgs(types.Timestamptz),
+		Eval: func(env *Env, _ []any) (any, error) {
+			if env != nil && env.Now != nil {
+				return env.Now().UTC(), nil
+			}
+			return time.Now().UTC(), nil
+		},
+	},
+	"current_date": {
+		// Real PG returns `date`; we don't yet model `date` as a
+		// distinct type, so we emit a midnight-UTC timestamptz. Tests
+		// can read the date part via EXTRACT or a comparison.
+		ResultType: noArgs(types.Timestamptz),
+		Eval: func(env *Env, _ []any) (any, error) {
+			now := time.Now().UTC()
+			if env != nil && env.Now != nil {
+				now = env.Now().UTC()
+			}
+			return time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC), nil
+		},
+	},
+	"current_time": {
+		// Real PG returns `time with time zone`; we approximate with
+		// a timestamptz pinned to the Unix epoch's date plus the time
+		// component. Good enough for the typical sqlc usage.
+		ResultType: noArgs(types.Timestamptz),
+		Eval: func(env *Env, _ []any) (any, error) {
+			now := time.Now().UTC()
+			if env != nil && env.Now != nil {
+				now = env.Now().UTC()
+			}
+			return time.Date(1970, 1, 1, now.Hour(), now.Minute(), now.Second(), now.Nanosecond(), time.UTC), nil
+		},
+	},
 	"now": {
 		ResultType: noArgs(types.Timestamptz),
 		// PG's real now() returns the transaction start time (constant
