@@ -3,6 +3,7 @@ package parse
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/types"
@@ -121,6 +122,36 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		}
 	}
 	return left, nil
+}
+
+// parseExtract consumes `( field FROM expr )`. The opening EXTRACT
+// has been consumed by the caller. We desugar to a `date_part`
+// FuncCall whose first arg is the field name as a text literal.
+func (p *parser) parseExtract() (ir.Expr, error) {
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	field, err := p.expect(tIdent, "EXTRACT field name")
+	if err != nil {
+		return nil, err
+	}
+	if !p.accept(kwFrom) {
+		return nil, fmt.Errorf("parse: expected FROM in EXTRACT at %d", p.peek().pos)
+	}
+	source, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &ir.FuncCall{
+		Name: "date_part",
+		Args: []ir.Expr{
+			&ir.Literal{Value: strings.ToLower(field.val), T: types.Text},
+			source,
+		},
+	}, nil
 }
 
 // parseExists consumes `EXISTS ( SELECT ... )`. The leading EXISTS
@@ -448,6 +479,13 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 		}
 		return &ir.ParamRef{Index: idx - 1}, nil
 	case tIdent:
+		// EXTRACT is a context keyword: `extract(field from expr)`. We
+		// desugar to a `date_part(field-text, expr)` call so the rest
+		// of the pipeline doesn't need a special node.
+		if strings.EqualFold(t.val, "extract") && p.peekNext().kind == tLParen {
+			p.consume()
+			return p.parseExtract()
+		}
 		p.consume()
 		// `ident(args)` is a function call. `ident.ident` is a qualified
 		// column reference. Bare identifiers stay as unqualified column

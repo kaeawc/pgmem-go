@@ -377,6 +377,32 @@ var builtins = map[string]builtinFunc{
 		ResultType: variadicSameType("least"),
 		Eval:       variadicReduce(func(cmp int) bool { return cmp < 0 }),
 	},
+	"date_part": {
+		// date_part(field, ts) — real PG returns double precision; our
+		// supported fields are whole numbers, so int8 is the closest
+		// fit (epoch in particular can exceed int4 for far-future
+		// timestamps). EXTRACT desugars to this.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("date_part: takes 2 arguments, got %d", len(args))
+			}
+			return types.Int8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			field, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("date_part: field must be text, got %T", args[0])
+			}
+			ts, ok := args[1].(time.Time)
+			if !ok {
+				return nil, fmt.Errorf("date_part: source must be timestamp, got %T", args[1])
+			}
+			return datePart(field, ts)
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -406,6 +432,40 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
 		},
 	},
+}
+
+// datePart returns the value of `field` extracted from `ts`. Field
+// names are lower-case; we cover the set sqlc-generated queries
+// commonly emit. Unknown fields error so callers don't silently get
+// zero.
+func datePart(field string, ts time.Time) (any, error) {
+	t := ts.UTC()
+	switch strings.ToLower(field) {
+	case "year":
+		return int64(t.Year()), nil
+	case "month":
+		return int64(int(t.Month())), nil
+	case "day":
+		return int64(t.Day()), nil
+	case "hour":
+		return int64(t.Hour()), nil
+	case "minute":
+		return int64(t.Minute()), nil
+	case "second":
+		return int64(t.Second()), nil
+	case "dow":
+		// PG: 0 = Sunday … 6 = Saturday. Go's time.Weekday matches.
+		return int64(int(t.Weekday())), nil
+	case "doy":
+		return int64(t.YearDay()), nil
+	case "week":
+		_, w := t.ISOWeek()
+		return int64(w), nil
+	case "epoch":
+		return ts.Unix(), nil
+	default:
+		return nil, fmt.Errorf("date_part: unsupported field %q", field)
+	}
 }
 
 // trimResultType validates the arity and returns text. ltrim, rtrim,
