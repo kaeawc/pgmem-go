@@ -124,6 +124,32 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	return left, nil
 }
 
+// parsePosition consumes `( substr IN str )` and returns a strpos
+// FuncCall — strpos's arg order is (haystack, needle) which is the
+// reverse of position's (substr IN haystack), so we swap. Both
+// operands parse at additive precedence so the inner IN keyword is
+// consumed here, not by parseComparison's `expr IN (list)` path.
+func (p *parser) parsePosition() (ir.Expr, error) {
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	substr, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if !p.accept(kwIn) {
+		return nil, fmt.Errorf("parse: expected IN in POSITION at %d", p.peek().pos)
+	}
+	str, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &ir.FuncCall{Name: "strpos", Args: []ir.Expr{str, substr}}, nil
+}
+
 // parseExtract consumes `( field FROM expr )`. The opening EXTRACT
 // has been consumed by the caller. We desugar to a `date_part`
 // FuncCall whose first arg is the field name as a text literal.
@@ -525,6 +551,12 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 		if strings.EqualFold(t.val, "extract") && p.peekNext().kind == tLParen {
 			p.consume()
 			return p.parseExtract()
+		}
+		// `position(substr IN str)` is keyword-syntax sugar for the
+		// strpos builtin with the operand order reversed.
+		if strings.EqualFold(t.val, "position") && p.peekNext().kind == tLParen {
+			p.consume() // POSITION
+			return p.parsePosition()
 		}
 		// `interval 'N unit'` is the standard literal form. We rewrite
 		// it to a `interval('N unit')` builtin call so downstream
