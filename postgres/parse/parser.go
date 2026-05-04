@@ -495,6 +495,7 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 
 func (p *parser) parseSelect() (ir.Node, error) {
 	p.consume() // SELECT
+	distinct := p.accept(kwDistinct)
 	exprs, names, err := p.parseSelectList()
 	if err != nil {
 		return nil, err
@@ -569,6 +570,9 @@ func (p *parser) parseSelect() (ir.Node, error) {
 	plan, err := buildSelectTopOf(input, exprs, names, groupBy, having)
 	if err != nil {
 		return nil, err
+	}
+	if distinct {
+		plan = &ir.Distinct{Input: plan}
 	}
 	if aggregating && p.peek().kind == kwOrder {
 		p.consume() // ORDER
