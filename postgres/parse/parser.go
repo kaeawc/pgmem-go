@@ -519,6 +519,13 @@ func (p *parser) parseInsert() (ir.Node, error) {
 		}
 		break
 	}
+	if p.peek().kind == kwOn {
+		oc, err := p.parseOnConflict()
+		if err != nil {
+			return nil, err
+		}
+		stmt.OnConflict = oc
+	}
 	if p.accept(kwReturning) {
 		exprs, names, err := p.parseSelectList()
 		if err != nil {
@@ -528,6 +535,41 @@ func (p *parser) parseInsert() (ir.Node, error) {
 		stmt.ReturningNames = names
 	}
 	return stmt, nil
+}
+
+// parseOnConflict consumes `ON CONFLICT (col[, col]) DO NOTHING`. The
+// leading ON has not been consumed. CONFLICT, DO, NOTHING are matched
+// as context idents so they remain usable as column names.
+func (p *parser) parseOnConflict() (*ir.OnConflict, error) {
+	p.consume() // ON
+	if !p.acceptIdent("conflict") {
+		return nil, fmt.Errorf("parse: expected CONFLICT after ON at %d", p.peek().pos)
+	}
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	var cols []string
+	for {
+		c, err := p.expect(tIdent, "conflict-target column")
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, c.val)
+		if p.accept(tComma) {
+			continue
+		}
+		break
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	if !p.acceptIdent("do") {
+		return nil, fmt.Errorf("parse: expected DO at %d", p.peek().pos)
+	}
+	if !p.acceptIdent("nothing") {
+		return nil, fmt.Errorf("parse: only ON CONFLICT DO NOTHING is supported (got %q)", p.peek().val)
+	}
+	return &ir.OnConflict{Columns: cols, DoNothing: true}, nil
 }
 
 func (p *parser) parseValuesTuple() ([]ir.Expr, error) {

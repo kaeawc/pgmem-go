@@ -261,6 +261,16 @@ type Delete struct {
 
 func (*Delete) node() {}
 
+// OnConflict carries the policy for INSERT ... ON CONFLICT. M5 ships
+// the DO NOTHING form; DO UPDATE arrives later. Columns names the
+// conflict-target columns. In real PG this must match a unique
+// constraint or index — we don't enforce that yet, so the policy
+// applies whenever the named columns alone match an existing row.
+type OnConflict struct {
+	Columns   []string
+	DoNothing bool
+}
+
 // Insert appends rows to the named table. Columns names the target
 // columns in order; if empty, every column of the table is targeted in
 // catalog order. Rows is parallel to Columns.
@@ -275,6 +285,7 @@ type Insert struct {
 	Rows           [][]Expr
 	Returning      []Expr
 	ReturningNames []string
+	OnConflict     *OnConflict
 }
 
 func (*Insert) node() {}
