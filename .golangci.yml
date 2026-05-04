@@ -37,6 +37,8 @@ linters:
         - G104  # best-effort cleanup is intentional
         - G115  # PG wire codecs do controlled int truncation by design
         - G404  # math/rand is fine for non-crypto sequence/uuid stub seeds in tests
+        - G401  # md5() is a real PG builtin we mirror for compatibility
+        - G501  # crypto/md5 import follows from the md5() builtin
   exclusions:
     generated: lax
     presets:

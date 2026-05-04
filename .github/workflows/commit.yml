@@ -126,7 +126,8 @@ jobs:
           # G104 — best-effort cleanup is intentional
           # G115 — PG wire codecs do controlled int truncation by design
           # G404 — math/rand is fine for non-crypto stubs (sequence seeds in tests)
-          gosec -exclude=G104,G115,G404 -fmt=junit-xml -out=gosec-report.xml -stdout ./...
+          # G401/G501 — md5() is a real PG builtin we mirror for compatibility
+          gosec -exclude=G104,G115,G404,G401,G501 -fmt=junit-xml -out=gosec-report.xml -stdout ./...
 
       - name: "Check if security report was created"
         id: gosec-report-exists
