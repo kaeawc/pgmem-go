@@ -533,6 +533,224 @@ var builtins = map[string]builtinFunc{
 			return datePart(field, ts)
 		},
 	},
+	"array_length": {
+		// array_length(arr, dim) — element count along the given
+		// dimension. We only model 1-D arrays, so dim must be 1.
+		// Returns NULL for an empty array (matches PG).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("array_length: takes 2 arguments, got %d", len(args))
+			}
+			return types.Int4, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			dim, ok := args[1].(int32)
+			if !ok {
+				return nil, fmt.Errorf("array_length: dim must be int4, got %T", args[1])
+			}
+			if dim != 1 {
+				return nil, nil
+			}
+			n, ok := arrayLen(args[0])
+			if !ok {
+				return nil, fmt.Errorf("array_length: not an array: %T", args[0])
+			}
+			if n == 0 {
+				return nil, nil
+			}
+			return int32(n), nil
+		},
+	},
+	"cardinality": {
+		// cardinality(arr) — total element count. Returns 0 for an
+		// empty array (unlike array_length, which returns NULL).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("cardinality: takes 1 argument, got %d", len(args))
+			}
+			return types.Int4, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			n, ok := arrayLen(args[0])
+			if !ok {
+				return nil, fmt.Errorf("cardinality: not an array: %T", args[0])
+			}
+			return int32(n), nil
+		},
+	},
+	"array_to_string": {
+		// array_to_string(arr, sep [, null_str]) — joins array
+		// elements with sep. NULL elements are dropped unless
+		// null_str is supplied (then substituted in).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("array_to_string: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			sep := textArg(args[1])
+			nullStr := ""
+			useNullStr := false
+			if len(args) == 3 && args[2] != nil {
+				nullStr = textArg(args[2])
+				useNullStr = true
+			}
+			parts, err := arrayToStrings(args[0])
+			if err != nil {
+				return nil, err
+			}
+			out := make([]string, 0, len(parts))
+			for _, p := range parts {
+				if p.isNull {
+					if useNullStr {
+						out = append(out, nullStr)
+					}
+					continue
+				}
+				out = append(out, p.s)
+			}
+			return strings.Join(out, sep), nil
+		},
+	},
+	"string_to_array": {
+		// string_to_array(str, sep [, null_str]) — splits str on sep
+		// into a text[]. When sep is NULL, every character becomes
+		// its own element (matches PG). null_str maps elements equal
+		// to it back to NULL.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("string_to_array: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.TextArray, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s := textArg(args[0])
+			var parts []string
+			if args[1] == nil {
+				parts = make([]string, 0, len(s))
+				for _, r := range s {
+					parts = append(parts, string(r))
+				}
+			} else {
+				sep := textArg(args[1])
+				if sep == "" {
+					parts = []string{s}
+				} else {
+					parts = strings.Split(s, sep)
+				}
+			}
+			// null_str: elements equal to it become NULL. Our []string
+			// runtime can't carry per-element NULLs today, so we
+			// approximate by dropping them. This is the common path for
+			// empty-string nulls which would otherwise look identical.
+			if len(args) == 3 && args[2] != nil {
+				nullStr := textArg(args[2])
+				out := parts[:0]
+				for _, p := range parts {
+					if p != nullStr {
+						out = append(out, p)
+					}
+				}
+				parts = out
+			}
+			return parts, nil
+		},
+	},
+	"split_part": {
+		// split_part(str, sep, n) — returns the n-th 1-indexed field
+		// after splitting str on sep. Returns '' when n is out of
+		// range. Negative n counts from the right (PG 14+).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 3 {
+				return nil, fmt.Errorf("split_part: takes 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil || args[2] == nil {
+				return nil, nil
+			}
+			s := textArg(args[0])
+			sep := textArg(args[1])
+			n, ok := args[2].(int32)
+			if !ok {
+				return nil, fmt.Errorf("split_part: n must be int4, got %T", args[2])
+			}
+			if sep == "" {
+				if n == 1 || n == -1 {
+					return s, nil
+				}
+				return "", nil
+			}
+			parts := strings.Split(s, sep)
+			idx := int(n)
+			if idx < 0 {
+				idx = len(parts) + idx + 1
+			}
+			if idx < 1 || idx > len(parts) {
+				return "", nil
+			}
+			return parts[idx-1], nil
+		},
+	},
+	"repeat": {
+		// repeat(str, n) — repeats str n times. Negative or zero n
+		// returns empty string.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("repeat: takes 2 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			s := textArg(args[0])
+			n, ok := args[1].(int32)
+			if !ok {
+				return nil, fmt.Errorf("repeat: n must be int4, got %T", args[1])
+			}
+			if n <= 0 {
+				return "", nil
+			}
+			return strings.Repeat(s, int(n)), nil
+		},
+	},
+	"reverse": {
+		// reverse(str) — reverse the string by rune. Returns NULL
+		// for NULL input.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("reverse: takes 1 argument, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s := textArg(args[0])
+			rs := []rune(s)
+			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
+				rs[i], rs[j] = rs[j], rs[i]
+			}
+			return string(rs), nil
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -797,6 +1015,55 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// arrayLen returns the element count of one of pgmem-go's runtime
+// array shapes ([]int64, []int32, []string). Returns ok=false for
+// non-array inputs.
+func arrayLen(v any) (int, bool) {
+	switch a := v.(type) {
+	case []int64:
+		return len(a), true
+	case []int32:
+		return len(a), true
+	case []string:
+		return len(a), true
+	}
+	return 0, false
+}
+
+// arrayElem is one element rendered for array_to_string. isNull
+// distinguishes a NULL element from an empty-string element.
+type arrayElem struct {
+	s      string
+	isNull bool
+}
+
+// arrayToStrings renders each element of a runtime array to text in
+// the same order. []string passes through; integer arrays use
+// strconv.FormatInt. Returns an error for non-array inputs.
+func arrayToStrings(v any) ([]arrayElem, error) {
+	switch a := v.(type) {
+	case []string:
+		out := make([]arrayElem, len(a))
+		for i, s := range a {
+			out[i] = arrayElem{s: s}
+		}
+		return out, nil
+	case []int64:
+		out := make([]arrayElem, len(a))
+		for i, n := range a {
+			out[i] = arrayElem{s: strconv.FormatInt(n, 10)}
+		}
+		return out, nil
+	case []int32:
+		out := make([]arrayElem, len(a))
+		for i, n := range a {
+			out[i] = arrayElem{s: strconv.FormatInt(int64(n), 10)}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("array_to_string: not an array: %T", v)
 }
 
 // clampSubstringRange computes the [start, end) rune-index slice for
