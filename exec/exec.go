@@ -2701,6 +2701,10 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 		return evalJSONArrow(l, r, false)
 	case "->>":
 		return evalJSONArrow(l, r, true)
+	case "@>":
+		return evalJSONContains(l, r)
+	case "<@":
+		return evalJSONContains(r, l)
 	case "~":
 		return evalRegex(l, r, false, false)
 	case "~*":
@@ -2890,6 +2894,77 @@ func jsonArrowSelect(doc any, idx any) (any, bool) {
 		return d[i], true
 	}
 	return nil, false
+}
+
+// evalJSONContains implements jsonb's `@>` containment: returns true
+// iff every key/value (objects) or every element (arrays) from `right`
+// is present in `left`. Scalars compare for equality. Both operands
+// must be jsonb (raw bytes).
+func evalJSONContains(l, r any) (any, error) {
+	rawL, ok := l.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("exec: jsonb @>: left must be jsonb, got %T", l)
+	}
+	rawR, ok := r.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("exec: jsonb @>: right must be jsonb, got %T", r)
+	}
+	var lv, rv any
+	if err := json.Unmarshal(rawL, &lv); err != nil {
+		return nil, fmt.Errorf("exec: jsonb @>: invalid jsonb on left: %w", err)
+	}
+	if err := json.Unmarshal(rawR, &rv); err != nil {
+		return nil, fmt.Errorf("exec: jsonb @>: invalid jsonb on right: %w", err)
+	}
+	return jsonContains(lv, rv), nil
+}
+
+// jsonContains is the recursive containment predicate. PG's exact
+// rules are richer (e.g. an array contains a scalar element if any
+// member equals it); this implementation matches the common cases.
+func jsonContains(l, r any) bool {
+	switch rv := r.(type) {
+	case map[string]any:
+		lm, ok := l.(map[string]any)
+		if !ok {
+			return false
+		}
+		for k, v := range rv {
+			lv, present := lm[k]
+			if !present || !jsonContains(lv, v) {
+				return false
+			}
+		}
+		return true
+	case []any:
+		la, ok := l.([]any)
+		if !ok {
+			return false
+		}
+		for _, want := range rv {
+			found := false
+			for _, got := range la {
+				if jsonContains(got, want) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false
+			}
+		}
+		return true
+	default:
+		// Scalar: equality. Use json.Marshal to canonicalize so 1 ≠ 1.0
+		// noise is contained — the byte forms match when JSON values
+		// are equivalent at the JSON level.
+		lb, err1 := json.Marshal(l)
+		rb, err2 := json.Marshal(r)
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		return string(lb) == string(rb)
+	}
 }
 
 // evalRegex implements PG's `~`, `~*`, `!~`, `!~*` regex match

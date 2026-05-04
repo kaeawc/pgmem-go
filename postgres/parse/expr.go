@@ -444,6 +444,10 @@ func comparisonOp(k tokenKind) (string, bool) {
 		return "!~", true
 	case tNRegexI:
 		return "!~*", true
+	case tContains:
+		return "@>", true
+	case tContained:
+		return "<@", true
 	default:
 		return "", false
 	}
