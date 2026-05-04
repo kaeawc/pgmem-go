@@ -2,6 +2,7 @@ package exec
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -852,6 +853,134 @@ var builtins = map[string]builtinFunc{
 			return re.Split(source, -1), nil
 		},
 	},
+	"to_jsonb": {
+		// to_jsonb(any) — serialise any runtime value as jsonb bytes.
+		// jsonb input passes through; arrays and primitives map to
+		// their natural JSON shape; time.Time emits RFC 3339.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("to_jsonb: takes 1 argument, got %d", len(args))
+			}
+			return types.JSONB, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return marshalToJSONB(args[0])
+		},
+	},
+	"jsonb_build_object": {
+		// jsonb_build_object(k1, v1, k2, v2, …) — variadic key/value
+		// pairs. Keys must be non-NULL and convert to text. Returns a
+		// jsonb object.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args)%2 != 0 {
+				return nil, fmt.Errorf("jsonb_build_object: argument list must have an even number of elements")
+			}
+			return types.JSONB, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			obj := make(map[string]any, len(args)/2)
+			order := make([]string, 0, len(args)/2)
+			for i := 0; i < len(args); i += 2 {
+				if args[i] == nil {
+					return nil, fmt.Errorf("jsonb_build_object: argument %d (key) must not be null", i+1)
+				}
+				key := textArg(args[i])
+				v, err := jsonValueOf(args[i+1])
+				if err != nil {
+					return nil, err
+				}
+				if _, exists := obj[key]; !exists {
+					order = append(order, key)
+				}
+				obj[key] = v
+			}
+			return marshalOrdered(obj, order)
+		},
+	},
+	"jsonb_build_array": {
+		// jsonb_build_array(...) — variadic, returns a jsonb array.
+		ResultType: func(_ []ir.Expr) (types.Type, error) {
+			return types.JSONB, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			arr := make([]any, len(args))
+			for i, a := range args {
+				v, err := jsonValueOf(a)
+				if err != nil {
+					return nil, err
+				}
+				arr[i] = v
+			}
+			out, err := json.Marshal(arr)
+			if err != nil {
+				return nil, fmt.Errorf("jsonb_build_array: %w", err)
+			}
+			return out, nil
+		},
+	},
+	"jsonb_typeof": {
+		// jsonb_typeof(jsonb) — returns one of 'object', 'array',
+		// 'string', 'number', 'boolean', 'null'. NULL input returns
+		// SQL NULL (NOT the string 'null').
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("jsonb_typeof: takes 1 argument, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			raw, ok := args[0].([]byte)
+			if !ok {
+				return nil, fmt.Errorf("jsonb_typeof: input must be jsonb, got %T", args[0])
+			}
+			var doc any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				return nil, fmt.Errorf("jsonb_typeof: invalid jsonb: %w", err)
+			}
+			switch doc.(type) {
+			case map[string]any:
+				return "object", nil
+			case []any:
+				return "array", nil
+			case string:
+				return "string", nil
+			case float64, json.Number:
+				return "number", nil
+			case bool:
+				return "boolean", nil
+			case nil:
+				return "null", nil
+			}
+			return nil, fmt.Errorf("jsonb_typeof: unknown type %T", doc)
+		},
+	},
+	"jsonb_array_length": {
+		// jsonb_array_length(jsonb) — element count of a jsonb array.
+		// Errors if the input isn't an array.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("jsonb_array_length: takes 1 argument, got %d", len(args))
+			}
+			return types.Int4, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			raw, ok := args[0].([]byte)
+			if !ok {
+				return nil, fmt.Errorf("jsonb_array_length: input must be jsonb, got %T", args[0])
+			}
+			var arr []any
+			if err := json.Unmarshal(raw, &arr); err != nil {
+				return nil, &SQLError{Code: "22023", Message: "cannot get array length of a non-array"}
+			}
+			return int32(len(arr)), nil
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -1116,6 +1245,101 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// jsonValueOf converts a runtime value into something
+// encoding/json can marshal into the desired JSON shape. jsonb
+// input is decoded back to its native form so it nests as a
+// structured object / array rather than a quoted string.
+func jsonValueOf(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch x := v.(type) {
+	case []byte:
+		// Treat as already-encoded jsonb. Decode so it composes.
+		var doc any
+		if err := json.Unmarshal(x, &doc); err != nil {
+			return nil, fmt.Errorf("jsonb: invalid input: %w", err)
+		}
+		return doc, nil
+	case time.Time:
+		return x.UTC().Format(time.RFC3339Nano), nil
+	case time.Duration:
+		return x.String(), nil
+	case [16]byte:
+		return formatUUID(x), nil
+	case []int64, []int32, []string, []any:
+		return x, nil
+	}
+	return v, nil
+}
+
+// marshalToJSONB marshals an arbitrary runtime value to jsonb bytes
+// using jsonValueOf's normalisation pass.
+func marshalToJSONB(v any) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	if raw, ok := v.([]byte); ok {
+		// Already jsonb. Validate and pass through unchanged.
+		var doc any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("to_jsonb: invalid jsonb: %w", err)
+		}
+		return raw, nil
+	}
+	x, err := jsonValueOf(v)
+	if err != nil {
+		return nil, err
+	}
+	out, err := json.Marshal(x)
+	if err != nil {
+		return nil, fmt.Errorf("to_jsonb: %w", err)
+	}
+	return out, nil
+}
+
+// marshalOrdered serialises a JSON object preserving the insertion
+// order of keys. encoding/json sorts map keys, which would lose the
+// PG-semantic "first occurrence wins, in order".
+func marshalOrdered(obj map[string]any, order []string) ([]byte, error) {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range order {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		kb, err := json.Marshal(k)
+		if err != nil {
+			return nil, err
+		}
+		b.Write(kb)
+		b.WriteByte(':')
+		vb, err := json.Marshal(obj[k])
+		if err != nil {
+			return nil, err
+		}
+		b.Write(vb)
+	}
+	b.WriteByte('}')
+	return []byte(b.String()), nil
+}
+
+func formatUUID(b [16]byte) string {
+	const hex = "0123456789abcdef"
+	out := make([]byte, 36)
+	pos := 0
+	for i, n := range b {
+		if i == 4 || i == 6 || i == 8 || i == 10 {
+			out[pos] = '-'
+			pos++
+		}
+		out[pos] = hex[n>>4]
+		out[pos+1] = hex[n&0xF]
+		pos += 2
+	}
+	return string(out)
 }
 
 // compilePGRegexp turns a PG regex + flags string into a compiled Go
