@@ -199,6 +199,52 @@ var builtins = map[string]builtinFunc{
 			return string(s[start:]), nil
 		},
 	},
+	"concat": {
+		// concat(...) — variadic, returns text. NULL arguments are
+		// skipped (treated as empty), matching real PG and unlike `||`
+		// which propagates NULL.
+		ResultType: func(_ []ir.Expr) (types.Type, error) { return types.Text, nil },
+		Eval: func(_ *Env, args []any) (any, error) {
+			var b strings.Builder
+			for _, a := range args {
+				if a == nil {
+					continue
+				}
+				b.WriteString(concatString(a))
+			}
+			return b.String(), nil
+		},
+	},
+	"concat_ws": {
+		// concat_ws(sep, args...) — separator-joined concat. A NULL
+		// separator returns NULL (matches PG); NULLs among the args are
+		// skipped.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 1 {
+				return nil, fmt.Errorf("concat_ws: takes at least 1 argument (separator)")
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			sep := concatString(args[0])
+			var b strings.Builder
+			first := true
+			for _, a := range args[1:] {
+				if a == nil {
+					continue
+				}
+				if !first {
+					b.WriteString(sep)
+				}
+				b.WriteString(concatString(a))
+				first = false
+			}
+			return b.String(), nil
+		},
+	},
 	"abs": {
 		// abs(int) — preserves the operand's integer width.
 		ResultType: func(args []ir.Expr) (types.Type, error) {
