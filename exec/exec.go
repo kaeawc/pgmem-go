@@ -362,12 +362,24 @@ func buildJoin(p *ir.Join, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	right, err := Build(p.Right, env)
+	leftSchema := left.OutputSchema()
+	// Probe the right side once to learn its schema. For a lateral
+	// join the probe runs with env.OuterSchema set to left's schema
+	// + a zero outer row, so any correlated ColumnRef inside the
+	// right plan resolves at probe time without needing a real left
+	// row to run.
+	rightEnv := *env
+	if p.Lateral {
+		rightEnv.OuterSchema = leftSchema
+		rightEnv.OuterRow = make(Row, len(leftSchema))
+	}
+	right, err := Build(p.Right, &rightEnv)
 	if err != nil {
 		left.Close()
 		return nil, err
 	}
-	combined := append(append([]Column(nil), left.OutputSchema()...), right.OutputSchema()...)
+	rightSchema := right.OutputSchema()
+	combined := append(append([]Column(nil), leftSchema...), rightSchema...)
 	var cond ir.Expr
 	if p.Cond != nil {
 		cond, err = resolveExpr(p.Cond, combined, env)
@@ -377,15 +389,25 @@ func buildJoin(p *ir.Join, env *Env) (Operator, error) {
 			return nil, err
 		}
 	}
-	return &joinOp{
+	op := &joinOp{
 		left:     left,
 		right:    right,
 		cond:     cond,
 		cols:     combined,
 		env:      env,
 		joinType: p.Type,
-		rightWid: len(right.OutputSchema()),
-	}, nil
+		rightWid: len(rightSchema),
+	}
+	if p.Lateral {
+		// The probe operator is no longer needed — close it and let
+		// joinOp rebuild a fresh right per left row.
+		right.Close()
+		op.right = nil
+		op.lateral = true
+		op.rightPlan = p.Right
+		op.leftSchema = leftSchema
+	}
+	return op, nil
 }
 
 type joinOp struct {
@@ -403,6 +425,13 @@ type joinOp struct {
 	rightRows []Row
 	rightInit bool
 
+	// Lateral mode: right plan is rebuilt per left row with the
+	// outer scope set, so its expressions can reference left's
+	// columns. rightInit / rightRows aren't reused across rows.
+	lateral    bool
+	rightPlan  ir.Node
+	leftSchema []Column
+
 	curLeft    Row
 	rightAt    int
 	curMatched bool // true if curLeft matched any right row (for LEFT)
@@ -411,15 +440,16 @@ type joinOp struct {
 func (j *joinOp) OutputSchema() []Column { return j.cols }
 func (j *joinOp) Close() error {
 	lerr := j.left.Close()
-	rerr := j.right.Close()
-	if lerr != nil {
-		return lerr
+	if j.right != nil {
+		if rerr := j.right.Close(); rerr != nil && lerr == nil {
+			return rerr
+		}
 	}
-	return rerr
+	return lerr
 }
 
 func (j *joinOp) Next(ctx context.Context) (Row, error) {
-	if !j.rightInit {
+	if !j.lateral && !j.rightInit {
 		rows, err := drain(j.right)
 		if err != nil {
 			return nil, err
@@ -436,6 +466,11 @@ func (j *joinOp) Next(ctx context.Context) (Row, error) {
 			j.curLeft = next
 			j.rightAt = 0
 			j.curMatched = false
+			if j.lateral {
+				if err := j.materialiseLateralRight(); err != nil {
+					return nil, err
+				}
+			}
 		}
 		for j.rightAt < len(j.rightRows) {
 			right := j.rightRows[j.rightAt]
@@ -458,6 +493,27 @@ func (j *joinOp) Next(ctx context.Context) (Row, error) {
 		}
 		j.curLeft = nil
 	}
+}
+
+// materialiseLateralRight builds a fresh right operator with the
+// outer scope set to the current left row, drains it into rightRows,
+// and closes it. Called once per left row so the right plan's
+// correlated references see the right outer row.
+func (j *joinOp) materialiseLateralRight() error {
+	childEnv := *j.env
+	childEnv.OuterSchema = j.leftSchema
+	childEnv.OuterRow = j.curLeft
+	op, err := Build(j.rightPlan, &childEnv)
+	if err != nil {
+		return fmt.Errorf("LATERAL: %w", err)
+	}
+	rows, err := drain(op)
+	op.Close()
+	if err != nil {
+		return fmt.Errorf("LATERAL: %w", err)
+	}
+	j.rightRows = rows
+	return nil
 }
 
 func (j *joinOp) evalCond(row Row) (bool, error) {
