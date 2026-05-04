@@ -41,6 +41,29 @@ type Window struct {
 
 func (*Window) node() {}
 
+// Recursive is the runtime representation of `WITH RECURSIVE name
+// AS (base UNION [ALL] step) …`. Plan is the inner UNION (or just
+// the base when there's no recursive part). Exec builds it
+// iteratively: base materialises, then step runs against the
+// growing working set until no new rows appear. UnionAll mirrors
+// the inner UNION's flag — false means duplicate rows are dropped.
+type Recursive struct {
+	Name     string
+	Plan     Node
+	UnionAll bool
+}
+
+func (*Recursive) node() {}
+
+// RecursiveRef is the placeholder a recursive CTE's step plan holds
+// where it would otherwise reference the CTE itself. At exec time
+// it reads the current working-set frame from env.RecursiveFrames.
+type RecursiveRef struct {
+	Name string
+}
+
+func (*RecursiveRef) node() {}
+
 // Unnest is the table-valued form `unnest(array_expr) [AS alias(col)]`.
 // One row per element; the output schema has a single column whose
 // name is Alias (default "unnest") and whose type is the array's

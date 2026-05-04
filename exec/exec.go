@@ -66,6 +66,20 @@ type Env struct {
 	// from OuterRow.
 	OuterSchema []Column
 	OuterRow    Row
+	// RecursiveFrames is the per-CTE working-set frame stack used
+	// while iterating a WITH RECURSIVE plan. Each frame holds the
+	// schema and the current set of rows that the step plan should
+	// see when it scans the recursive name. Built once by
+	// buildRecursive; read by buildRecursiveRef.
+	RecursiveFrames map[string]*RecursiveFrame
+}
+
+// RecursiveFrame is the working-set view a recursive CTE's step
+// plan reads through env.RecursiveFrames. Cols stays fixed; Rows
+// changes between iterations to reflect the most recent batch.
+type RecursiveFrame struct {
+	Cols []Column
+	Rows []Row
 }
 
 // Operator is the runtime instantiation of an ir.Node.
@@ -129,6 +143,10 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildUnnest(p, env)
 	case *ir.GenerateSeries:
 		return buildGenerateSeries(p, env)
+	case *ir.Recursive:
+		return buildRecursive(p, env)
+	case *ir.RecursiveRef:
+		return buildRecursiveRef(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -901,6 +919,118 @@ func buildUnnest(p *ir.Unnest, env *Env) (Operator, error) {
 	}
 	cols := []Column{{Qualifier: p.Alias, Name: p.Alias, Type: colType}}
 	return &materializedOp{cols: cols, rows: rows}, nil
+}
+
+// --- Recursive ---
+
+// buildRecursive iterates a WITH RECURSIVE plan to a fixed point.
+// The base materialises into the initial working set; the step
+// rebuilds each iteration against the latest working set until it
+// stops yielding new rows. UNION (without ALL) deduplicates.
+func buildRecursive(p *ir.Recursive, env *Env) (Operator, error) {
+	var base, step ir.Node
+	if u, ok := p.Plan.(*ir.Union); ok {
+		base = u.Left
+		step = u.Right
+	} else {
+		base = p.Plan
+	}
+	bop, err := Build(base, env)
+	if err != nil {
+		return nil, err
+	}
+	cols := append([]Column(nil), bop.OutputSchema()...)
+	ctx := context.Background()
+	var allRows []Row
+	seen := map[string]struct{}{}
+	addRow := func(r Row) {
+		if !p.UnionAll {
+			k := rowKey(r)
+			if _, ok := seen[k]; ok {
+				return
+			}
+			seen[k] = struct{}{}
+		}
+		allRows = append(allRows, r)
+	}
+	var workingRows []Row
+	for {
+		r, err := bop.Next(ctx)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			bop.Close()
+			return nil, err
+		}
+		before := len(allRows)
+		addRow(r)
+		if len(allRows) > before {
+			workingRows = append(workingRows, r)
+		}
+	}
+	bop.Close()
+	if step == nil {
+		return &materializedOp{cols: cols, rows: allRows}, nil
+	}
+	if env.RecursiveFrames == nil {
+		env.RecursiveFrames = map[string]*RecursiveFrame{}
+	}
+	frame := &RecursiveFrame{Cols: cols, Rows: workingRows}
+	env.RecursiveFrames[p.Name] = frame
+	defer delete(env.RecursiveFrames, p.Name)
+
+	const safetyCap = 100000
+	for iter := 0; iter < safetyCap; iter++ {
+		if len(frame.Rows) == 0 {
+			break
+		}
+		sop, err := Build(step, env)
+		if err != nil {
+			return nil, err
+		}
+		var nextRows []Row
+		for {
+			r, err := sop.Next(ctx)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				sop.Close()
+				return nil, err
+			}
+			before := len(allRows)
+			addRow(r)
+			if len(allRows) > before {
+				nextRows = append(nextRows, r)
+			}
+		}
+		sop.Close()
+		if len(nextRows) == 0 {
+			break
+		}
+		frame.Rows = nextRows
+	}
+	return &materializedOp{cols: cols, rows: allRows}, nil
+}
+
+func buildRecursiveRef(p *ir.RecursiveRef, env *Env) (Operator, error) {
+	frame, ok := env.RecursiveFrames[p.Name]
+	if !ok {
+		return nil, fmt.Errorf("exec: recursive reference %q not in scope", p.Name)
+	}
+	rows := make([]Row, len(frame.Rows))
+	for i, r := range frame.Rows {
+		rows[i] = append(Row(nil), r...)
+	}
+	return &materializedOp{cols: frame.Cols, rows: rows}, nil
+}
+
+// rowKey is a coarse string key for dedup of recursive UNION rows.
+// fmt.Sprint is good enough for the small sets recursive CTEs
+// typically produce.
+func rowKey(r Row) string {
+	return fmt.Sprintf("%v", []any(r))
 }
 
 // --- GenerateSeries ---
