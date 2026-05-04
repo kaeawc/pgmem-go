@@ -2362,6 +2362,10 @@ func evalUnaryOp(u *ir.UnaryOp, in Row, env *Env) (any, error) {
 		return nil, err
 	}
 	switch u.Op {
+	case "is null":
+		return v == nil, nil
+	case "is not null":
+		return v != nil, nil
 	case "not":
 		if v == nil {
 			return nil, nil

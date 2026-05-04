@@ -87,6 +87,9 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		p.consume() // NOT
 		return p.parseInClause(left, true)
 	}
+	if p.peek().kind == kwIs {
+		return p.parseIsNull(left)
+	}
 	if op, ok := likeOp(p.peek().kind); ok {
 		p.consume()
 		right, err := p.parseAdditive()
@@ -111,6 +114,23 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 		}
 	}
 	return left, nil
+}
+
+// parseIsNull consumes `IS NULL` or `IS NOT NULL` after `left`. We
+// represent it as a unary op whose operand is the probe — keeping it a
+// unary lets evaluation skip the standard "either side NULL → NULL"
+// short-circuit that comparison ops use.
+func (p *parser) parseIsNull(left ir.Expr) (ir.Expr, error) {
+	p.consume() // IS
+	negate := p.accept(kwNot)
+	if !p.accept(kwNull) {
+		return nil, fmt.Errorf("parse: expected NULL after IS at %d", p.peek().pos)
+	}
+	op := "is null"
+	if negate {
+		op = "is not null"
+	}
+	return &ir.UnaryOp{Op: op, Expr: left, T: types.Bool}, nil
 }
 
 func likeOp(k tokenKind) (string, bool) {

@@ -84,6 +84,7 @@ const (
 	kwDistinct
 	kwLike
 	kwIlike
+	kwIs
 )
 
 type token struct {
@@ -140,6 +141,7 @@ var keywords = map[string]tokenKind{
 	"distinct":   kwDistinct,
 	"like":       kwLike,
 	"ilike":      kwIlike,
+	"is":         kwIs,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is
