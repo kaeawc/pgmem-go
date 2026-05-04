@@ -81,6 +81,7 @@ const (
 	kwExists
 	kwGroup
 	kwHaving
+	kwDistinct
 )
 
 type token struct {
@@ -134,6 +135,7 @@ var keywords = map[string]tokenKind{
 	"exists":     kwExists,
 	"group":      kwGroup,
 	"having":     kwHaving,
+	"distinct":   kwDistinct,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

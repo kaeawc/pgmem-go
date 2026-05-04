@@ -95,6 +95,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildUpdate(p, env)
 	case *ir.Aggregate:
 		return buildAggregate(p, env)
+	case *ir.Distinct:
+		return buildDistinct(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -414,6 +416,42 @@ func concatRows(a, b Row) Row {
 }
 
 func nullRow(width int) Row { return make(Row, width) }
+
+// --- Distinct ---
+
+// buildDistinct wraps Input in a streaming dedup operator. Equality is
+// computed via groupKeyString on each output row's tuple — same hash
+// scheme GROUP BY uses, so types we already handle there work here too.
+func buildDistinct(p *ir.Distinct, env *Env) (Operator, error) {
+	in, err := Build(p.Input, env)
+	if err != nil {
+		return nil, err
+	}
+	return &distinctOp{in: in, seen: map[string]struct{}{}}, nil
+}
+
+type distinctOp struct {
+	in   Operator
+	seen map[string]struct{}
+}
+
+func (d *distinctOp) OutputSchema() []Column { return d.in.OutputSchema() }
+func (d *distinctOp) Close() error           { return d.in.Close() }
+
+func (d *distinctOp) Next(ctx context.Context) (Row, error) {
+	for {
+		row, err := d.in.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		key := groupKeyString([]any(row))
+		if _, dup := d.seen[key]; dup {
+			continue
+		}
+		d.seen[key] = struct{}{}
+		return row, nil
+	}
+}
 
 // --- Sort ---
 

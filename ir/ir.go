@@ -95,6 +95,15 @@ type Limit struct {
 
 func (*Limit) node() {}
 
+// Distinct keeps only one row per unique tuple of Input's columns.
+// Equivalent to wrapping a SELECT DISTINCT in a hash-set deduplicator.
+// Output schema matches Input.
+type Distinct struct {
+	Input Node
+}
+
+func (*Distinct) node() {}
+
 // AggregateCall is one entry in an Aggregate node's Calls slice.
 //
 //	Func — lower-case name (count, sum, min, max, avg).
