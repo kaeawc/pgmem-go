@@ -209,6 +209,7 @@ type AggregateCall struct {
 	Args     []Expr
 	Output   string
 	Distinct bool // true for `agg(DISTINCT expr)` — dedupe before accumulating
+	Filter   Expr // when non-nil, only rows where Filter→true are accepted
 }
 
 // Aggregate computes input aggregation. With GroupBy empty (the
@@ -498,6 +499,10 @@ type FuncCall struct {
 	T        types.Type
 	Star     bool
 	Distinct bool // true for `agg(DISTINCT expr)`; ignored on non-aggregate calls
+	// Filter, when non-nil, restricts which input rows the aggregate
+	// observes (`agg(expr) FILTER (WHERE cond)`). Ignored on non-
+	// aggregate calls.
+	Filter Expr
 	// Window, when non-nil, marks this call as a window function with
 	// the given OVER spec. Window calls are extracted from the
 	// SELECT list during planning and replaced with synthetic column

@@ -54,6 +54,7 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 	}
 
 	resolvedArgs := make([][]ir.Expr, len(p.Calls))
+	resolvedFilters := make([]ir.Expr, len(p.Calls))
 	for i, call := range p.Calls {
 		resolvedArgs[i] = make([]ir.Expr, len(call.Args))
 		for j, a := range call.Args {
@@ -64,10 +65,18 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 			}
 			resolvedArgs[i][j] = r
 		}
+		if call.Filter != nil {
+			f, err := resolveExpr(call.Filter, inSchema, env)
+			if err != nil {
+				in.Close()
+				return nil, err
+			}
+			resolvedFilters[i] = f
+		}
 	}
 	// Probe accumulator types via a throwaway accumulator set — the
 	// real per-group accs are constructed lazily during Next.
-	probe, err := newAccumulatorSet(p.Calls, resolvedArgs)
+	probe, err := newAccumulatorSet(p.Calls, resolvedArgs, resolvedFilters)
 	if err != nil {
 		in.Close()
 		return nil, err
@@ -83,18 +92,21 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 
 	cols := append(groupCols, aggCols...)
 	return &aggregateOp{
-		in:        in,
-		calls:     p.Calls,
-		callArgs:  resolvedArgs,
-		groupKeys: groupKeys,
-		cols:      cols,
-		env:       env,
+		in:          in,
+		calls:       p.Calls,
+		callArgs:    resolvedArgs,
+		callFilters: resolvedFilters,
+		groupKeys:   groupKeys,
+		cols:        cols,
+		env:         env,
 	}, nil
 }
 
 // newAccumulatorSet builds one accumulator per call. resolvedArgs[i]
 // is the resolved argument list for calls[i] — empty for COUNT(*).
-func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs [][]ir.Expr) ([]aggAcc, error) {
+// resolvedFilters[i] carries the per-call FILTER (WHERE …) cond (or
+// nil) that wraps the accumulator to skip non-matching rows.
+func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs [][]ir.Expr, resolvedFilters []ir.Expr) ([]aggAcc, error) {
 	out := make([]aggAcc, len(calls))
 	for i, call := range calls {
 		acc, err := newAggregator(call.Func, resolvedArgs[i])
@@ -108,10 +120,37 @@ func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs [][]ir.Expr) ([]ag
 				seen:  map[string]struct{}{},
 			}
 		}
+		if i < len(resolvedFilters) && resolvedFilters[i] != nil {
+			acc = &filterAggWrap{inner: acc, cond: resolvedFilters[i]}
+		}
 		out[i] = acc
 	}
 	return out, nil
 }
+
+// filterAggWrap drops rows whose FILTER (WHERE …) condition isn't
+// true before forwarding to the inner accumulator. Aggregate rule:
+// false / NULL filter → row skipped.
+type filterAggWrap struct {
+	inner aggAcc
+	cond  ir.Expr
+}
+
+func (f *filterAggWrap) resultType() types.Type { return f.inner.resultType() }
+
+func (f *filterAggWrap) accept(in Row, env *Env) error {
+	v, err := evalExpr(f.cond, in, env)
+	if err != nil {
+		return err
+	}
+	b, ok := v.(bool)
+	if !ok || !b {
+		return nil
+	}
+	return f.inner.accept(in, env)
+}
+
+func (f *filterAggWrap) result() (any, error) { return f.inner.result() }
 
 // distinctAggWrap dedupes incoming rows by the argument tuple before
 // forwarding them to the inner accumulator. Duplicates among the
@@ -152,12 +191,13 @@ type aggAcc interface {
 }
 
 type aggregateOp struct {
-	in        Operator
-	calls     []ir.AggregateCall
-	callArgs  [][]ir.Expr // parallel to calls; empty for COUNT(*)
-	groupKeys []ir.Expr   // resolved against input schema; empty for scalar agg
-	cols      []Column
-	env       *Env
+	in          Operator
+	calls       []ir.AggregateCall
+	callArgs    [][]ir.Expr // parallel to calls; empty for COUNT(*)
+	callFilters []ir.Expr   // parallel to calls; nil when no FILTER (WHERE …)
+	groupKeys   []ir.Expr   // resolved against input schema; empty for scalar agg
+	cols        []Column
+	env         *Env
 
 	// Lazy state: filled on first Next, drained over subsequent Next
 	// calls. For scalar aggregation pending has exactly one entry; for
@@ -203,7 +243,7 @@ func (a *aggregateOp) runOnce() error {
 		if b, ok := groups[key]; ok {
 			return b, nil
 		}
-		accs, err := newAccumulatorSet(a.calls, a.callArgs)
+		accs, err := newAccumulatorSet(a.calls, a.callArgs, a.callFilters)
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +284,7 @@ func (a *aggregateOp) runOnce() error {
 	// Scalar aggregate (no GROUP BY): always emit a single row, even
 	// when the input was empty — matches PG's COUNT-on-empty-table = 0.
 	if len(a.groupKeys) == 0 && len(groups) == 0 {
-		accs, err := newAccumulatorSet(a.calls, a.callArgs)
+		accs, err := newAccumulatorSet(a.calls, a.callArgs, a.callFilters)
 		if err != nil {
 			return err
 		}

@@ -667,31 +667,50 @@ func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
 	if _, err := p.expect(tLParen, "("); err != nil {
 		return nil, err
 	}
-	if p.accept(tStar) {
-		if _, err := p.expect(tRParen, ")"); err != nil {
-			return nil, err
-		}
-		return &ir.FuncCall{Name: name, Args: nil, Star: true}, nil
-	}
-	distinct := p.accept(kwDistinct)
-	var args []ir.Expr
-	if p.peek().kind != tRParen {
-		for {
-			a, err := p.parseExpr()
-			if err != nil {
-				return nil, err
+	star := p.accept(tStar)
+	var (
+		distinct bool
+		args     []ir.Expr
+	)
+	if !star {
+		distinct = p.accept(kwDistinct)
+		if p.peek().kind != tRParen {
+			for {
+				a, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				args = append(args, a)
+				if p.accept(tComma) {
+					continue
+				}
+				break
 			}
-			args = append(args, a)
-			if p.accept(tComma) {
-				continue
-			}
-			break
 		}
 	}
 	if _, err := p.expect(tRParen, ")"); err != nil {
 		return nil, err
 	}
-	fc := &ir.FuncCall{Name: name, Args: args, Distinct: distinct}
+	fc := &ir.FuncCall{Name: name, Args: args, Distinct: distinct, Star: star}
+	// Optional `FILTER (WHERE cond)` — restricts which input rows
+	// the aggregate observes. Real PG also allows it on window
+	// functions; we only honour it on aggregates today.
+	if p.acceptIdent("filter") {
+		if _, err := p.expect(tLParen, "("); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwWhere, "WHERE"); err != nil {
+			return nil, err
+		}
+		cond, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tRParen, ")"); err != nil {
+			return nil, err
+		}
+		fc.Filter = cond
+	}
 	if p.acceptIdent("over") {
 		spec, err := p.parseWindowSpec()
 		if err != nil {
