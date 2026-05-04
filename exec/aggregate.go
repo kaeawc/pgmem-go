@@ -313,8 +313,97 @@ func newAggregator(name string, args []ir.Expr) (aggAcc, error) {
 		return &boolAgg{arg: arg, all: true}, nil
 	case "bool_or":
 		return &boolAgg{arg: arg, all: false}, nil
+	case "array_agg":
+		return newArrayAgg(arg), nil
 	}
 	return nil, fmt.Errorf("exec: unknown aggregate %q", name)
+}
+
+// arrayAggAcc collects argument values into a typed Go slice. The
+// element type is decided up front from the resolved arg.Type();
+// subsequent values must agree.
+type arrayAggAcc struct {
+	arg     ir.Expr
+	values  []any
+	resultT types.Type
+}
+
+func newArrayAgg(arg ir.Expr) *arrayAggAcc {
+	t := types.Int8Array
+	if arg != nil {
+		switch arg.Type() {
+		case types.Int4:
+			t = types.Int4Array
+		case types.Int8:
+			t = types.Int8Array
+		case types.Text:
+			t = types.TextArray
+		}
+	}
+	return &arrayAggAcc{arg: arg, resultT: t}
+}
+
+func (a *arrayAggAcc) resultType() types.Type { return a.resultT }
+
+func (a *arrayAggAcc) accept(in Row, env *Env) error {
+	v, err := evalExpr(a.arg, in, env)
+	if err != nil {
+		return err
+	}
+	a.values = append(a.values, v)
+	return nil
+}
+
+func (a *arrayAggAcc) result() (any, error) {
+	if len(a.values) == 0 {
+		return nil, nil
+	}
+	switch a.resultT {
+	case types.Int4Array:
+		out := make([]int32, 0, len(a.values))
+		for _, v := range a.values {
+			if v == nil {
+				continue
+			}
+			n, ok := v.(int32)
+			if !ok {
+				return nil, fmt.Errorf("array_agg: element %T not int4", v)
+			}
+			out = append(out, n)
+		}
+		return out, nil
+	case types.Int8Array:
+		out := make([]int64, 0, len(a.values))
+		for _, v := range a.values {
+			if v == nil {
+				continue
+			}
+			n, ok := v.(int64)
+			if !ok {
+				if n32, ok := v.(int32); ok {
+					out = append(out, int64(n32))
+					continue
+				}
+				return nil, fmt.Errorf("array_agg: element %T not int8", v)
+			}
+			out = append(out, n)
+		}
+		return out, nil
+	case types.TextArray:
+		out := make([]string, 0, len(a.values))
+		for _, v := range a.values {
+			if v == nil {
+				continue
+			}
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("array_agg: element %T not text", v)
+			}
+			out = append(out, s)
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("array_agg: unsupported result type %s", a.resultT.Name())
 }
 
 // boolAgg implements bool_and (all=true) and bool_or (all=false). PG

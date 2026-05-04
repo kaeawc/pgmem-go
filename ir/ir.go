@@ -41,6 +41,17 @@ type Window struct {
 
 func (*Window) node() {}
 
+// Unnest is the table-valued form `unnest(array_expr) [AS alias(col)]`.
+// One row per element; the output schema has a single column whose
+// name is Alias (default "unnest") and whose type is the array's
+// element type.
+type Unnest struct {
+	Array Expr
+	Alias string
+}
+
+func (*Unnest) node() {}
+
 // SubqueryAlias wraps an inline SELECT used in a FROM clause:
 //
 //	FROM (SELECT ...) sub

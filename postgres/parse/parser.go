@@ -158,6 +158,13 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	if p.peek().kind == tLParen && p.peekNext().kind == kwSelect {
 		return p.parseDerivedTable()
 	}
+	// Table-valued `unnest(array_expr) [AS alias]`. We recognise it
+	// here rather than via a generic "table function" mechanism
+	// because unnest is the only set-returning function pgmem-go
+	// supports today.
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "unnest") && p.peekNext().kind == tLParen {
+		return p.parseUnnest()
+	}
 	t, err := p.expect(tIdent, "table name")
 	if err != nil {
 		return nil, err
@@ -176,6 +183,29 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 		return &ir.SubqueryAlias{Inner: plan, Alias: qual}, nil
 	}
 	return &ir.Scan{Table: t.val, Alias: alias}, nil
+}
+
+// parseUnnest consumes `unnest ( array_expr ) [AS alias]` from a
+// FROM clause. The output schema is a single column whose name is
+// the alias (default "unnest") and whose type comes from the array
+// element type at exec.Build.
+func (p *parser) parseUnnest() (ir.Node, error) {
+	p.consume() // unnest
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	arr, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	alias := p.parseOptionalAlias()
+	if alias == "" {
+		alias = "unnest"
+	}
+	return &ir.Unnest{Array: arr, Alias: alias}, nil
 }
 
 // parseDerivedTable consumes `( SELECT ... ) [AS] alias`. Real PG
@@ -1520,7 +1550,7 @@ func isAggregateCall(e ir.Expr) bool {
 	}
 	switch fc.Name {
 	case "count", "sum", "min", "max", "avg", "string_agg",
-		"bool_and", "bool_or", "every":
+		"bool_and", "bool_or", "every", "array_agg":
 		return true
 	}
 	return false
