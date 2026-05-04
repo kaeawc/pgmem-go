@@ -284,6 +284,20 @@ type CreateTable struct {
 	// these come from `CHECK (...)` or `CONSTRAINT name CHECK (...)`
 	// lines in the table parens.
 	TableChecks []TableCheck
+	// TableFKs are table-level FOREIGN KEY constraints. Each entry
+	// names the local column and the parent (table, column). Multi-
+	// column FKs aren't yet supported; the parser rejects them. The
+	// executor folds these onto the matching column's References at
+	// CreateTable time.
+	TableFKs []TableFK
+}
+
+// TableFK is one `[CONSTRAINT name] FOREIGN KEY (col) REFERENCES
+// parent(parent_col) [ON DELETE action]` clause.
+type TableFK struct {
+	Name   string
+	Column string
+	Ref    *ColumnRefSpec
 }
 
 // TableCheck is a table-level CHECK constraint. Name is optional —
