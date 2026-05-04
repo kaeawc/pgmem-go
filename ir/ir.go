@@ -244,6 +244,29 @@ type CreateTable struct {
 
 func (*CreateTable) node() {}
 
+// CreateIndex is a no-op DDL — pgmem-go has no real index machinery,
+// so CREATE INDEX is accepted purely for migration-tool / sqlc-init
+// compatibility. The Name / Table / Concurrently / IfNotExists
+// fields are kept so a future indexed-scan piece can grow the
+// behaviour without an IR rev.
+type CreateIndex struct {
+	Name         string
+	Table        string
+	IfNotExists  bool
+	Concurrently bool
+}
+
+func (*CreateIndex) node() {}
+
+// DropIndex is the partner no-op for CREATE INDEX. IfExists keeps
+// the cleanup path quiet on a missing index.
+type DropIndex struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropIndex) node() {}
+
 // CreateView registers a named view backed by an IR plan. The view
 // shows up in the catalog like a read-only table; SELECT against it
 // inlines the plan.

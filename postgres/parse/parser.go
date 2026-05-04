@@ -417,27 +417,160 @@ func (p *parser) parseDropTable() (ir.Node, error) {
 
 // --- CREATE TABLE ---
 
-// parseCreate dispatches between CREATE TABLE and CREATE VIEW. The
-// CREATE keyword has not been consumed yet.
+// parseCreate dispatches between CREATE TABLE / VIEW / INDEX. The
+// CREATE keyword has not been consumed yet. INDEX form also accepts
+// the optional UNIQUE prefix (`CREATE UNIQUE INDEX …`) — matched
+// here.
 func (p *parser) parseCreate() (ir.Node, error) {
-	if p.peekNext().kind == kwTable {
+	next := p.peekNext()
+	if next.kind == kwTable {
 		return p.parseCreateTable()
 	}
-	if p.peekNext().kind == tIdent && strings.EqualFold(p.peekNext().val, "view") {
-		return p.parseCreateView()
+	if next.kind == tIdent {
+		switch strings.ToLower(next.val) {
+		case "view":
+			return p.parseCreateView()
+		case "index", "concurrently":
+			return p.parseCreateIndex()
+		}
 	}
-	return nil, fmt.Errorf("parse: unexpected token after CREATE: %q", p.peekNext().val)
+	if next.kind == kwUnique {
+		// `CREATE UNIQUE INDEX …` — the UNIQUE is part of the
+		// index spec, not the start of an inline constraint.
+		return p.parseCreateIndex()
+	}
+	return nil, fmt.Errorf("parse: unexpected token after CREATE: %q", next.val)
 }
 
-// parseDrop dispatches between DROP TABLE and DROP VIEW.
+// parseDrop dispatches between DROP TABLE / VIEW / INDEX.
 func (p *parser) parseDrop() (ir.Node, error) {
-	if p.peekNext().kind == kwTable {
+	next := p.peekNext()
+	if next.kind == kwTable {
 		return p.parseDropTable()
 	}
-	if p.peekNext().kind == tIdent && strings.EqualFold(p.peekNext().val, "view") {
-		return p.parseDropView()
+	if next.kind == tIdent {
+		switch strings.ToLower(next.val) {
+		case "view":
+			return p.parseDropView()
+		case "index":
+			return p.parseDropIndex()
+		}
 	}
-	return nil, fmt.Errorf("parse: unexpected token after DROP: %q", p.peekNext().val)
+	return nil, fmt.Errorf("parse: unexpected token after DROP: %q", next.val)
+}
+
+// parseCreateIndex consumes the wide `CREATE [UNIQUE] INDEX
+// [CONCURRENTLY] [IF NOT EXISTS] [name] ON table [USING method] (
+// expr_list ) [WHERE …]` form and discards everything but the name
+// and table — pgmem-go has no real index machinery, so the operator
+// is a no-op DDL.
+func (p *parser) parseCreateIndex() (ir.Node, error) {
+	p.consume() // CREATE
+	p.accept(kwUnique)
+	concurrentlySeen := p.acceptIdent("concurrently")
+	if !p.acceptIdent("index") {
+		return nil, fmt.Errorf("parse: expected INDEX at %d", p.peek().pos)
+	}
+	if !concurrentlySeen {
+		concurrentlySeen = p.acceptIdent("concurrently")
+	}
+	ifNotExists := false
+	if p.accept(kwIf) {
+		if !p.accept(kwNot) {
+			return nil, fmt.Errorf("parse: expected NOT after IF at %d", p.peek().pos)
+		}
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifNotExists = true
+	}
+	// Optional index name — present unless caller skipped to ON.
+	var name string
+	if p.peek().kind == tIdent {
+		name = p.consume().val
+	}
+	if !p.accept(kwOn) {
+		return nil, fmt.Errorf("parse: expected ON in CREATE INDEX at %d", p.peek().pos)
+	}
+	tableTok, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	// Optional USING <method>.
+	if p.acceptIdent("using") {
+		if _, err := p.expect(tIdent, "index method"); err != nil {
+			return nil, err
+		}
+	}
+	// Column / expression list — discarded.
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	if err := skipBalancedParens(p); err != nil {
+		return nil, err
+	}
+	// Optional partial-index predicate.
+	if p.accept(kwWhere) {
+		if _, err := p.parseExpr(); err != nil {
+			return nil, err
+		}
+	}
+	return &ir.CreateIndex{
+		Name:         name,
+		Table:        tableTok.val,
+		IfNotExists:  ifNotExists,
+		Concurrently: concurrentlySeen,
+	}, nil
+}
+
+// parseDropIndex consumes `DROP INDEX [CONCURRENTLY] [IF EXISTS]
+// name [, name ...]` and ignores everything but the first name.
+// pgmem-go doesn't track indexes, so the operator is a no-op.
+func (p *parser) parseDropIndex() (ir.Node, error) {
+	p.consume() // DROP
+	if !p.acceptIdent("index") {
+		return nil, fmt.Errorf("parse: expected INDEX at %d", p.peek().pos)
+	}
+	p.acceptIdent("concurrently")
+	ifExists := false
+	if p.accept(kwIf) {
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	name, err := p.expect(tIdent, "index name")
+	if err != nil {
+		return nil, err
+	}
+	// Drop additional names — we still produce a single ir.DropIndex
+	// node; there's nothing to actually drop in any case.
+	for p.accept(tComma) {
+		if _, err := p.expect(tIdent, "index name"); err != nil {
+			return nil, err
+		}
+	}
+	return &ir.DropIndex{Name: name.val, IfExists: ifExists}, nil
+}
+
+// skipBalancedParens consumes tokens until the matching ')' that
+// pairs with the most recently consumed '('. Nested parens count
+// against the depth so `(a, (b, c))` round-trips. The `(` has
+// already been consumed by the caller.
+func skipBalancedParens(p *parser) error {
+	depth := 1
+	for depth > 0 {
+		switch p.peek().kind {
+		case tEOF:
+			return fmt.Errorf("parse: unterminated parenthesised list")
+		case tLParen:
+			depth++
+		case tRParen:
+			depth--
+		}
+		p.consume()
+	}
+	return nil
 }
 
 // parseCreateView consumes `CREATE VIEW name AS SELECT …`.
