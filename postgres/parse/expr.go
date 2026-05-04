@@ -250,15 +250,30 @@ func (p *parser) parseBetween(probe ir.Expr, negate bool) (ir.Expr, error) {
 	}, nil
 }
 
-// parseIsNull consumes `IS NULL` or `IS NOT NULL` after `left`. We
-// represent it as a unary op whose operand is the probe — keeping it a
-// unary lets evaluation skip the standard "either side NULL → NULL"
-// short-circuit that comparison ops use.
+// parseIsNull consumes the `IS …` postfix after `left`. We support
+// `IS NULL`, `IS NOT NULL`, `IS DISTINCT FROM expr`, and
+// `IS NOT DISTINCT FROM expr`. The first two are unary ops whose
+// evaluator skips the standard NULL short-circuit; the latter two
+// are binary ops that treat NULL as a comparable value.
 func (p *parser) parseIsNull(left ir.Expr) (ir.Expr, error) {
 	p.consume() // IS
 	negate := p.accept(kwNot)
+	if p.accept(kwDistinct) {
+		if !p.accept(kwFrom) {
+			return nil, fmt.Errorf("parse: expected FROM after DISTINCT at %d", p.peek().pos)
+		}
+		right, err := p.parseAdditive()
+		if err != nil {
+			return nil, err
+		}
+		op := "is distinct from"
+		if negate {
+			op = "is not distinct from"
+		}
+		return &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool}, nil
+	}
 	if !p.accept(kwNull) {
-		return nil, fmt.Errorf("parse: expected NULL after IS at %d", p.peek().pos)
+		return nil, fmt.Errorf("parse: expected NULL or DISTINCT after IS at %d", p.peek().pos)
 	}
 	op := "is null"
 	if negate {

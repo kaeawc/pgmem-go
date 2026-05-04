@@ -2680,6 +2680,10 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 	if err != nil {
 		return nil, err
 	}
+	switch b.Op {
+	case "is distinct from", "is not distinct from":
+		return evalIsDistinctFrom(l, r, b.Op == "is not distinct from")
+	}
 	if l == nil || r == nil {
 		return nil, nil
 	}
@@ -2749,6 +2753,30 @@ func arithResultType(l, r types.Type) types.Type {
 		return types.Int8
 	}
 	return types.Int4
+}
+
+// evalIsDistinctFrom is NULL-safe equality. Per PG: NULL IS DISTINCT
+// FROM NULL is false (they are *not* distinct); NULL IS DISTINCT FROM
+// non-null is true. The negate flag flips the result for the
+// IS NOT DISTINCT FROM form.
+func evalIsDistinctFrom(l, r any, negate bool) (any, error) {
+	var distinct bool
+	switch {
+	case l == nil && r == nil:
+		distinct = false
+	case l == nil || r == nil:
+		distinct = true
+	default:
+		cmp, err := compareValues(l, r)
+		if err != nil {
+			return nil, err
+		}
+		distinct = cmp != 0
+	}
+	if negate {
+		return !distinct, nil
+	}
+	return distinct, nil
 }
 
 // evalJSONArrow implements jsonb's `->` (asText=false) and `->>`
