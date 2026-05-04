@@ -2124,11 +2124,25 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 	}
 	tableSchema := make([]Column, len(ct.Columns))
 	for i, c := range ct.Columns {
-		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
+		tableSchema[i] = Column{Qualifier: ct.Name, Name: c.Name, Type: c.Type}
 	}
 	op := &deleteOp{table: st, ct: ct, env: env, tableSchema: tableSchema}
+	resolveSchema := tableSchema
+	if p.Using != nil {
+		usingOp, err := Build(p.Using, env)
+		if err != nil {
+			return nil, err
+		}
+		op.usingCols = append([]Column(nil), usingOp.OutputSchema()...)
+		op.usingRows, err = drain(usingOp)
+		usingOp.Close()
+		if err != nil {
+			return nil, err
+		}
+		resolveSchema = append(append([]Column(nil), tableSchema...), op.usingCols...)
+	}
 	if p.Where != nil {
-		cond, err := resolveExpr(p.Where, tableSchema, env)
+		cond, err := resolveExpr(p.Where, resolveSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -2151,6 +2165,12 @@ type deleteOp struct {
 	tableSchema []Column
 	where       ir.Expr // nil → delete all
 	env         *Env
+
+	// Optional USING scope. usingRows is the materialised auxiliary
+	// rows; usingCols is its schema. WHERE sees both target and
+	// using-side columns when usingRows is set.
+	usingRows []Row
+	usingCols []Column
 
 	done    bool
 	deleted int
@@ -2236,13 +2256,25 @@ func (d *deleteOp) matches(row storage.Row) (bool, error) {
 	if d.where == nil {
 		return true, nil
 	}
-	v, err := evalExpr(d.where, Row(row), d.env)
-	if err != nil {
-		return false, err
+	if len(d.usingRows) == 0 {
+		v, err := evalExpr(d.where, Row(row), d.env)
+		if err != nil {
+			return false, err
+		}
+		b, ok := v.(bool)
+		return ok && b, nil
 	}
-	// SQL three-valued logic: NULL is not "true", so it doesn't match.
-	b, ok := v.(bool)
-	return ok && b, nil
+	for _, ur := range d.usingRows {
+		combined := concatRows(Row(row), ur)
+		v, err := evalExpr(d.where, combined, d.env)
+		if err != nil {
+			return false, err
+		}
+		if b, ok := v.(bool); ok && b {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (d *deleteOp) tag() string { return fmt.Sprintf("DELETE %d", d.deleted) }
@@ -2260,9 +2292,33 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	}
 	tableSchema := make([]Column, len(ct.Columns))
 	for i, c := range ct.Columns {
-		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
+		tableSchema[i] = Column{Qualifier: ct.Name, Name: c.Name, Type: c.Type}
 	}
 	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, env: env}
+
+	// Resolution schema: target schema, optionally extended with the
+	// FROM tree's columns. assignments / WHERE / RETURNING all see
+	// this combined view so SET expressions and predicates can
+	// reference auxiliary tables.
+	resolveSchema := tableSchema
+	var fromCols []Column
+	var fromRows []Row
+	if p.From != nil {
+		fromOp, err := Build(p.From, env)
+		if err != nil {
+			return nil, err
+		}
+		fromCols = append([]Column(nil), fromOp.OutputSchema()...)
+		fromRows, err = drain(fromOp)
+		fromOp.Close()
+		if err != nil {
+			return nil, err
+		}
+		resolveSchema = append(append([]Column(nil), tableSchema...), fromCols...)
+		op.fromCols = fromCols
+		op.fromRows = fromRows
+		op.targetWidth = len(tableSchema)
+	}
 
 	op.assigns = make([]resolvedAssign, len(p.Assignments))
 	for i, a := range p.Assignments {
@@ -2276,7 +2332,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 		if colIdx < 0 {
 			return nil, fmt.Errorf("exec: update %q: unknown column %q", p.Table, a.Column)
 		}
-		expr, err := resolveExpr(a.Expr, tableSchema, env)
+		expr, err := resolveExpr(a.Expr, resolveSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -2284,7 +2340,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	}
 
 	if p.Where != nil {
-		cond, err := resolveExpr(p.Where, tableSchema, env)
+		cond, err := resolveExpr(p.Where, resolveSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -2292,6 +2348,8 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	}
 
 	if len(p.Returning) > 0 {
+		// RETURNING runs against the post-update target row only —
+		// from rows aren't visible.
 		exprs, cols, err := resolveReturning(p.Returning, p.ReturningNames, tableSchema, env)
 		if err != nil {
 			return nil, err
@@ -2314,6 +2372,13 @@ type updateOp struct {
 	assigns     []resolvedAssign
 	where       ir.Expr
 	env         *Env
+
+	// Optional FROM scope. fromRows is the materialised auxiliary
+	// rows; fromCols is its schema. targetWidth is len(tableSchema)
+	// — the offset where from-side columns start in a combined row.
+	fromRows    []Row
+	fromCols    []Column
+	targetWidth int
 
 	done    bool
 	updated int
@@ -2350,16 +2415,16 @@ func (u *updateOp) runOnce() error {
 	u.table.Mutate(func(rows []storage.Row) []storage.Row {
 		next := make([]storage.Row, len(rows))
 		for i, row := range rows {
-			match, err := u.matches(row)
+			combined, ok, err := u.firstMatchingCombined(row)
 			if err != nil {
 				evalErr = err
 				return rows
 			}
-			if !match {
+			if !ok {
 				next[i] = row
 				continue
 			}
-			updated, err := u.applyAssignments(row)
+			updated, err := u.applyAssignmentsCombined(row, combined)
 			if err != nil {
 				evalErr = err
 				return rows
@@ -2408,11 +2473,38 @@ func (u *updateOp) runOnce() error {
 	return nil
 }
 
-func (u *updateOp) matches(row storage.Row) (bool, error) {
+// firstMatchingCombined returns the (target ++ from) row that
+// matches WHERE for the given target. With no FROM scope it just
+// evaluates WHERE against the target row. With FROM, it iterates
+// the materialised from rows and stops at the first combo whose
+// WHERE evaluates true. Returns (combined, false, nil) when no
+// match is found.
+func (u *updateOp) firstMatchingCombined(row storage.Row) (Row, bool, error) {
+	if len(u.fromRows) == 0 {
+		ok, err := u.evalWhere(Row(row))
+		if err != nil {
+			return nil, false, err
+		}
+		return Row(row), ok, nil
+	}
+	for _, fr := range u.fromRows {
+		combined := concatRows(Row(row), fr)
+		ok, err := u.evalWhere(combined)
+		if err != nil {
+			return nil, false, err
+		}
+		if ok {
+			return combined, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func (u *updateOp) evalWhere(row Row) (bool, error) {
 	if u.where == nil {
 		return true, nil
 	}
-	v, err := evalExpr(u.where, Row(row), u.env)
+	v, err := evalExpr(u.where, row, u.env)
 	if err != nil {
 		return false, err
 	}
@@ -2420,13 +2512,14 @@ func (u *updateOp) matches(row storage.Row) (bool, error) {
 	return ok && b, nil
 }
 
-// applyAssignments returns a new row with each assignment evaluated
-// against the *original* row. PG semantics: assignments don't see each
-// other's effects within the same UPDATE.
-func (u *updateOp) applyAssignments(orig storage.Row) (storage.Row, error) {
+// applyAssignmentsCombined returns a new target row with each
+// assignment evaluated against the combined (target ++ from) row.
+// PG semantics: assignments don't see each other's effects within
+// the same UPDATE.
+func (u *updateOp) applyAssignmentsCombined(orig storage.Row, combined Row) (storage.Row, error) {
 	out := append(storage.Row(nil), orig...)
 	for _, a := range u.assigns {
-		v, err := evalExpr(a.expr, Row(orig), u.env)
+		v, err := evalExpr(a.expr, combined, u.env)
 		if err != nil {
 			return nil, err
 		}

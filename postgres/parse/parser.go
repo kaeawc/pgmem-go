@@ -295,6 +295,13 @@ func (p *parser) parseUpdate() (ir.Node, error) {
 		}
 		break
 	}
+	if p.accept(kwFrom) {
+		from, err := p.parseFromClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.From = from
+	}
 	if p.accept(kwWhere) {
 		cond, err := p.parseExpr()
 		if err != nil {
@@ -325,6 +332,13 @@ func (p *parser) parseDelete() (ir.Node, error) {
 		return nil, err
 	}
 	stmt := &ir.Delete{Table: name.val}
+	if p.acceptIdent("using") {
+		using, err := p.parseFromClause()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Using = using
+	}
 	if p.accept(kwWhere) {
 		cond, err := p.parseExpr()
 		if err != nil {

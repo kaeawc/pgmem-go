@@ -324,6 +324,10 @@ type Update struct {
 	Where          Expr
 	Returning      []Expr
 	ReturningNames []string
+	// From, when non-nil, joins additional tables into the update
+	// scope: `UPDATE t SET … FROM other WHERE …`. SET expressions and
+	// WHERE see both target columns and From's output schema.
+	From Node
 }
 
 func (*Update) node() {}
@@ -337,6 +341,9 @@ type Delete struct {
 	Where          Expr
 	Returning      []Expr
 	ReturningNames []string
+	// Using mirrors UPDATE's From: extra tables visible to WHERE for
+	// `DELETE FROM t USING other WHERE …`.
+	Using Node
 }
 
 func (*Delete) node() {}
