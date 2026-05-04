@@ -116,9 +116,13 @@ func buildScan(p *ir.Scan, env *Env) (Operator, error) {
 	if !ok {
 		return nil, fmt.Errorf("exec: storage missing table %q", p.Table)
 	}
+	qualifier := p.Table
+	if p.Alias != "" {
+		qualifier = p.Alias
+	}
 	cols := make([]Column, len(ct.Columns))
 	for i, c := range ct.Columns {
-		cols[i] = Column{Qualifier: p.Table, Name: c.Name, Type: c.Type}
+		cols[i] = Column{Qualifier: qualifier, Name: c.Name, Type: c.Type}
 	}
 	return &scanOp{cols: cols, rows: storageRowsToExec(st.Rows())}, nil
 }

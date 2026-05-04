@@ -156,11 +156,42 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	alias := p.parseOptionalAlias()
 	if plan, ok := p.ctes[strings.ToLower(t.val)]; ok {
+		// Aliases on CTE references aren't propagated yet — column refs
+		// still work via name match against the inner plan's schema.
+		_ = alias
 		return plan, nil
 	}
-	return &ir.Scan{Table: t.val}, nil
+	return &ir.Scan{Table: t.val, Alias: alias}, nil
 }
+
+// parseOptionalAlias accepts `[AS] alias` if the next token can serve
+// as a table alias. Returns "" when nothing alias-shaped follows. We
+// don't gate on `kwAs` so the optional-AS form (`FROM users u`) works
+// alongside the explicit form (`FROM users AS u`).
+func (p *parser) parseOptionalAlias() string {
+	if p.accept(kwAs) {
+		t, err := p.expect(tIdent, "alias")
+		if err != nil {
+			return ""
+		}
+		return t.val
+	}
+	if p.peek().kind == tIdent && !aliasStopword(p.peek().val) {
+		return p.consume().val
+	}
+	return ""
+}
+
+// aliasStopword reports whether a bare identifier following a table
+// reference should be left for the next clause rather than consumed
+// as an alias. PG's grammar makes ON / WHERE etc. proper keywords;
+// our lexer keeps a few clause openers as identifiers (CTEs use ON
+// internally, etc.), but in practice the keywords are reserved. The
+// stopword list here is empty for now; extend it if a plain ident
+// keyword starts to look ambiguous.
+func aliasStopword(_ string) bool { return false }
 
 // peekIsJoin reports whether the next token starts a JOIN clause —
 // either `JOIN` directly or one of the prefix keywords.

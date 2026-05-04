@@ -12,9 +12,12 @@ type Node interface{ node() }
 
 // --- Read-side plan nodes ---
 
-// Scan reads every row of the named table.
+// Scan reads every row of the named table. Alias, when set, replaces
+// the Table value as the qualifier for column references in the scan's
+// output schema — i.e. `users u` makes `u.id` the canonical reference.
 type Scan struct {
 	Table string
+	Alias string
 }
 
 func (*Scan) node() {}
