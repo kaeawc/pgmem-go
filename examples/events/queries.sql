@@ -23,13 +23,16 @@ WHERE message ~* 'error'
 ORDER BY created_at DESC;
 
 -- name: EventsPerHour :many
-SELECT date_trunc('hour', created_at) AS hour,
+SELECT date_trunc('hour', created_at)::timestamptz AS hour,
        count(*) AS n
 FROM events
-GROUP BY hour
+GROUP BY date_trunc('hour', created_at)
 ORDER BY hour;
 
 -- name: EventEpochs :many
-SELECT id, extract(epoch FROM created_at) AS epoch
+-- sqlc infers `extract(epoch FROM …)` as numeric (matching real PG),
+-- but pgmem-go's date_part returns int8 today — the type clash makes
+-- the generated scan fail. Cast to bigint so both sides agree.
+SELECT id, extract(epoch FROM created_at)::bigint AS epoch
 FROM events
 ORDER BY id;
