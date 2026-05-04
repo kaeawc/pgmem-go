@@ -996,6 +996,30 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 	}
 }
 
+// parseGeneratedClause consumes the rest of `GENERATED ALWAYS AS
+// (expr) STORED`. Identity columns (`GENERATED [ALWAYS|BY DEFAULT]
+// AS IDENTITY`) aren't supported yet — only the computed-from-other-
+// columns form. The leading GENERATED ident has been consumed.
+func (p *parser) parseGeneratedClause() (ir.Expr, error) {
+	if !p.acceptIdent("always") {
+		return nil, fmt.Errorf("parse: expected ALWAYS after GENERATED at %d", p.peek().pos)
+	}
+	if _, err := p.expect(kwAs, "AS"); err != nil {
+		return nil, err
+	}
+	if p.acceptIdent("identity") {
+		return nil, fmt.Errorf("parse: GENERATED AS IDENTITY not yet supported (pos %d)", p.peek().pos)
+	}
+	expr, err := p.parseParenExpr()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptIdent("stored") {
+		return nil, fmt.Errorf("parse: expected STORED after generated expression at %d", p.peek().pos)
+	}
+	return expr, nil
+}
+
 // resolveSerial recognizes the SERIAL / BIGSERIAL pseudo-types and
 // returns the underlying integer type plus the Auto flag so the
 // caller can flatten them into a regular ColumnDef.
@@ -1056,6 +1080,12 @@ func (p *parser) parseColumnConstraint(def *ir.ColumnDef) (done bool, err error)
 			return false, err
 		}
 		def.Default = expr
+	case p.acceptIdent("generated"):
+		expr, err := p.parseGeneratedClause()
+		if err != nil {
+			return false, err
+		}
+		def.Generated = expr
 	default:
 		return true, nil
 	}
