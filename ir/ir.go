@@ -244,6 +244,25 @@ type CreateTable struct {
 
 func (*CreateTable) node() {}
 
+// CreateView registers a named view backed by an IR plan. The view
+// shows up in the catalog like a read-only table; SELECT against it
+// inlines the plan.
+type CreateView struct {
+	Name string
+	Plan Node
+}
+
+func (*CreateView) node() {}
+
+// DropView removes a view from the catalog. IfExists makes a missing
+// view a no-op rather than an error.
+type DropView struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropView) node() {}
+
 // Truncate empties the listed tables. Real PG also resets identity
 // sequences when RESTART IDENTITY is given; we accept the option as a
 // no-op for now since we don't yet model sequences as first-class

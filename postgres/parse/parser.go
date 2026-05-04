@@ -83,9 +83,9 @@ func (p *parser) parseStmt() (ir.Node, error) {
 	case kwUpdate:
 		return p.parseUpdate()
 	case kwCreate:
-		return p.parseCreateTable()
+		return p.parseCreate()
 	case kwDrop:
-		return p.parseDropTable()
+		return p.parseDrop()
 	case kwTruncate:
 		return p.parseTruncate()
 	default:
@@ -416,6 +416,69 @@ func (p *parser) parseDropTable() (ir.Node, error) {
 }
 
 // --- CREATE TABLE ---
+
+// parseCreate dispatches between CREATE TABLE and CREATE VIEW. The
+// CREATE keyword has not been consumed yet.
+func (p *parser) parseCreate() (ir.Node, error) {
+	if p.peekNext().kind == kwTable {
+		return p.parseCreateTable()
+	}
+	if p.peekNext().kind == tIdent && strings.EqualFold(p.peekNext().val, "view") {
+		return p.parseCreateView()
+	}
+	return nil, fmt.Errorf("parse: unexpected token after CREATE: %q", p.peekNext().val)
+}
+
+// parseDrop dispatches between DROP TABLE and DROP VIEW.
+func (p *parser) parseDrop() (ir.Node, error) {
+	if p.peekNext().kind == kwTable {
+		return p.parseDropTable()
+	}
+	if p.peekNext().kind == tIdent && strings.EqualFold(p.peekNext().val, "view") {
+		return p.parseDropView()
+	}
+	return nil, fmt.Errorf("parse: unexpected token after DROP: %q", p.peekNext().val)
+}
+
+// parseCreateView consumes `CREATE VIEW name AS SELECT …`.
+func (p *parser) parseCreateView() (ir.Node, error) {
+	p.consume() // CREATE
+	if !p.acceptIdent("view") {
+		return nil, fmt.Errorf("parse: expected VIEW at %d", p.peek().pos)
+	}
+	name, err := p.expect(tIdent, "view name")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwAs, "AS"); err != nil {
+		return nil, err
+	}
+	plan, err := p.parseSelectMaybeUnion()
+	if err != nil {
+		return nil, err
+	}
+	return &ir.CreateView{Name: name.val, Plan: plan}, nil
+}
+
+// parseDropView consumes `DROP VIEW [IF EXISTS] name`.
+func (p *parser) parseDropView() (ir.Node, error) {
+	p.consume() // DROP
+	if !p.acceptIdent("view") {
+		return nil, fmt.Errorf("parse: expected VIEW at %d", p.peek().pos)
+	}
+	ifExists := false
+	if p.accept(kwIf) {
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	name, err := p.expect(tIdent, "view name")
+	if err != nil {
+		return nil, err
+	}
+	return &ir.DropView{Name: name.val, IfExists: ifExists}, nil
+}
 
 func (p *parser) parseCreateTable() (ir.Node, error) {
 	p.consume() // CREATE
