@@ -374,6 +374,29 @@ type ScalarSubquery struct {
 func (*ScalarSubquery) expr()              {}
 func (s *ScalarSubquery) Type() types.Type { return s.T }
 
+// CaseWhen is one branch of a Case expression.
+type CaseWhen struct {
+	// Match is the WHEN expression. For a "searched" CASE (no operand)
+	// it's a bool predicate; for a "simple" CASE it's compared to the
+	// outer Operand for equality.
+	Match Expr
+	// Result is the THEN expression evaluated when this branch fires.
+	Result Expr
+}
+
+// Case is `CASE [operand] WHEN ... THEN ... [ELSE ...] END`. Operand
+// is nil for the searched form. Else may be nil — when no branch
+// fires and there is no ELSE, the result is NULL.
+type Case struct {
+	Operand Expr
+	Whens   []CaseWhen
+	Else    Expr
+	T       types.Type
+}
+
+func (*Case) expr()              {}
+func (c *Case) Type() types.Type { return c.T }
+
 // InListExpr is `probe IN (val1, val2, ...)`. Result is always bool.
 type InListExpr struct {
 	Probe Expr
