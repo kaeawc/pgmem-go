@@ -1,7 +1,11 @@
 package exec
 
 import (
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -981,6 +985,153 @@ var builtins = map[string]builtinFunc{
 			return int32(len(arr)), nil
 		},
 	},
+	"format": {
+		// format(template, args...) — PG-style template with %s, %I,
+		// %L, %% specifiers. %s renders the arg as text; %I quotes
+		// identifiers; %L quotes literals. We keep the implementation
+		// to those five forms — the full PG grammar (positional %1$s,
+		// width modifiers) is beyond what tests typically need.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 1 {
+				return nil, fmt.Errorf("format: takes at least 1 argument (template)")
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			return formatTemplate(textArg(args[0]), args[1:])
+		},
+	},
+	"chr": {
+		// chr(n) — return the one-character text whose code point is
+		// n. n must be a positive int4; 0 is rejected (PG rejects \0).
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("chr: takes 1 argument, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			n, ok := args[0].(int32)
+			if !ok {
+				return nil, fmt.Errorf("chr: arg must be int4, got %T", args[0])
+			}
+			if n <= 0 {
+				return nil, &SQLError{Code: "22023", Message: "null character not permitted"}
+			}
+			return string(rune(n)), nil
+		},
+	},
+	"ascii": {
+		// ascii(s) — Unicode code point of the first character of s.
+		// Returns 0 for an empty string, matching PG.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("ascii: takes 1 argument, got %d", len(args))
+			}
+			return types.Int4, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s := textArg(args[0])
+			if s == "" {
+				return int32(0), nil
+			}
+			r, _ := decodeFirstRune(s)
+			return int32(r), nil
+		},
+	},
+	"to_hex": {
+		// to_hex(n) — lowercase hex string for an int4/int8.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("to_hex: takes 1 argument, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			switch n := args[0].(type) {
+			case int32:
+				return strconv.FormatInt(int64(uint32(n)), 16), nil
+			case int64:
+				return strconv.FormatUint(uint64(n), 16), nil
+			default:
+				return nil, fmt.Errorf("to_hex: arg must be integer, got %T", args[0])
+			}
+		},
+	},
+	"md5": {
+		// md5(text) — lowercase 32-char hex MD5 digest. PG also
+		// supports md5(bytea); for now we accept text only — the
+		// common case in test suites.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("md5: takes 1 argument, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			data, err := hashInputBytes(args[0])
+			if err != nil {
+				return nil, fmt.Errorf("md5: %w", err)
+			}
+			sum := md5.Sum(data)
+			return hex.EncodeToString(sum[:]), nil
+		},
+	},
+	"sha256": {
+		// sha256(bytea) — returns the SHA-256 digest as bytea (raw
+		// 32 bytes), matching PG's pgcrypto-free 14+ behaviour.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("sha256: takes 1 argument, got %d", len(args))
+			}
+			return types.Bytea, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			data, err := hashInputBytes(args[0])
+			if err != nil {
+				return nil, fmt.Errorf("sha256: %w", err)
+			}
+			sum := sha256.Sum256(data)
+			return sum[:], nil
+		},
+	},
+	"sha512": {
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("sha512: takes 1 argument, got %d", len(args))
+			}
+			return types.Bytea, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			data, err := hashInputBytes(args[0])
+			if err != nil {
+				return nil, fmt.Errorf("sha512: %w", err)
+			}
+			sum := sha512.Sum512(data)
+			return sum[:], nil
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -1245,6 +1396,89 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// formatTemplate implements PG's `format(template, args...)` for
+// the %s, %I, %L, %% specifiers. Unrecognised specifiers surface a
+// clear error so callers know we didn't silently drop the arg.
+func formatTemplate(template string, args []any) (string, error) {
+	var b strings.Builder
+	argIdx := 0
+	i := 0
+	for i < len(template) {
+		c := template[i]
+		if c != '%' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		if i+1 >= len(template) {
+			return "", fmt.Errorf("format: lone %% at end of template")
+		}
+		spec := template[i+1]
+		switch spec {
+		case '%':
+			b.WriteByte('%')
+		case 's', 'I', 'L':
+			if argIdx >= len(args) {
+				return "", fmt.Errorf("format: too few arguments for template")
+			}
+			a := args[argIdx]
+			argIdx++
+			switch spec {
+			case 's':
+				if a == nil {
+					// %s on NULL renders as empty string in PG.
+					break
+				}
+				b.WriteString(textArg(a))
+			case 'I':
+				if a == nil {
+					return "", &SQLError{Code: "22004", Message: "null values cannot be formatted as an SQL identifier"}
+				}
+				b.WriteString(quoteIdent(textArg(a)))
+			case 'L':
+				if a == nil {
+					b.WriteString("NULL")
+				} else {
+					b.WriteString(quoteLiteral(textArg(a)))
+				}
+			}
+		default:
+			return "", fmt.Errorf("format: unsupported specifier %%%c", spec)
+		}
+		i += 2
+	}
+	return b.String(), nil
+}
+
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// decodeFirstRune returns the first rune of s and its byte width.
+// Empty s returns (0, 0).
+func decodeFirstRune(s string) (rune, int) {
+	for _, r := range s {
+		return r, len(string(r))
+	}
+	return 0, 0
+}
+
+// hashInputBytes coerces a hash-input arg to bytes. Strings encode
+// as UTF-8; bytea passes through; anything else errors.
+func hashInputBytes(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case string:
+		return []byte(x), nil
+	case []byte:
+		return x, nil
+	}
+	return nil, fmt.Errorf("input must be text or bytea, got %T", v)
 }
 
 // jsonValueOf converts a runtime value into something
