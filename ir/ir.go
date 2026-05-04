@@ -360,6 +360,10 @@ type ColumnDef struct {
 	// `REFERENCES <table>(<column>)`. ON DELETE behavior follows in a
 	// later slice — for now the constraint is implicitly RESTRICT.
 	References *ColumnRefSpec
+	// Default, when non-nil, is the column's DEFAULT expression. The
+	// executor resolves it against an empty schema and evaluates it
+	// per-INSERT for any row that omitted the column.
+	Default Expr
 }
 
 // ColumnRefSpec is the (table, column) pair a FOREIGN KEY references,

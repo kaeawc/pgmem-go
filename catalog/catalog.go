@@ -24,6 +24,11 @@ type Column struct {
 	// References, when set, names the parent table+column this column
 	// FK-references. Empty Table means no FK on this column.
 	References ColumnRef
+	// Default, when non-nil, is the column's DEFAULT expression. It's
+	// evaluated against an empty row (no column refs) when an INSERT
+	// omits this column. Auto columns ignore Default — the SERIAL
+	// fill happens first.
+	Default ir.Expr
 }
 
 // ColumnRef names a (table, column) pair on the catalog. Used by
