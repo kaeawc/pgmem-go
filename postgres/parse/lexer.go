@@ -28,8 +28,10 @@ const (
 	tMinus
 	tSlash
 	tPercent
-	tConcat // ||
-	tCast   // ::
+	tConcat    // ||
+	tCast      // ::
+	tArrow     // ->
+	tArrowText // ->>
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -184,6 +186,12 @@ func lex(src string) ([]token, error) {
 			i++
 		case c == '-' && i+1 < len(src) && src[i+1] == '-':
 			i = skipLineComment(src, i)
+		case c == '-' && i+2 < len(src) && src[i+1] == '>' && src[i+2] == '>':
+			out = append(out, token{tArrowText, "->>", i})
+			i += 3
+		case c == '-' && i+1 < len(src) && src[i+1] == '>':
+			out = append(out, token{tArrow, "->", i})
+			i += 2
 		case c == '-':
 			out = append(out, token{tMinus, "-", i})
 			i++
