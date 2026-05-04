@@ -1193,6 +1193,7 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 // scoping).
 func (p *parser) parseWith() (ir.Node, error) {
 	p.consume() // WITH
+	recursive := p.acceptIdent("recursive")
 	if p.ctes == nil {
 		p.ctes = map[string]ir.Node{}
 	}
@@ -1207,6 +1208,17 @@ func (p *parser) parseWith() (ir.Node, error) {
 		if _, err := p.expect(tLParen, "("); err != nil {
 			return nil, err
 		}
+		key := strings.ToLower(name.val)
+		if _, dup := p.ctes[key]; dup {
+			return nil, fmt.Errorf("parse: duplicate CTE name %q", name.val)
+		}
+		// For RECURSIVE, the step references the CTE itself. Pre-
+		// register a RecursiveRef placeholder so the inner FROM
+		// clause resolves cleanly; we'll swap in the real Recursive
+		// plan once the inner is parsed.
+		if recursive {
+			p.ctes[key] = &ir.RecursiveRef{Name: name.val}
+		}
 		plan, err := p.parseSelectMaybeUnion()
 		if err != nil {
 			return nil, err
@@ -1214,11 +1226,15 @@ func (p *parser) parseWith() (ir.Node, error) {
 		if _, err := p.expect(tRParen, ")"); err != nil {
 			return nil, err
 		}
-		key := strings.ToLower(name.val)
-		if _, dup := p.ctes[key]; dup {
-			return nil, fmt.Errorf("parse: duplicate CTE name %q", name.val)
+		if recursive {
+			unionAll := false
+			if u, ok := plan.(*ir.Union); ok {
+				unionAll = u.All
+			}
+			p.ctes[key] = &ir.Recursive{Name: name.val, Plan: plan, UnionAll: unionAll}
+		} else {
+			p.ctes[key] = plan
 		}
-		p.ctes[key] = plan
 		if !p.accept(tComma) {
 			break
 		}
