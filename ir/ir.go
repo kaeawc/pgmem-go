@@ -105,6 +105,15 @@ type CreateTable struct {
 
 func (*CreateTable) node() {}
 
+// DropTable removes a table from the catalog and the storage engine.
+// IfExists makes a missing table a no-op rather than an error.
+type DropTable struct {
+	Name     string
+	IfExists bool
+}
+
+func (*DropTable) node() {}
+
 // ColumnDef is one column in a CREATE TABLE statement.
 type ColumnDef struct {
 	Name    string

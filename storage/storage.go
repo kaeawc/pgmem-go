@@ -30,6 +30,11 @@ type Engine interface {
 	Begin(ctx context.Context) (Txn, error)
 	Table(name string) (Table, bool)
 	CreateTable(name string, columnCount int) Table
+	// DropTable removes a table; returns false when the name didn't
+	// exist. Concurrent in-flight transactions that already snapshotted
+	// the table keep their snapshot — the engine drop is independent of
+	// per-tx state.
+	DropTable(name string) bool
 }
 
 // Txn is a transaction handle. The executor only ever sees Tables
@@ -102,6 +107,16 @@ func (e *engine) CreateTable(name string, columnCount int) Table {
 	t := &table{name: name, ncols: columnCount}
 	e.tables[name] = t
 	return t
+}
+
+func (e *engine) DropTable(name string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.tables[name]; !ok {
+		return false
+	}
+	delete(e.tables, name)
+	return true
 }
 
 // --- canonical (committed) table ---

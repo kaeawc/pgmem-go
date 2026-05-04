@@ -56,6 +56,8 @@ func (p *parser) parseStmt() (ir.Node, error) {
 		return p.parseUpdate()
 	case kwCreate:
 		return p.parseCreateTable()
+	case kwDrop:
+		return p.parseDropTable()
 	default:
 		return nil, fmt.Errorf("parse: unsupported leading token %q", tok.val)
 	}
@@ -217,6 +219,27 @@ func (p *parser) parseDelete() (ir.Node, error) {
 		stmt.ReturningNames = names
 	}
 	return stmt, nil
+}
+
+// --- DROP TABLE ---
+
+func (p *parser) parseDropTable() (ir.Node, error) {
+	p.consume() // DROP
+	if _, err := p.expect(kwTable, "TABLE"); err != nil {
+		return nil, err
+	}
+	ifExists := false
+	if p.accept(kwIf) {
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	name, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	return &ir.DropTable{Name: name.val, IfExists: ifExists}, nil
 }
 
 // --- CREATE TABLE ---

@@ -75,6 +75,9 @@ const (
 	kwIn
 	kwReferences
 	kwCascade
+	kwDrop
+	kwIf
+	kwExists
 )
 
 type token struct {
@@ -123,6 +126,9 @@ var keywords = map[string]tokenKind{
 	"in":         kwIn,
 	"references": kwReferences,
 	"cascade":    kwCascade,
+	"drop":       kwDrop,
+	"if":         kwIf,
+	"exists":     kwExists,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

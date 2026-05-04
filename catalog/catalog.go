@@ -63,6 +63,9 @@ type Table struct {
 type Schema interface {
 	Table(name string) (Table, bool)
 	CreateTable(t Table) error
+	// DropTable removes the named table. Returns false when the table
+	// doesn't exist (the caller decides whether that's an error).
+	DropTable(name string) bool
 	// Tables returns every table currently in the schema, in
 	// insertion order. Used by the FK enforcer to find referencers
 	// when a parent row is being deleted.
@@ -93,6 +96,22 @@ func (s *schema) CreateTable(t Table) error {
 	}
 	s.tables[t.Name] = t
 	return nil
+}
+
+func (s *schema) DropTable(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.tables[name]; !ok {
+		return false
+	}
+	delete(s.tables, name)
+	for i, n := range s.order {
+		if n == name {
+			s.order = append(s.order[:i], s.order[i+1:]...)
+			break
+		}
+	}
+	return true
 }
 
 func (s *schema) Tables() []Table {

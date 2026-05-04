@@ -212,6 +212,8 @@ func defaultTag(plan ir.Node) string {
 		return "SELECT"
 	case *ir.CreateTable:
 		return "CREATE TABLE"
+	case *ir.DropTable:
+		return "DROP TABLE"
 	case *ir.Insert:
 		return "INSERT"
 	default:
