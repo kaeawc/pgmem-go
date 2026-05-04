@@ -169,6 +169,9 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "unnest") && p.peekNext().kind == tLParen {
 		return p.parseUnnest()
 	}
+	if p.peek().kind == tIdent && strings.EqualFold(p.peek().val, "generate_series") && p.peekNext().kind == tLParen {
+		return p.parseGenerateSeries()
+	}
 	t, err := p.expect(tIdent, "table name")
 	if err != nil {
 		return nil, err
@@ -210,6 +213,42 @@ func (p *parser) parseUnnest() (ir.Node, error) {
 		alias = "unnest"
 	}
 	return &ir.Unnest{Array: arr, Alias: alias}, nil
+}
+
+// parseGenerateSeries consumes `generate_series(start, stop[, step])
+// [AS alias]` from a FROM clause. The args are arbitrary integer
+// expressions resolved at exec time.
+func (p *parser) parseGenerateSeries() (ir.Node, error) {
+	p.consume() // generate_series
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	start, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tComma, ","); err != nil {
+		return nil, err
+	}
+	stop, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	var step ir.Expr
+	if p.accept(tComma) {
+		step, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	alias := p.parseOptionalAlias()
+	if alias == "" {
+		alias = "generate_series"
+	}
+	return &ir.GenerateSeries{Start: start, Stop: stop, Step: step, Alias: alias}, nil
 }
 
 // parseDerivedTable consumes `( SELECT ... ) [AS] alias`. Real PG
