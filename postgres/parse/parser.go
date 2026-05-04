@@ -130,6 +130,7 @@ func (p *parser) parseJoinSuffix(left ir.Node) (ir.Node, error) {
 	if !p.accept(kwJoin) {
 		return nil, fmt.Errorf("parse: expected JOIN at %d", p.peek().pos)
 	}
+	lateral := p.acceptIdent("lateral")
 	right, err := p.parseTableRef()
 	if err != nil {
 		return nil, err
@@ -151,7 +152,7 @@ func (p *parser) parseJoinSuffix(left ir.Node) (ir.Node, error) {
 			return nil, err
 		}
 	}
-	return &ir.Join{Left: left, Right: right, Cond: cond, Type: joinType}, nil
+	return &ir.Join{Left: left, Right: right, Cond: cond, Type: joinType, Lateral: lateral}, nil
 }
 
 func (p *parser) parseTableRef() (ir.Node, error) {

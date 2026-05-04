@@ -117,11 +117,17 @@ const (
 // Cond. For an INNER JOIN the right rows that match are emitted; for
 // LEFT they are augmented with NULLs when no match exists. CROSS
 // ignores Cond.
+//
+// Lateral, when true, marks the join as a LATERAL join: the Right
+// plan can reference Left's columns (typical shape: derived-table
+// subquery on the right). The executor rebuilds the right operator
+// per left row with the outer row threaded through env.
 type Join struct {
-	Left  Node
-	Right Node
-	Cond  Expr
-	Type  JoinType
+	Left    Node
+	Right   Node
+	Cond    Expr
+	Type    JoinType
+	Lateral bool
 }
 
 func (*Join) node() {}
