@@ -261,3 +261,39 @@ type FuncCall struct {
 
 func (*FuncCall) expr()              {}
 func (f *FuncCall) Type() types.Type { return f.T }
+
+// ScalarSubquery is `(SELECT ...)` used as a value expression. The
+// inner plan must produce a single column; producing more than one row
+// is a runtime error (PG SQLSTATE 21000). Type is filled in at
+// exec.Build time from the inner plan's first column.
+type ScalarSubquery struct {
+	Plan Node
+	T    types.Type
+}
+
+func (*ScalarSubquery) expr()              {}
+func (s *ScalarSubquery) Type() types.Type { return s.T }
+
+// InListExpr is `probe IN (val1, val2, ...)`. Result is always bool.
+type InListExpr struct {
+	Probe Expr
+	List  []Expr
+}
+
+func (*InListExpr) expr()            {}
+func (*InListExpr) Type() types.Type { return boolType }
+
+// InSubqueryExpr is `probe IN (SELECT ...)`. The inner plan must
+// produce a single column. Result is always bool.
+type InSubqueryExpr struct {
+	Probe Expr
+	Plan  Node
+}
+
+func (*InSubqueryExpr) expr()            {}
+func (*InSubqueryExpr) Type() types.Type { return boolType }
+
+// boolType is a small indirection so we don't take a `types.Bool`
+// dependency at package init time (avoids any future ordering issues
+// when the dialect package re-registers types).
+var boolType = types.Bool

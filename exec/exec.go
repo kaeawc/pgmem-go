@@ -143,7 +143,7 @@ func buildProject(p *ir.Project, env *Env) (Operator, error) {
 	exprs := make([]ir.Expr, len(p.Exprs))
 	cols := make([]Column, len(p.Exprs))
 	for i, e := range p.Exprs {
-		resolved, err := resolveExpr(e, inSchema, env.Params)
+		resolved, err := resolveExpr(e, inSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +229,7 @@ func buildFilter(p *ir.Filter, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	cond, err := resolveExpr(p.Cond, in.OutputSchema(), env.Params)
+	cond, err := resolveExpr(p.Cond, in.OutputSchema(), env)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +291,7 @@ func buildJoin(p *ir.Join, env *Env) (Operator, error) {
 	combined := append(append([]Column(nil), left.OutputSchema()...), right.OutputSchema()...)
 	var cond ir.Expr
 	if p.Cond != nil {
-		cond, err = resolveExpr(p.Cond, combined, env.Params)
+		cond, err = resolveExpr(p.Cond, combined, env)
 		if err != nil {
 			left.Close()
 			right.Close()
@@ -412,7 +412,7 @@ func buildSort(p *ir.Sort, env *Env) (Operator, error) {
 	}
 	keys := make([]ir.SortKey, len(p.Keys))
 	for i, k := range p.Keys {
-		resolved, err := resolveExpr(k.Expr, in.OutputSchema(), env.Params)
+		resolved, err := resolveExpr(k.Expr, in.OutputSchema(), env)
 		if err != nil {
 			return nil, err
 		}
@@ -475,22 +475,22 @@ func buildLimit(p *ir.Limit, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	count, err := resolveOrNil(p.Count, env.Params)
+	count, err := resolveOrNil(p.Count, env)
 	if err != nil {
 		return nil, fmt.Errorf("LIMIT: %w", err)
 	}
-	offset, err := resolveOrNil(p.Offset, env.Params)
+	offset, err := resolveOrNil(p.Offset, env)
 	if err != nil {
 		return nil, fmt.Errorf("OFFSET: %w", err)
 	}
 	return &limitOp{in: in, countExpr: count, offsetExpr: offset, params: env.Params}, nil
 }
 
-func resolveOrNil(e ir.Expr, params []Param) (ir.Expr, error) {
+func resolveOrNil(e ir.Expr, env *Env) (ir.Expr, error) {
 	if e == nil {
 		return nil, nil
 	}
-	return resolveExpr(e, nil, params)
+	return resolveExpr(e, nil, env)
 }
 
 type limitOp struct {
@@ -652,7 +652,7 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		}
 		out := make([]ir.Expr, len(row))
 		for j, e := range row {
-			r, err := resolveExpr(e, nil, env.Params)
+			r, err := resolveExpr(e, nil, env)
 			if err != nil {
 				return nil, err
 			}
@@ -665,6 +665,7 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		ct:     ct,
 		colMap: colMap,
 		rows:   resolvedRows,
+		env:    env,
 		params: env.Params,
 	}
 	if len(p.Returning) > 0 {
@@ -678,7 +679,7 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		op.returning = make([]ir.Expr, len(p.Returning))
 		op.returningCols = make([]Column, len(p.Returning))
 		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env.Params)
+			r, err := resolveExpr(e, tableSchema, env)
 			if err != nil {
 				return nil, err
 			}
@@ -726,7 +727,8 @@ type insertOp struct {
 	ct       catalog.Table
 	colMap   []int
 	rows     [][]ir.Expr
-	params   []Param
+	env      *Env
+	params   []Param // env.Params snapshot, kept for evalExpr brevity
 	done     bool
 	inserted int
 
@@ -785,7 +787,7 @@ func (i *insertOp) runOnce() error {
 	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
 		return err
 	}
-	if err := checkChecks(i.ct, built, i.params); err != nil {
+	if err := checkChecks(i.ct, built, i.env); err != nil {
 		return err
 	}
 	for _, row := range built {
@@ -865,7 +867,7 @@ func checkNotNull(ct catalog.Table, row storage.Row) error {
 // Per real PG: a CHECK that evaluates to NULL is treated as success
 // (only an explicit FALSE rejects). Matches sqlc-generated test code
 // expectations.
-func checkChecks(ct catalog.Table, rows []storage.Row, params []Param) error {
+func checkChecks(ct catalog.Table, rows []storage.Row, env *Env) error {
 	if len(ct.Checks) == 0 {
 		return nil
 	}
@@ -874,12 +876,12 @@ func checkChecks(ct catalog.Table, rows []storage.Row, params []Param) error {
 		schema[i] = Column{Name: c.Name, Type: c.Type}
 	}
 	for _, chk := range ct.Checks {
-		resolved, err := resolveExpr(chk.Expr, schema, params)
+		resolved, err := resolveExpr(chk.Expr, schema, env)
 		if err != nil {
 			return err
 		}
 		for _, row := range rows {
-			v, err := evalExpr(resolved, Row(row), params)
+			v, err := evalExpr(resolved, Row(row), env.Params)
 			if err != nil {
 				return err
 			}
@@ -940,7 +942,7 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 	}
 	op := &deleteOp{table: st, ct: ct, params: env.Params, tableSchema: tableSchema}
 	if p.Where != nil {
-		cond, err := resolveExpr(p.Where, tableSchema, env.Params)
+		cond, err := resolveExpr(p.Where, tableSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -950,7 +952,7 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 		op.returning = make([]ir.Expr, len(p.Returning))
 		op.returningCols = make([]Column, len(p.Returning))
 		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env.Params)
+			r, err := resolveExpr(e, tableSchema, env)
 			if err != nil {
 				return nil, err
 			}
@@ -1075,7 +1077,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	for i, c := range ct.Columns {
 		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
 	}
-	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, params: env.Params}
+	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, env: env, params: env.Params}
 
 	op.assigns = make([]resolvedAssign, len(p.Assignments))
 	for i, a := range p.Assignments {
@@ -1089,7 +1091,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 		if colIdx < 0 {
 			return nil, fmt.Errorf("exec: update %q: unknown column %q", p.Table, a.Column)
 		}
-		expr, err := resolveExpr(a.Expr, tableSchema, env.Params)
+		expr, err := resolveExpr(a.Expr, tableSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -1097,7 +1099,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	}
 
 	if p.Where != nil {
-		cond, err := resolveExpr(p.Where, tableSchema, env.Params)
+		cond, err := resolveExpr(p.Where, tableSchema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -1108,7 +1110,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 		op.returning = make([]ir.Expr, len(p.Returning))
 		op.returningCols = make([]Column, len(p.Returning))
 		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env.Params)
+			r, err := resolveExpr(e, tableSchema, env)
 			if err != nil {
 				return nil, err
 			}
@@ -1134,6 +1136,7 @@ type updateOp struct {
 	tableSchema []Column
 	assigns     []resolvedAssign
 	where       ir.Expr
+	env         *Env
 	params      []Param
 
 	done    bool
@@ -1198,7 +1201,7 @@ func (u *updateOp) runOnce() error {
 			evalErr = err
 			return rows
 		}
-		if err := checkChecks(u.ct, updatedRows, u.params); err != nil {
+		if err := checkChecks(u.ct, updatedRows, u.env); err != nil {
 			evalErr = err
 			return rows
 		}
@@ -1324,7 +1327,18 @@ func refDisplayName(ref *ir.ColumnRef) string {
 // resolveExpr recursively fills in ColumnRef.Index/T (from the input
 // schema) and ParamRef.T (from the bound parameter list). Pure literals
 // pass through unchanged.
-func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
+// resolveExpr fills in static metadata on an expression tree:
+//   - ColumnRef gets Index + T from the input schema
+//   - ParamRef gets T from env.Params
+//   - FuncCall gets a result type from the builtin registry
+//   - Sub-queries (uncorrelated) are *evaluated* here against env and
+//     replaced with literals — that's why env carries Engine/Schema/Txn,
+//     not just Params.
+//
+// env may be nil when called from a context that has no engine handle
+// (CHECK constraints don't need one, parameters don't appear there).
+// In that case, a ParamRef or subquery in e errors loudly.
+func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	switch x := e.(type) {
 	case *ir.Literal:
 		return x, nil
@@ -1335,22 +1349,23 @@ func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
 		}
 		return &ir.ColumnRef{Qualifier: x.Qualifier, Name: x.Name, Index: idx, T: schema[idx].Type}, nil
 	case *ir.ParamRef:
+		params := envParams(env)
 		if x.Index < 0 || x.Index >= len(params) {
 			return nil, fmt.Errorf("exec: $%d not bound (%d params provided)", x.Index+1, len(params))
 		}
 		return &ir.ParamRef{Index: x.Index, T: params[x.Index].Type}, nil
 	case *ir.BinOp:
-		l, err := resolveExpr(x.Left, schema, params)
+		l, err := resolveExpr(x.Left, schema, env)
 		if err != nil {
 			return nil, err
 		}
-		r, err := resolveExpr(x.Right, schema, params)
+		r, err := resolveExpr(x.Right, schema, env)
 		if err != nil {
 			return nil, err
 		}
 		return &ir.BinOp{Op: x.Op, Left: l, Right: r, T: x.T}, nil
 	case *ir.UnaryOp:
-		inner, err := resolveExpr(x.Expr, schema, params)
+		inner, err := resolveExpr(x.Expr, schema, env)
 		if err != nil {
 			return nil, err
 		}
@@ -1358,7 +1373,7 @@ func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
 	case *ir.FuncCall:
 		args := make([]ir.Expr, len(x.Args))
 		for i, a := range x.Args {
-			r, err := resolveExpr(a, schema, params)
+			r, err := resolveExpr(a, schema, env)
 			if err != nil {
 				return nil, err
 			}
@@ -1373,8 +1388,109 @@ func resolveExpr(e ir.Expr, schema []Column, params []Param) (ir.Expr, error) {
 			return nil, fmt.Errorf("function %q: %w", x.Name, err)
 		}
 		return &ir.FuncCall{Name: x.Name, Args: args, T: t}, nil
+	case *ir.ScalarSubquery:
+		return evalScalarSubquery(x, env)
+	case *ir.InListExpr:
+		probe, err := resolveExpr(x.Probe, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		list := make([]ir.Expr, len(x.List))
+		for i, e := range x.List {
+			r, err := resolveExpr(e, schema, env)
+			if err != nil {
+				return nil, err
+			}
+			list[i] = r
+		}
+		return &ir.InListExpr{Probe: probe, List: list}, nil
+	case *ir.InSubqueryExpr:
+		probe, err := resolveExpr(x.Probe, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		list, err := evalInSubquery(x, env)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.InListExpr{Probe: probe, List: list}, nil
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
+	}
+}
+
+func envParams(env *Env) []Param {
+	if env == nil {
+		return nil
+	}
+	return env.Params
+}
+
+// evalScalarSubquery runs the inner plan against env and returns a
+// Literal carrying the single (column 0, row 0) value. More than one
+// row is SQLSTATE 21000 ("more than one row returned by a subquery
+// used as an expression").
+func evalScalarSubquery(s *ir.ScalarSubquery, env *Env) (ir.Expr, error) {
+	if env == nil {
+		return nil, fmt.Errorf("exec: scalar subquery requires execution environment")
+	}
+	op, err := Build(s.Plan, env)
+	if err != nil {
+		return nil, err
+	}
+	defer op.Close()
+	cols := op.OutputSchema()
+	if len(cols) != 1 {
+		return nil, fmt.Errorf("exec: scalar subquery returned %d columns, want 1", len(cols))
+	}
+	row, err := op.Next(context.Background())
+	if errors.Is(err, io.EOF) {
+		return &ir.Literal{Value: nil, T: cols[0].Type}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	value := any(nil)
+	if len(row) > 0 {
+		value = row[0]
+	}
+	if _, err := op.Next(context.Background()); err == nil {
+		return nil, &SQLError{Code: "21000", Message: "more than one row returned by a subquery used as an expression"}
+	} else if !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return &ir.Literal{Value: value, T: cols[0].Type}, nil
+}
+
+// evalInSubquery runs the inner plan and returns its first column's
+// values as a list of Literal expressions, ready to feed an InListExpr.
+func evalInSubquery(s *ir.InSubqueryExpr, env *Env) ([]ir.Expr, error) {
+	if env == nil {
+		return nil, fmt.Errorf("exec: IN subquery requires execution environment")
+	}
+	op, err := Build(s.Plan, env)
+	if err != nil {
+		return nil, err
+	}
+	defer op.Close()
+	cols := op.OutputSchema()
+	if len(cols) != 1 {
+		return nil, fmt.Errorf("exec: IN subquery returned %d columns, want 1", len(cols))
+	}
+	var out []ir.Expr
+	for {
+		row, err := op.Next(context.Background())
+		if errors.Is(err, io.EOF) {
+			return out, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var v any
+		if len(row) > 0 {
+			v = row[0]
+		}
+		out = append(out, &ir.Literal{Value: v, T: cols[0].Type})
 	}
 }
 
@@ -1398,9 +1514,46 @@ func evalExpr(e ir.Expr, in Row, params []Param) (any, error) {
 		return evalUnaryOp(x, in, params)
 	case *ir.FuncCall:
 		return evalFuncCall(x, in, params)
+	case *ir.InListExpr:
+		return evalInList(x, in, params)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalInList: SQL three-valued IN. NULL probe ⇒ NULL. Probe equal to
+// any non-NULL list value ⇒ TRUE. Probe not equal to any non-NULL value,
+// but at least one NULL in list ⇒ NULL. Otherwise FALSE.
+func evalInList(x *ir.InListExpr, in Row, params []Param) (any, error) {
+	probe, err := evalExpr(x.Probe, in, params)
+	if err != nil {
+		return nil, err
+	}
+	if probe == nil {
+		return nil, nil
+	}
+	sawNull := false
+	for _, e := range x.List {
+		v, err := evalExpr(e, in, params)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			sawNull = true
+			continue
+		}
+		cmp, err := compareValues(probe, v)
+		if err != nil {
+			return nil, err
+		}
+		if cmp == 0 {
+			return true, nil
+		}
+	}
+	if sawNull {
+		return nil, nil
+	}
+	return false, nil
 }
 
 // evalFuncCall looks the builtin up by name, evaluates each argument
