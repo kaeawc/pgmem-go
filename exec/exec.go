@@ -101,6 +101,10 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildCreateView(p, env), nil
 	case *ir.DropView:
 		return buildDropView(p, env), nil
+	case *ir.CreateIndex:
+		return &ddlOp{tag: "CREATE INDEX", do: func() error { return nil }}, nil
+	case *ir.DropIndex:
+		return &ddlOp{tag: "DROP INDEX", do: func() error { return nil }}, nil
 	case *ir.DropTable:
 		return buildDropTable(p, env), nil
 	case *ir.Insert:
