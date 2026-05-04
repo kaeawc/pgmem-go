@@ -279,6 +279,18 @@ func (*Aggregate) node() {}
 type CreateTable struct {
 	Name    string
 	Columns []ColumnDef
+	// TableChecks are table-level CHECK constraints (not attached to
+	// any single column). Per-column CHECKs live on ColumnDef.Check;
+	// these come from `CHECK (...)` or `CONSTRAINT name CHECK (...)`
+	// lines in the table parens.
+	TableChecks []TableCheck
+}
+
+// TableCheck is a table-level CHECK constraint. Name is optional —
+// when empty the executor synthesises one (e.g. <table>_check).
+type TableCheck struct {
+	Name string
+	Expr Expr
 }
 
 func (*CreateTable) node() {}

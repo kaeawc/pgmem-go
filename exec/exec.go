@@ -1409,6 +1409,13 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 				})
 			}
 		}
+		for _, tc := range p.TableChecks {
+			n := tc.Name
+			if n == "" {
+				n = p.Name + "_check"
+			}
+			checks = append(checks, catalog.Check{Name: n, Expr: tc.Expr})
+		}
 		if err := env.Schema.CreateTable(catalog.Table{Name: p.Name, Columns: cols, Checks: checks}); err != nil {
 			return err
 		}
