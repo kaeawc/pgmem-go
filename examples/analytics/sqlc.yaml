@@ -1,0 +1,26 @@
+version: "2"
+sql:
+  - engine: postgresql
+    queries: queries.sql
+    schema: schema.sql
+    gen:
+      go:
+        package: db
+        out: db
+        sql_package: pgx/v5
+        emit_prepared_queries: false
+        overrides:
+          - db_type: timestamptz
+            nullable: false
+            go_type:
+              type: "time.Time"
+          - db_type: timestamptz
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true
+          - db_type: pg_catalog.int8
+            nullable: true
+            go_type:
+              type: "int64"
+              pointer: true
