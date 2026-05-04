@@ -12,6 +12,35 @@ type Node interface{ node() }
 
 // --- Read-side plan nodes ---
 
+// WindowSpec is the OVER (…) clause: optional partition keys and
+// optional ordering keys. Frame clauses (ROWS BETWEEN …) aren't
+// modelled — row_number / rank / dense_rank don't need them.
+type WindowSpec struct {
+	PartitionBy []Expr
+	OrderBy     []SortKey
+}
+
+// WindowCall is one entry in a Window node's Calls slice. Output is
+// the synthetic column name the planner uses to thread the result
+// back through the surrounding Project.
+type WindowCall struct {
+	Func   string // lower-case (row_number, rank, dense_rank)
+	Args   []Expr
+	Spec   WindowSpec
+	Output string
+}
+
+// Window evaluates a list of window functions against Input. Output
+// schema is Input's columns followed by one column per WindowCall in
+// Calls order. Each call's value is computed per (PartitionBy,
+// OrderBy) group from the spec.
+type Window struct {
+	Input Node
+	Calls []WindowCall
+}
+
+func (*Window) node() {}
+
 // SubqueryAlias wraps an inline SELECT used in a FROM clause:
 //
 //	FROM (SELECT ...) sub
@@ -441,6 +470,12 @@ type FuncCall struct {
 	T        types.Type
 	Star     bool
 	Distinct bool // true for `agg(DISTINCT expr)`; ignored on non-aggregate calls
+	// Window, when non-nil, marks this call as a window function with
+	// the given OVER spec. Window calls are extracted from the
+	// SELECT list during planning and replaced with synthetic column
+	// references; the runtime never sees a FuncCall whose Window is
+	// still attached.
+	Window *WindowSpec
 }
 
 func (*FuncCall) expr()              {}
