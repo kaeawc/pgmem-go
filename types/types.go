@@ -533,9 +533,386 @@ func ByOID(oid uint32) (Type, bool) {
 		return UUID, true
 	case 3802:
 		return JSONB, true
+	case 1007:
+		return Int4Array, true
+	case 1009:
+		return TextArray, true
+	case 1016:
+		return Int8Array, true
 	default:
 		return nil, false
 	}
+}
+
+// Int8Array is PG bigint[] (OID 1016). Element is int8 (OID 20).
+// Internally we hold the value as []int64.
+var Int8Array Type = &arrayType{
+	name:    "int8[]",
+	oid:     1016,
+	elemOID: 20,
+	encodeText: func(v any) (string, error) {
+		arr, ok := v.([]int64)
+		if !ok {
+			return "", fmt.Errorf("unsupported %T", v)
+		}
+		var b []byte
+		b = append(b, '{')
+		for i, n := range arr {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = strconv.AppendInt(b, n, 10)
+		}
+		b = append(b, '}')
+		return string(b), nil
+	},
+	decodeTextElem: func(s string) (any, error) {
+		n, err := strconv.ParseInt(s, 10, 64)
+		return n, err
+	},
+	encodeBinElem: func(v any) ([]byte, error) {
+		n, ok := asInt64(v)
+		if !ok {
+			return nil, fmt.Errorf("int8 array element: unsupported %T", v)
+		}
+		b := make([]byte, 8)
+		binary.BigEndian.PutUint64(b, uint64(n))
+		return b, nil
+	},
+	decodeBinElem: func(b []byte) (any, error) {
+		if len(b) != 8 {
+			return nil, fmt.Errorf("int8 array element: want 8 bytes, got %d", len(b))
+		}
+		return int64(binary.BigEndian.Uint64(b)), nil
+	},
+	zero: func() any { return []int64(nil) },
+	appendElem: func(arr any, e any) (any, error) {
+		s, _ := arr.([]int64)
+		n, err := toInt64Loose(e)
+		if err != nil {
+			return nil, err
+		}
+		return append(s, n), nil
+	},
+}
+
+// Int4Array is PG integer[] (OID 1007). Element is int4 (OID 23).
+// Internally we hold the value as []int32.
+var Int4Array Type = &arrayType{
+	name:    "int4[]",
+	oid:     1007,
+	elemOID: 23,
+	encodeText: func(v any) (string, error) {
+		arr, ok := v.([]int32)
+		if !ok {
+			return "", fmt.Errorf("unsupported %T", v)
+		}
+		var b []byte
+		b = append(b, '{')
+		for i, n := range arr {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = strconv.AppendInt(b, int64(n), 10)
+		}
+		b = append(b, '}')
+		return string(b), nil
+	},
+	decodeTextElem: func(s string) (any, error) {
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		return int32(n), nil
+	},
+	encodeBinElem: func(v any) ([]byte, error) {
+		n, ok := asInt64(v)
+		if !ok {
+			return nil, fmt.Errorf("int4 array element: unsupported %T", v)
+		}
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, uint32(int32(n)))
+		return b, nil
+	},
+	decodeBinElem: func(b []byte) (any, error) {
+		if len(b) != 4 {
+			return nil, fmt.Errorf("int4 array element: want 4 bytes, got %d", len(b))
+		}
+		return int32(binary.BigEndian.Uint32(b)), nil
+	},
+	zero: func() any { return []int32(nil) },
+	appendElem: func(arr any, e any) (any, error) {
+		s, _ := arr.([]int32)
+		n, err := toInt64Loose(e)
+		if err != nil {
+			return nil, err
+		}
+		return append(s, int32(n)), nil
+	},
+}
+
+// TextArray is PG text[] (OID 1009). Element is text (OID 25).
+// Internally we hold the value as []string.
+var TextArray Type = &arrayType{
+	name:    "text[]",
+	oid:     1009,
+	elemOID: 25,
+	encodeText: func(v any) (string, error) {
+		arr, ok := v.([]string)
+		if !ok {
+			return "", fmt.Errorf("unsupported %T", v)
+		}
+		var b []byte
+		b = append(b, '{')
+		for i, s := range arr {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = appendArrayQuoted(b, s)
+		}
+		b = append(b, '}')
+		return string(b), nil
+	},
+	decodeTextElem: func(s string) (any, error) {
+		return s, nil
+	},
+	encodeBinElem: func(v any) ([]byte, error) {
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("text array element: unsupported %T", v)
+		}
+		return []byte(s), nil
+	},
+	decodeBinElem: func(b []byte) (any, error) {
+		out := make([]byte, len(b))
+		copy(out, b)
+		return string(out), nil
+	},
+	zero: func() any { return []string(nil) },
+	appendElem: func(arr any, e any) (any, error) {
+		s, _ := arr.([]string)
+		v, ok := e.(string)
+		if !ok {
+			return nil, fmt.Errorf("text array element: %T", e)
+		}
+		return append(s, v), nil
+	},
+}
+
+// arrayType is a small helper that supplies the shared text + binary
+// codec scaffolding for PG one-dimensional array types. Per-element
+// encode / decode and the slice-typed accumulator are passed in.
+type arrayType struct {
+	name           string
+	oid            uint32
+	elemOID        uint32
+	encodeText     func(v any) (string, error)
+	decodeTextElem func(s string) (any, error)
+	encodeBinElem  func(v any) ([]byte, error)
+	decodeBinElem  func(b []byte) (any, error)
+	zero           func() any
+	appendElem     func(arr any, e any) (any, error)
+}
+
+func (a *arrayType) Name() string { return a.name }
+func (a *arrayType) OID() uint32  { return a.oid }
+func (a *arrayType) Size() int16  { return -1 }
+
+func (a *arrayType) EncodeText(v any) ([]byte, error) {
+	s, err := a.encodeText(v)
+	if err != nil {
+		return nil, fmt.Errorf("%s EncodeText: %w", a.name, err)
+	}
+	return []byte(s), nil
+}
+
+func (a *arrayType) DecodeText(b []byte) (any, error) {
+	s := string(b)
+	if len(s) < 2 || s[0] != '{' || s[len(s)-1] != '}' {
+		return nil, fmt.Errorf("%s DecodeText: bad shape %q", a.name, s)
+	}
+	body := s[1 : len(s)-1]
+	out := a.zero()
+	if body == "" {
+		return out, nil
+	}
+	for _, raw := range splitArrayElems(body) {
+		v, err := a.decodeTextElem(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%s DecodeText: %w", a.name, err)
+		}
+		out, err = a.appendElem(out, v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (a *arrayType) EncodeBinary(v any) ([]byte, error) {
+	// PG one-dim array binary header:
+	//   int32 ndim
+	//   int32 hasnull (always 0 for the slices we accept)
+	//   int32 elemoid
+	//   per dim: int32 length, int32 lower-bound (1)
+	//   per element: int32 size, then size bytes (size = -1 for NULL)
+	var elems [][]byte
+	switch arr := v.(type) {
+	case []int64:
+		for _, n := range arr {
+			b, err := a.encodeBinElem(n)
+			if err != nil {
+				return nil, fmt.Errorf("%s EncodeBinary: %w", a.name, err)
+			}
+			elems = append(elems, b)
+		}
+	case []int32:
+		for _, n := range arr {
+			b, err := a.encodeBinElem(n)
+			if err != nil {
+				return nil, fmt.Errorf("%s EncodeBinary: %w", a.name, err)
+			}
+			elems = append(elems, b)
+		}
+	case []string:
+		for _, s := range arr {
+			b, err := a.encodeBinElem(s)
+			if err != nil {
+				return nil, fmt.Errorf("%s EncodeBinary: %w", a.name, err)
+			}
+			elems = append(elems, b)
+		}
+	default:
+		return nil, fmt.Errorf("%s EncodeBinary: unsupported %T", a.name, v)
+	}
+	out := make([]byte, 0, 20+len(elems)*8)
+	out = appendInt32(out, 1) // ndim
+	out = appendInt32(out, 0) // hasnull
+	out = appendInt32(out, int32(a.elemOID))
+	out = appendInt32(out, int32(len(elems)))
+	out = appendInt32(out, 1) // lower bound
+	for _, e := range elems {
+		out = appendInt32(out, int32(len(e)))
+		out = append(out, e...)
+	}
+	return out, nil
+}
+
+func (a *arrayType) DecodeBinary(b []byte) (any, error) {
+	if len(b) < 20 {
+		return nil, fmt.Errorf("%s DecodeBinary: want >= 20 bytes, got %d", a.name, len(b))
+	}
+	ndim := int32(binary.BigEndian.Uint32(b[0:4]))
+	if ndim != 1 {
+		return nil, fmt.Errorf("%s DecodeBinary: only 1-D arrays supported (got ndim=%d)", a.name, ndim)
+	}
+	dimLen := int32(binary.BigEndian.Uint32(b[12:16]))
+	pos := 20
+	out := a.zero()
+	for i := int32(0); i < dimLen; i++ {
+		if pos+4 > len(b) {
+			return nil, fmt.Errorf("%s DecodeBinary: truncated", a.name)
+		}
+		sz := int32(binary.BigEndian.Uint32(b[pos : pos+4]))
+		pos += 4
+		if sz < 0 {
+			return nil, fmt.Errorf("%s DecodeBinary: NULL elements not supported yet", a.name)
+		}
+		if pos+int(sz) > len(b) {
+			return nil, fmt.Errorf("%s DecodeBinary: truncated", a.name)
+		}
+		v, err := a.decodeBinElem(b[pos : pos+int(sz)])
+		if err != nil {
+			return nil, err
+		}
+		pos += int(sz)
+		out, err = a.appendElem(out, v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func appendInt32(b []byte, n int32) []byte {
+	var buf [4]byte
+	binary.BigEndian.PutUint32(buf[:], uint32(n))
+	return append(b, buf[:]...)
+}
+
+// splitArrayElems splits the PG array-text body on commas while
+// respecting a single level of double-quoting. We don't support
+// embedded backslash escapes beyond `\\` and `\"`, which is enough
+// for the strings sqlc-generated tests roundtrip.
+func splitArrayElems(body string) []string {
+	var out []string
+	var buf []byte
+	inQuote := false
+	for i := 0; i < len(body); i++ {
+		c := body[i]
+		switch {
+		case c == '"' && !inQuote:
+			inQuote = true
+		case c == '"' && inQuote:
+			inQuote = false
+		case c == '\\' && inQuote && i+1 < len(body):
+			buf = append(buf, body[i+1])
+			i++
+		case c == ',' && !inQuote:
+			out = append(out, string(buf))
+			buf = buf[:0]
+		default:
+			buf = append(buf, c)
+		}
+	}
+	out = append(out, string(buf))
+	return out
+}
+
+// appendArrayQuoted appends s as an array element, wrapping in
+// double quotes when the value would otherwise be ambiguous (commas,
+// braces, whitespace, quotes, or empty).
+func appendArrayQuoted(b []byte, s string) []byte {
+	if needsArrayQuote(s) {
+		b = append(b, '"')
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == '"' || c == '\\' {
+				b = append(b, '\\')
+			}
+			b = append(b, c)
+		}
+		b = append(b, '"')
+		return b
+	}
+	return append(b, s...)
+}
+
+func needsArrayQuote(s string) bool {
+	if s == "" {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ',' || c == '{' || c == '}' || c == '"' || c == '\\' || c == ' ' || c == '\t' {
+			return true
+		}
+	}
+	return false
+}
+
+// toInt64Loose accepts the integer-like inputs we'd see from a wire
+// decode (int / int32 / int64) and reports a parse error otherwise.
+func toInt64Loose(v any) (int64, error) {
+	switch n := v.(type) {
+	case int64:
+		return n, nil
+	case int32:
+		return int64(n), nil
+	case int:
+		return int64(n), nil
+	}
+	return 0, fmt.Errorf("not an integer: %T", v)
 }
 
 // Interval is a stripped-down PG `interval` type. We model it as a
@@ -583,6 +960,12 @@ func ByName(name string) (Type, bool) {
 		return Timestamptz, true
 	case "jsonb":
 		return JSONB, true
+	case "int[]", "integer[]", "int4[]":
+		return Int4Array, true
+	case "bigint[]", "int8[]":
+		return Int8Array, true
+	case "text[]", "varchar[]":
+		return TextArray, true
 	default:
 		return nil, false
 	}

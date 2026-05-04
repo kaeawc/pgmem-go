@@ -527,6 +527,18 @@ type Case struct {
 func (*Case) expr()              {}
 func (c *Case) Type() types.Type { return c.T }
 
+// AnyExpr is `probe op ANY (array)`: true iff any element of the
+// array satisfies `probe op element`. We currently support op `=`
+// (the most common form, and what sqlc emits for list parameters).
+type AnyExpr struct {
+	Probe Expr
+	Op    string
+	Array Expr
+}
+
+func (*AnyExpr) expr()            {}
+func (*AnyExpr) Type() types.Type { return boolType }
+
 // InListExpr is `probe IN (val1, val2, ...)`. Result is always bool.
 type InListExpr struct {
 	Probe Expr

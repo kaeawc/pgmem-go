@@ -467,8 +467,15 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 			return ir.ColumnDef{}, err
 		}
 	}
+	colTypeName := typeName.val
+	if p.accept(tLBracket) {
+		if !p.accept(tRBracket) {
+			return ir.ColumnDef{}, fmt.Errorf("parse: expected ']' after '[' at %d", p.peek().pos)
+		}
+		colTypeName += "[]"
+	}
 	def := ir.ColumnDef{Name: name.val}
-	if t, auto, ok := resolveSerial(typeName.val); ok {
+	if t, auto, ok := resolveSerial(colTypeName); ok {
 		// SERIAL / BIGSERIAL: Postgres desugars these to (int4|int8) +
 		// NOT NULL + DEFAULT nextval(...). We squash that into Auto +
 		// NotNull on the catalog column.
@@ -476,9 +483,9 @@ func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
 		def.Auto = auto
 		def.NotNull = true
 	} else {
-		t, ok := types.ByName(typeName.val)
+		t, ok := types.ByName(colTypeName)
 		if !ok {
-			return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", typeName.val)
+			return ir.ColumnDef{}, fmt.Errorf("parse: unknown type %q", colTypeName)
 		}
 		def.Type = t
 	}

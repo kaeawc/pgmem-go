@@ -75,6 +75,22 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	}
 	if op, ok := comparisonOp(p.peek().kind); ok {
 		p.consume()
+		// `op ANY (array)` is the SQL-standard "match any element"
+		// form sqlc emits for list parameters. Parse it as a
+		// dedicated AnyExpr so the eval path can iterate the array.
+		if p.acceptIdent("any") {
+			if _, err := p.expect(tLParen, "("); err != nil {
+				return nil, err
+			}
+			arr, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expect(tRParen, ")"); err != nil {
+				return nil, err
+			}
+			return &ir.AnyExpr{Probe: left, Op: op, Array: arr}, nil
+		}
 		right, err := p.parseAdditive()
 		if err != nil {
 			return nil, err
@@ -493,9 +509,16 @@ func (p *parser) parsePrimary() (ir.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		t, ok := types.ByName(typeName.val)
+		name := typeName.val
+		if p.accept(tLBracket) {
+			if !p.accept(tRBracket) {
+				return nil, fmt.Errorf("parse: expected ']' after '[' at %d", p.peek().pos)
+			}
+			name += "[]"
+		}
+		t, ok := types.ByName(name)
 		if !ok {
-			return nil, fmt.Errorf("parse: unknown cast target type %q", typeName.val)
+			return nil, fmt.Errorf("parse: unknown cast target type %q", name)
 		}
 		base = &ir.Cast{Expr: base, T: t}
 	}
