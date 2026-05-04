@@ -526,19 +526,27 @@ func (p *parser) parseInsert() (ir.Node, error) {
 			return nil, err
 		}
 	}
-	if _, err := p.expect(kwValues, "VALUES"); err != nil {
-		return nil, err
-	}
-	for {
-		row, err := p.parseValuesTuple()
+	if p.peek().kind == kwSelect {
+		src, err := p.parseSelectMaybeUnion()
 		if err != nil {
 			return nil, err
 		}
-		stmt.Rows = append(stmt.Rows, row)
-		if p.accept(tComma) {
-			continue
+		stmt.Source = src
+	} else {
+		if _, err := p.expect(kwValues, "VALUES"); err != nil {
+			return nil, err
 		}
-		break
+		for {
+			row, err := p.parseValuesTuple()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Rows = append(stmt.Rows, row)
+			if p.accept(tComma) {
+				continue
+			}
+			break
+		}
 	}
 	if p.peek().kind == kwOn {
 		oc, err := p.parseOnConflict()

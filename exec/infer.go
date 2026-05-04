@@ -145,6 +145,9 @@ func walkParamsInsert(p *ir.Insert, sch catalog.Schema, scopeTable string, hint 
 			walkExprParams(e, expected, sch, scopeTable, hint, maxIdx)
 		}
 	}
+	if p.Source != nil {
+		walkParams(p.Source, sch, scopeTable, hint, maxIdx)
+	}
 }
 
 // walkParamsDelete: WHERE and RETURNING expressions both reference the

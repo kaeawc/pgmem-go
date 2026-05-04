@@ -899,6 +899,20 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		env:        env,
 		onConflict: p.OnConflict,
 	}
+	if p.Source != nil {
+		if len(p.Rows) > 0 {
+			return nil, fmt.Errorf("exec: insert with both VALUES and SELECT source")
+		}
+		src, err := Build(p.Source, env)
+		if err != nil {
+			return nil, err
+		}
+		if got, want := len(src.OutputSchema()), len(colMap); got != want {
+			src.Close()
+			return nil, fmt.Errorf("exec: INSERT ... SELECT column count mismatch: got %d, want %d", got, want)
+		}
+		op.source = src
+	}
 	if p.OnConflict != nil {
 		idxs, err := resolveConflictColumns(ct, p.OnConflict.Columns)
 		if err != nil {
@@ -1076,6 +1090,7 @@ type insertOp struct {
 	ct             catalog.Table
 	colMap         []int
 	rows           [][]ir.Expr
+	source         Operator // INSERT ... SELECT — drained at runOnce
 	env            *Env
 	onConflict     *ir.OnConflict
 	conflictColIdx []int
@@ -1123,14 +1138,14 @@ func (i *insertOp) runOnce() error {
 	// is in place but the *operator* still owes all-or-nothing on
 	// constraint failures within a single statement.
 	autoCols := autoColumnIndexes(i.ct, i.colMap)
-	built := make([]storage.Row, len(i.rows))
-	for r, exprRow := range i.rows {
+	rawRows, err := i.collectInputRows()
+	if err != nil {
+		return err
+	}
+	built := make([]storage.Row, len(rawRows))
+	for r, vals := range rawRows {
 		row := make(storage.Row, len(i.ct.Columns))
-		for j, e := range exprRow {
-			v, err := evalExpr(e, nil, i.env)
-			if err != nil {
-				return err
-			}
+		for j, v := range vals {
 			row[i.colMap[j]] = v
 		}
 		fillAutoColumns(row, i.ct, autoCols, i.table)
@@ -1179,6 +1194,42 @@ func (i *insertOp) runOnce() error {
 		}
 	}
 	return nil
+}
+
+// collectInputRows materialises the raw tuples this INSERT will write.
+// VALUES branches evaluate each expression in advance; INSERT ...
+// SELECT drains the source operator and treats each output row as
+// the next tuple.
+func (i *insertOp) collectInputRows() ([][]any, error) {
+	if i.source != nil {
+		defer i.source.Close()
+		var out [][]any
+		for {
+			r, err := i.source.Next(context.Background())
+			if errors.Is(err, io.EOF) {
+				return out, nil
+			}
+			if err != nil {
+				return nil, err
+			}
+			vals := make([]any, len(r))
+			copy(vals, []any(r))
+			out = append(out, vals)
+		}
+	}
+	out := make([][]any, len(i.rows))
+	for r, exprRow := range i.rows {
+		vals := make([]any, len(exprRow))
+		for j, e := range exprRow {
+			v, err := evalExpr(e, nil, i.env)
+			if err != nil {
+				return nil, err
+			}
+			vals[j] = v
+		}
+		out[r] = vals
+	}
+	return out, nil
 }
 
 // applyDoUpdate splits `built` into rows that don't conflict (returned
