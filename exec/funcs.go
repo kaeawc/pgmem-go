@@ -3,6 +3,7 @@ package exec
 import (
 	"crypto/rand"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -751,6 +752,106 @@ var builtins = map[string]builtinFunc{
 			return string(rs), nil
 		},
 	},
+	"regexp_replace": {
+		// regexp_replace(source, pattern, replacement [, flags]) — by
+		// default replaces ONLY the first match (PG's default,
+		// different from Go's ReplaceAllString). Pass 'g' in flags
+		// for global replacement. 'i' for case-insensitive, 'm' for
+		// multiline. PG's $1..$9 backreferences map to Go's $1..$9.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 3 || len(args) > 4 {
+				return nil, fmt.Errorf("regexp_replace: takes 3 or 4 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil || args[2] == nil {
+				return nil, nil
+			}
+			source := textArg(args[0])
+			pattern := textArg(args[1])
+			replacement := textArg(args[2])
+			flags := ""
+			if len(args) == 4 && args[3] != nil {
+				flags = textArg(args[3])
+			}
+			re, global, err := compilePGRegexp(pattern, flags)
+			if err != nil {
+				return nil, err
+			}
+			if global {
+				return re.ReplaceAllString(source, replacement), nil
+			}
+			loc := re.FindStringSubmatchIndex(source)
+			if loc == nil {
+				return source, nil
+			}
+			result := re.ReplaceAllString(source[loc[0]:loc[1]], replacement)
+			return source[:loc[0]] + result + source[loc[1]:], nil
+		},
+	},
+	"regexp_match": {
+		// regexp_match(source, pattern [, flags]) — returns text[] of
+		// the first match's capture groups, or the whole match as a
+		// single-element array when the pattern has no groups.
+		// Returns NULL when there is no match.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("regexp_match: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.TextArray, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			source := textArg(args[0])
+			pattern := textArg(args[1])
+			flags := ""
+			if len(args) == 3 && args[2] != nil {
+				flags = textArg(args[2])
+			}
+			re, _, err := compilePGRegexp(pattern, flags)
+			if err != nil {
+				return nil, err
+			}
+			m := re.FindStringSubmatch(source)
+			if m == nil {
+				return nil, nil
+			}
+			if re.NumSubexp() == 0 {
+				return []string{m[0]}, nil
+			}
+			return append([]string(nil), m[1:]...), nil
+		},
+	},
+	"regexp_split_to_array": {
+		// regexp_split_to_array(source, pattern [, flags]) — splits
+		// source on every match of pattern and returns the resulting
+		// pieces as a text[].
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("regexp_split_to_array: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.TextArray, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			source := textArg(args[0])
+			pattern := textArg(args[1])
+			flags := ""
+			if len(args) == 3 && args[2] != nil {
+				flags = textArg(args[2])
+			}
+			re, _, err := compilePGRegexp(pattern, flags)
+			if err != nil {
+				return nil, err
+			}
+			return re.Split(source, -1), nil
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -1015,6 +1116,38 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// compilePGRegexp turns a PG regex + flags string into a compiled Go
+// regexp. Flags map: 'i' → case-insensitive, 'm' → multiline ('^'/'$'
+// match line bounds), 's' → dot matches newline, 'n' is the inverse
+// of 's' and pgmem-go ignores it (Go's default). 'g' is reported
+// separately so regexp_replace can switch between first-match and
+// all-match. Other PG-specific flags ('p', 'q', 'w', 'x') are
+// rejected with a clear error.
+func compilePGRegexp(pattern, flags string) (*regexp.Regexp, bool, error) {
+	var goFlags []byte
+	global := false
+	for i := 0; i < len(flags); i++ {
+		switch flags[i] {
+		case 'g':
+			global = true
+		case 'i', 'm', 's':
+			goFlags = append(goFlags, flags[i])
+		case 'n':
+			// PG default — Go's default — dot does not match newline.
+		default:
+			return nil, false, fmt.Errorf("regexp: unsupported flag %q", flags[i])
+		}
+	}
+	if len(goFlags) > 0 {
+		pattern = "(?" + string(goFlags) + ")" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, false, fmt.Errorf("regexp: invalid pattern: %w", err)
+	}
+	return re, global, nil
 }
 
 // arrayLen returns the element count of one of pgmem-go's runtime
