@@ -2,6 +2,12 @@
 -- rollup; CASE WHEN for low-stock flagging; self-referential FK on
 -- categories.
 
+-- name: AddCategory :one
+INSERT INTO categories (parent_id, name) VALUES ($1, $2) RETURNING *;
+
+-- name: AddWarehouse :one
+INSERT INTO warehouses (name) VALUES ($1) RETURNING *;
+
 -- name: AddProduct :one
 INSERT INTO products (category_id, name, threshold)
 VALUES ($1, $2, $3) RETURNING *;

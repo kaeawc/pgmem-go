@@ -163,10 +163,16 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	}
 	alias := p.parseOptionalAlias()
 	if plan, ok := p.ctes[strings.ToLower(t.val)]; ok {
-		// Aliases on CTE references aren't propagated yet — column refs
-		// still work via name match against the inner plan's schema.
-		_ = alias
-		return plan, nil
+		// CTE reference. When the caller wrote `WITH cte AS (...) ...
+		// FROM cte alias`, the alias re-tags the inner plan's columns
+		// so `alias.col` resolves cleanly. Without an explicit alias
+		// the CTE's own name becomes the qualifier — same way real PG
+		// behaves.
+		qual := alias
+		if qual == "" {
+			qual = t.val
+		}
+		return &ir.SubqueryAlias{Inner: plan, Alias: qual}, nil
 	}
 	return &ir.Scan{Table: t.val, Alias: alias}, nil
 }
@@ -847,6 +853,12 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		if err != nil {
 			return nil, err
 		}
+		// ORDER BY may reference SELECT-list output aliases. Since the
+		// Sort sits before the Project here (so base columns the SELECT
+		// list dropped are still available), rewrite any bare ColumnRef
+		// sort key whose name matches an alias to the underlying
+		// SELECT-list expression.
+		rewriteSortKeysByAlias(keys, exprs, names)
 		input = &ir.Sort{Input: input, Keys: keys}
 	}
 
@@ -1029,20 +1041,107 @@ type aggRewriter struct {
 func (r *aggRewriter) rewriteSelectList(exprs []ir.Expr) ([]ir.Expr, error) {
 	out := make([]ir.Expr, len(exprs))
 	for i, e := range exprs {
-		switch v := e.(type) {
-		case *ir.ColumnRef:
-			if _, ok := r.groupBySet[columnRefKey(v)]; !ok {
-				return nil, fmt.Errorf("parse: column %q must appear in GROUP BY or be used in an aggregate", v.Name)
+		if c, ok := e.(*ir.ColumnRef); ok {
+			if _, in := r.groupBySet[columnRefKey(c)]; !in {
+				return nil, fmt.Errorf("parse: column %q must appear in GROUP BY or be used in an aggregate", c.Name)
 			}
-			out[i] = &ir.ColumnRef{Name: v.Name, Qualifier: v.Qualifier}
-		default:
-			if !isAggregateCall(e) {
-				return nil, fmt.Errorf("parse: select expression must reference a GROUP BY column or be an aggregate")
-			}
-			out[i] = r.replaceAggregate(e.(*ir.FuncCall))
+			out[i] = &ir.ColumnRef{Name: c.Name, Qualifier: c.Qualifier}
+			continue
 		}
+		// Walk arbitrary expressions so aggregates buried inside
+		// casts, arithmetic, or other function calls are detected.
+		// Bare column refs that aren't in GROUP BY surface as an
+		// error during the walk.
+		rewritten, err := r.rewriteSelectExpr(e)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = rewritten
 	}
 	return out, nil
+}
+
+// rewriteSelectExpr walks an expression and replaces aggregate calls
+// with synthetic ColumnRefs while validating that any non-aggregated
+// column reference appears in GROUP BY.
+func (r *aggRewriter) rewriteSelectExpr(e ir.Expr) (ir.Expr, error) {
+	switch v := e.(type) {
+	case *ir.ColumnRef:
+		if _, ok := r.groupBySet[columnRefKey(v)]; !ok {
+			return nil, fmt.Errorf("parse: column %q must appear in GROUP BY or be used in an aggregate", v.Name)
+		}
+		return &ir.ColumnRef{Name: v.Name, Qualifier: v.Qualifier}, nil
+	case *ir.FuncCall:
+		if isAggregateCall(v) {
+			return r.replaceAggregate(v), nil
+		}
+		args := make([]ir.Expr, len(v.Args))
+		for i, a := range v.Args {
+			rr, err := r.rewriteSelectExpr(a)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = rr
+		}
+		cp := *v
+		cp.Args = args
+		return &cp, nil
+	case *ir.BinOp:
+		l, err := r.rewriteSelectExpr(v.Left)
+		if err != nil {
+			return nil, err
+		}
+		rgt, err := r.rewriteSelectExpr(v.Right)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.BinOp{Op: v.Op, Left: l, Right: rgt, T: v.T}, nil
+	case *ir.UnaryOp:
+		inner, err := r.rewriteSelectExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.UnaryOp{Op: v.Op, Expr: inner, T: v.T}, nil
+	case *ir.Cast:
+		inner, err := r.rewriteSelectExpr(v.Expr)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.Cast{Expr: inner, T: v.T}, nil
+	case *ir.Case:
+		out := *v
+		if v.Operand != nil {
+			op, err := r.rewriteSelectExpr(v.Operand)
+			if err != nil {
+				return nil, err
+			}
+			out.Operand = op
+		}
+		out.Whens = make([]ir.CaseWhen, len(v.Whens))
+		for i, w := range v.Whens {
+			m, err := r.rewriteSelectExpr(w.Match)
+			if err != nil {
+				return nil, err
+			}
+			rs, err := r.rewriteSelectExpr(w.Result)
+			if err != nil {
+				return nil, err
+			}
+			out.Whens[i] = ir.CaseWhen{Match: m, Result: rs}
+		}
+		if v.Else != nil {
+			el, err := r.rewriteSelectExpr(v.Else)
+			if err != nil {
+				return nil, err
+			}
+			out.Else = el
+		}
+		return &out, nil
+	case *ir.Literal, *ir.ParamRef:
+		return v, nil
+	default:
+		return e, nil
+	}
 }
 
 // rewriteAnyExpr walks an arbitrary expression tree replacing every
@@ -1184,6 +1283,32 @@ func defaultColName(e ir.Expr) string {
 		return c.Name
 	}
 	return "?column?"
+}
+
+// rewriteSortKeysByAlias replaces bare-name sort keys with their
+// SELECT-list source expression when the name matches an alias. Lets
+// `ORDER BY status` work for queries like
+// `SELECT … CASE WHEN … END AS status FROM …`.
+func rewriteSortKeysByAlias(keys []ir.SortKey, exprs []ir.Expr, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	aliasMap := make(map[string]ir.Expr, len(names))
+	for i, n := range names {
+		if n == "" {
+			continue
+		}
+		aliasMap[n] = exprs[i]
+	}
+	for i, k := range keys {
+		ref, ok := k.Expr.(*ir.ColumnRef)
+		if !ok || ref.Qualifier != "" {
+			continue
+		}
+		if expr, ok := aliasMap[ref.Name]; ok {
+			keys[i].Expr = expr
+		}
+	}
 }
 
 func (p *parser) parseSortKeys() ([]ir.SortKey, error) {

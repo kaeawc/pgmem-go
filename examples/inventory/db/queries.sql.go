@@ -8,12 +8,29 @@ package db
 import (
 	"context"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const addProduct = `-- name: AddProduct :one
+const addCategory = `-- name: AddCategory :one
 
+INSERT INTO categories (parent_id, name) VALUES ($1, $2) RETURNING id, parent_id, name
+`
+
+type AddCategoryParams struct {
+	ParentID *int64
+	Name     string
+}
+
+// Exercises: sum() GROUP BY for on-hand; CTEs for per-warehouse
+// rollup; CASE WHEN for low-stock flagging; self-referential FK on
+// categories.
+func (q *Queries) AddCategory(ctx context.Context, arg AddCategoryParams) (Category, error) {
+	row := q.db.QueryRow(ctx, addCategory, arg.ParentID, arg.Name)
+	var i Category
+	err := row.Scan(&i.ID, &i.ParentID, &i.Name)
+	return i, err
+}
+
+const addProduct = `-- name: AddProduct :one
 INSERT INTO products (category_id, name, threshold)
 VALUES ($1, $2, $3) RETURNING id, category_id, name, threshold
 `
@@ -24,9 +41,6 @@ type AddProductParams struct {
 	Threshold  int32
 }
 
-// Exercises: sum() GROUP BY for on-hand; CTEs for per-warehouse
-// rollup; CASE WHEN for low-stock flagging; self-referential FK on
-// categories.
 func (q *Queries) AddProduct(ctx context.Context, arg AddProductParams) (Product, error) {
 	row := q.db.QueryRow(ctx, addProduct, arg.CategoryID, arg.Name, arg.Threshold)
 	var i Product
@@ -39,11 +53,22 @@ func (q *Queries) AddProduct(ctx context.Context, arg AddProductParams) (Product
 	return i, err
 }
 
+const addWarehouse = `-- name: AddWarehouse :one
+INSERT INTO warehouses (name) VALUES ($1) RETURNING id, name
+`
+
+func (q *Queries) AddWarehouse(ctx context.Context, name string) (Warehouse, error) {
+	row := q.db.QueryRow(ctx, addWarehouse, name)
+	var i Warehouse
+	err := row.Scan(&i.ID, &i.Name)
+	return i, err
+}
+
 const childCategories = `-- name: ChildCategories :many
 SELECT id, parent_id, name FROM categories WHERE parent_id = $1 ORDER BY name
 `
 
-func (q *Queries) ChildCategories(ctx context.Context, parentID pgtype.Int8) ([]Category, error) {
+func (q *Queries) ChildCategories(ctx context.Context, parentID *int64) ([]Category, error) {
 	rows, err := q.db.Query(ctx, childCategories, parentID)
 	if err != nil {
 		return nil, err
