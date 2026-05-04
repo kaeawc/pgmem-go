@@ -2465,7 +2465,7 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 		}
 		return &ir.FuncCall{Name: x.Name, Args: args, T: t}, nil
 	case *ir.ScalarSubquery:
-		return evalScalarSubquery(x, env)
+		return resolveScalarSubquery(x, schema, env)
 	case *ir.InListExpr:
 		return resolveInList(x, schema, env)
 	case *ir.InSubqueryExpr:
@@ -2709,6 +2709,39 @@ func envParams(env *Env) []Param {
 	return env.Params
 }
 
+// resolveScalarSubquery is the resolveExpr-time entry. Uncorrelated
+// subqueries pre-evaluate to a Literal (the original behaviour);
+// correlated ones survive into evalExpr where the inner plan
+// rebuilds per outer row.
+func resolveScalarSubquery(x *ir.ScalarSubquery, schema []Column, env *Env) (ir.Expr, error) {
+	if !planReferencesOuter(x.Plan, schema) {
+		return evalScalarSubquery(x, env)
+	}
+	outer := make([]ir.OuterField, len(schema))
+	for i, c := range schema {
+		outer[i] = ir.OuterField{Qualifier: c.Qualifier, Name: c.Name, T: c.Type}
+	}
+	// Probe the inner plan once to learn its result type, so the
+	// surrounding expression sees a non-nil Type. Build with the
+	// outer schema set but with no per-row OuterRow yet — the type
+	// only depends on the plan structure, not the row values.
+	probeEnv := *env
+	probeOuter := make([]Column, len(schema))
+	copy(probeOuter, schema)
+	probeEnv.OuterSchema = probeOuter
+	probeEnv.OuterRow = make(Row, len(probeOuter))
+	op, err := Build(x.Plan, &probeEnv)
+	if err != nil {
+		return nil, err
+	}
+	cols := op.OutputSchema()
+	op.Close()
+	if len(cols) != 1 {
+		return nil, fmt.Errorf("exec: scalar subquery returned %d columns, want 1", len(cols))
+	}
+	return &ir.ScalarSubquery{Plan: x.Plan, T: cols[0].Type, OuterSchema: outer}, nil
+}
+
 // evalScalarSubquery runs the inner plan against env and returns a
 // Literal carrying the single (column 0, row 0) value. More than one
 // row is SQLSTATE 21000 ("more than one row returned by a subquery
@@ -2818,9 +2851,47 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 		return evalAny(x, in, env)
 	case *ir.ExistsExpr:
 		return evalCorrelatedExists(x, in, env)
+	case *ir.ScalarSubquery:
+		return evalCorrelatedScalar(x, in, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalCorrelatedScalar runs the (correlated) inner plan with
+// env.OuterRow set to the current outer row. Mirrors
+// evalCorrelatedExists, but extracts a single value and enforces the
+// "at most one row" rule.
+func evalCorrelatedScalar(s *ir.ScalarSubquery, in Row, env *Env) (any, error) {
+	outer := make([]Column, len(s.OuterSchema))
+	for i, f := range s.OuterSchema {
+		outer[i] = Column{Qualifier: f.Qualifier, Name: f.Name, Type: f.T}
+	}
+	childEnv := *env
+	childEnv.OuterSchema = outer
+	childEnv.OuterRow = in
+	op, err := Build(s.Plan, &childEnv)
+	if err != nil {
+		return nil, fmt.Errorf("correlated scalar subquery: %w", err)
+	}
+	defer op.Close()
+	row, err := op.Next(context.Background())
+	if errors.Is(err, io.EOF) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("correlated scalar subquery: %w", err)
+	}
+	value := any(nil)
+	if len(row) > 0 {
+		value = row[0]
+	}
+	if _, err := op.Next(context.Background()); err == nil {
+		return nil, &SQLError{Code: "21000", Message: "more than one row returned by a subquery used as an expression"}
+	} else if !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return value, nil
 }
 
 // evalCorrelatedExists builds the inner plan with env.OuterSchema /

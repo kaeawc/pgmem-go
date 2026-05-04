@@ -185,6 +185,15 @@ func TestPostsAndComments(t *testing.T) {
 		t.Errorf("got %+v", counts)
 	}
 
+	// Correlated scalar subquery: count comments via the post id
+	// referenced from the outer query.
+	withCount, err := q.PostWithCommentCount(ctx, post.ID)
+	if err != nil {
+		t.Fatalf("PostWithCommentCount: %v", err)
+	}
+	if withCount.CommentCount != 2 {
+		t.Errorf("subquery count = %d, want 2", withCount.CommentCount)
+	}
 }
 
 func TestPagination(t *testing.T) {
