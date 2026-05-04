@@ -538,6 +538,31 @@ func ByOID(oid uint32) (Type, bool) {
 	}
 }
 
+// Interval is a stripped-down PG `interval` type. We model it as a
+// time.Duration so timestamp ± interval falls out of standard Go
+// arithmetic. The wire codec is a stub: we don't accept interval as a
+// bound parameter or emit it in column metadata yet — intervals
+// typically appear inline as literals (`interval '1 day'`).
+var Interval Type = &intervalType{}
+
+type intervalType struct{}
+
+func (*intervalType) Name() string { return "interval" }
+func (*intervalType) OID() uint32  { return 1186 }
+func (*intervalType) Size() int16  { return 16 }
+func (*intervalType) EncodeText(_ any) ([]byte, error) {
+	return nil, fmt.Errorf("interval EncodeText: not supported")
+}
+func (*intervalType) EncodeBinary(_ any) ([]byte, error) {
+	return nil, fmt.Errorf("interval EncodeBinary: not supported")
+}
+func (*intervalType) DecodeText(_ []byte) (any, error) {
+	return nil, fmt.Errorf("interval DecodeText: not supported")
+}
+func (*intervalType) DecodeBinary(_ []byte) (any, error) {
+	return nil, fmt.Errorf("interval DecodeBinary: not supported")
+}
+
 // ByName looks up by SQL type name. Used by the parser to translate
 // CREATE TABLE column types.
 func ByName(name string) (Type, bool) {

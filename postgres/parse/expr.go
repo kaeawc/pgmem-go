@@ -520,6 +520,17 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 			p.consume()
 			return p.parseExtract()
 		}
+		// `interval 'N unit'` is the standard literal form. We rewrite
+		// it to a `interval('N unit')` builtin call so downstream
+		// stages don't need a special node.
+		if strings.EqualFold(t.val, "interval") && p.peekNext().kind == tString {
+			p.consume() // INTERVAL
+			s := p.consume()
+			return &ir.FuncCall{
+				Name: "interval",
+				Args: []ir.Expr{&ir.Literal{Value: s.val, T: types.Text}},
+			}, nil
+		}
 		p.consume()
 		// PG keeps a few SQL-standard datetime keywords as bare names:
 		// `current_timestamp`, `current_date`, `current_time` are valid

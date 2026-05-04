@@ -2746,6 +2746,28 @@ func binOpResultType(op string, l, r types.Type) types.Type {
 	return arithResultType(l, r)
 }
 
+// tryTimeArith handles timestamp ± interval arithmetic. Returns the
+// computed value with ok=true on a match, ok=false otherwise so
+// evalArith falls through to the integer path.
+func tryTimeArith(op string, l, r any) (any, bool) {
+	if t, okT := l.(time.Time); okT {
+		if d, okD := r.(time.Duration); okD {
+			switch op {
+			case "+":
+				return t.Add(d), true
+			case "-":
+				return t.Add(-d), true
+			}
+		}
+	}
+	if d, okD := l.(time.Duration); okD {
+		if t, okT := r.(time.Time); okT && op == "+" {
+			return t.Add(d), true
+		}
+	}
+	return nil, false
+}
+
 // arithResultType picks the output type of a binary additive/
 // multiplicative op based on its operands.
 //   - || is text concatenation; result type is text.
@@ -2755,6 +2777,9 @@ func binOpResultType(op string, l, r types.Type) types.Type {
 // Unknown operand types fall back to int4; if they aren't really
 // integers evalArith rejects them at evaluation time.
 func arithResultType(l, r types.Type) types.Type {
+	if l == types.Timestamptz || r == types.Timestamptz {
+		return types.Timestamptz
+	}
 	if l == types.Text || r == types.Text {
 		return types.Text
 	}
@@ -2992,6 +3017,9 @@ func concatString(v any) string {
 // int32 if the static result type says int4. Division by zero matches
 // PG behaviour: SQLSTATE 22012.
 func evalArith(op string, l, r any, resultT types.Type) (any, error) {
+	if v, ok := tryTimeArith(op, l, r); ok {
+		return v, nil
+	}
 	li, err := toInt64(l)
 	if err != nil {
 		return nil, err

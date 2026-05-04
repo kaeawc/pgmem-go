@@ -3,6 +3,7 @@ package exec
 import (
 	"crypto/rand"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -414,6 +415,27 @@ var builtins = map[string]builtinFunc{
 		ResultType: variadicSameType("least"),
 		Eval:       variadicReduce(func(cmp int) bool { return cmp < 0 }),
 	},
+	"interval": {
+		// interval('1 day') / interval('5 hours') — parses a small
+		// subset of the PG interval string. Returns time.Duration; the
+		// arithmetic path in evalArith handles timestamp ± interval.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("interval: takes 1 argument, got %d", len(args))
+			}
+			return types.Interval, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("interval: expected text, got %T", args[0])
+			}
+			return parseInterval(s)
+		},
+	},
 	"date_trunc": {
 		// date_trunc(field, ts) returns the timestamp truncated to the
 		// named precision. Fields: year, month, day, hour, minute,
@@ -496,6 +518,51 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
 		},
 	},
+}
+
+// parseInterval handles the small subset of PG interval text we need:
+// one or more `<n> <unit>` pairs separated by whitespace, where unit
+// is one of day(s)/hour(s)/minute(s)/second(s)/week(s)/month(s)/year(s).
+// Months and years approximate (30 / 365.25 days).
+func parseInterval(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("interval: empty string")
+	}
+	parts := strings.Fields(s)
+	if len(parts)%2 != 0 {
+		return 0, fmt.Errorf("interval: odd token count in %q", s)
+	}
+	var total time.Duration
+	for i := 0; i < len(parts); i += 2 {
+		n, err := strconv.ParseInt(parts[i], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("interval: bad number %q", parts[i])
+		}
+		unit := strings.ToLower(parts[i+1])
+		unit = strings.TrimSuffix(unit, "s") // plural → singular
+		var step time.Duration
+		switch unit {
+		case "second", "sec":
+			step = time.Second
+		case "minute", "min":
+			step = time.Minute
+		case "hour":
+			step = time.Hour
+		case "day":
+			step = 24 * time.Hour
+		case "week":
+			step = 7 * 24 * time.Hour
+		case "month":
+			step = 30 * 24 * time.Hour
+		case "year":
+			step = time.Duration(float64(24*time.Hour) * 365.25)
+		default:
+			return 0, fmt.Errorf("interval: unsupported unit %q", parts[i+1])
+		}
+		total += time.Duration(n) * step
+	}
+	return total, nil
 }
 
 // dateTrunc returns ts truncated to the named precision. Behaviour
