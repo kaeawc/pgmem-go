@@ -23,11 +23,15 @@ type conn struct {
 	tc   net.Conn
 	deps Deps
 
-	// Prepared statements and portals. M2 keeps a single anonymous
-	// statement and portal — pgx names them, but for the unparameter-
-	// ized queries we recognize there is no observable difference.
-	stmt   *prepared
-	portal *portal
+	// Prepared statements and portals. stmt is the most recent unnamed
+	// statement (Parse name == ""); namedStmts caches statements that
+	// pgx prepared by name, so subsequent Bind / Describe(S) on a name
+	// the client cached find the right plan even when pgx skips the
+	// re-Parse on a hit.
+	stmt        *prepared
+	namedStmts  map[string]*prepared
+	portal      *portal
+	namedPortal map[string]*portal
 
 	// Conn-scoped transaction state. currentTxn is non-nil when the
 	// client is inside an explicit BEGIN block; statements while it's
@@ -178,6 +182,7 @@ func (c *conn) dispatch(ctx context.Context, msg pgproto3.FrontendMessage) error
 	case *pgproto3.Terminate:
 		return io.EOF
 	case *pgproto3.Close:
+		c.handleClose(m)
 		c.be.Send(&pgproto3.CloseComplete{})
 		return c.be.Flush()
 	default:
@@ -414,22 +419,82 @@ func (c *conn) handleParse(m *pgproto3.Parse) error {
 		}
 	}
 	c.stmt = stmt
+	if m.Name != "" {
+		if c.namedStmts == nil {
+			c.namedStmts = map[string]*prepared{}
+		}
+		c.namedStmts[m.Name] = stmt
+	}
 	c.be.Send(&pgproto3.ParseComplete{})
 	return nil
 }
 
-func (c *conn) handleBind(m *pgproto3.Bind) error {
-	if c.stmt == nil {
-		return c.sendError("26000", "no prepared statement")
+// handleClose drops a named statement or portal entry from the
+// connection's caches. Closing the unnamed slot clears the c.stmt /
+// c.portal pointer accordingly. This matches PG protocol semantics
+// for the Close message.
+func (c *conn) handleClose(m *pgproto3.Close) {
+	switch m.ObjectType {
+	case 'S':
+		if m.Name == "" {
+			c.stmt = nil
+		} else if c.namedStmts != nil {
+			delete(c.namedStmts, m.Name)
+		}
+	case 'P':
+		if m.Name == "" {
+			c.portal = nil
+		} else if c.namedPortal != nil {
+			delete(c.namedPortal, m.Name)
+		}
 	}
-	params, err := decodeParams(c.stmt.paramTypes, m.ParameterFormatCodes, m.Parameters)
+}
+
+// lookupPortal resolves a portal name. Empty name → the last unnamed
+// Bind (anonymous portal). Otherwise look up the named cache.
+func (c *conn) lookupPortal(name string) *portal {
+	if name == "" {
+		return c.portal
+	}
+	if c.namedPortal == nil {
+		return nil
+	}
+	return c.namedPortal[name]
+}
+
+// lookupStmt resolves a prepared-statement name. Empty name → the
+// last unnamed Parse (anonymous statement). Otherwise look up the
+// named cache.
+func (c *conn) lookupStmt(name string) *prepared {
+	if name == "" {
+		return c.stmt
+	}
+	if c.namedStmts == nil {
+		return nil
+	}
+	return c.namedStmts[name]
+}
+
+func (c *conn) handleBind(m *pgproto3.Bind) error {
+	stmt := c.lookupStmt(m.PreparedStatement)
+	if stmt == nil {
+		return c.sendError("26000", fmt.Sprintf("prepared statement %q does not exist", m.PreparedStatement))
+	}
+	params, err := decodeParams(stmt.paramTypes, m.ParameterFormatCodes, m.Parameters)
 	if err != nil {
 		return c.sendError("22023", err.Error())
 	}
-	c.portal = &portal{
-		stmt:          c.stmt,
+	p := &portal{
+		stmt:          stmt,
 		resultFormats: append([]int16(nil), m.ResultFormatCodes...),
 		params:        params,
+	}
+	c.portal = p
+	if m.DestinationPortal != "" {
+		if c.namedPortal == nil {
+			c.namedPortal = map[string]*portal{}
+		}
+		c.namedPortal[m.DestinationPortal] = p
 	}
 	c.be.Send(&pgproto3.BindComplete{})
 	return nil
@@ -464,13 +529,20 @@ func decodeParams(declared []types.Type, formats []int16, raw [][]byte) ([]exec.
 }
 
 func formatFor(codes []int16, i int) int16 {
-	switch len(codes) {
-	case 0:
+	switch {
+	case len(codes) == 0:
 		return 0
-	case 1:
+	case len(codes) == 1:
 		return codes[0]
-	default:
+	case i < len(codes):
 		return codes[i]
+	default:
+		// PG protocol allows the result-format-codes array to be 0, 1,
+		// or N entries long where N matches the column count. If a
+		// client sent fewer codes than the columns we'd panic on the
+		// final indices — fall back to text instead. Real PG would
+		// reject the Bind earlier.
+		return 0
 	}
 }
 
@@ -487,15 +559,16 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) error {
 	var stmt *prepared
 	switch m.ObjectType {
 	case 'S':
-		stmt = c.stmt
+		stmt = c.lookupStmt(m.Name)
 		if stmt != nil {
 			c.be.Send(&pgproto3.ParameterDescription{ParameterOIDs: stmt.paramOIDs})
 		} else {
 			c.be.Send(&pgproto3.ParameterDescription{ParameterOIDs: nil})
 		}
 	case 'P':
-		if c.portal != nil {
-			stmt = c.portal.stmt
+		p := c.lookupPortal(m.Name)
+		if p != nil {
+			stmt = p.stmt
 		}
 	}
 	if stmt == nil || stmt.plan == nil {
@@ -514,8 +587,8 @@ func (c *conn) handleDescribe(m *pgproto3.Describe) error {
 	return nil
 }
 
-func (c *conn) handleExecute(ctx context.Context, _ *pgproto3.Execute) error {
-	p := c.portal
+func (c *conn) handleExecute(ctx context.Context, m *pgproto3.Execute) error {
+	p := c.lookupPortal(m.Portal)
 	if p == nil || p.stmt == nil {
 		return c.sendError("26000", "no portal bound")
 	}
@@ -671,8 +744,12 @@ func (c *conn) rowDescriptionFor(stmt *prepared) (*pgproto3.RowDescription, erro
 	if len(schema) == 0 {
 		return nil, nil
 	}
+	// Result format codes come from a Bind on a portal; only use them
+	// when the portal we have actually wraps this statement. Otherwise
+	// the codes belong to a previous query on this connection and
+	// would mis-tag the wrong column types.
 	var formats []int16
-	if c.portal != nil {
+	if c.portal != nil && c.portal.stmt == stmt {
 		formats = c.portal.resultFormats
 	}
 	return rowDescription(schema, formats), nil
