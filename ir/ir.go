@@ -70,10 +70,23 @@ type Join struct {
 
 func (*Join) node() {}
 
-// SortKey is one ORDER BY clause: an expression and a direction.
+// NullsOrder controls where NULLs sort relative to non-NULLs in an
+// ORDER BY clause. NullsDefault (the zero value) follows real PG: ASC
+// → NULLS LAST, DESC → NULLS FIRST.
+type NullsOrder int
+
+const (
+	NullsDefault NullsOrder = iota
+	NullsFirst
+	NullsLast
+)
+
+// SortKey is one ORDER BY clause: an expression, a direction, and an
+// optional explicit NULLS placement.
 type SortKey struct {
-	Expr Expr
-	Desc bool
+	Expr  Expr
+	Desc  bool
+	Nulls NullsOrder
 }
 
 // Sort orders Input's rows by the SortKeys in lexicographic order.
