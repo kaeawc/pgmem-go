@@ -1394,7 +1394,7 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		cols := make([]catalog.Column, len(p.Columns))
 		var checks []catalog.Check
 		for i, c := range p.Columns {
-			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto, Default: c.Default}
+			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto, Default: c.Default, Generated: c.Generated}
 			if c.References != nil {
 				cols[i].References = catalog.ColumnRef{
 					Table:    c.References.Table,
@@ -1485,7 +1485,7 @@ func alterTableAdd(env *Env, tbl catalog.Table, def ir.ColumnDef) error {
 	if def.NotNull && len(rows) > 0 {
 		return &SQLError{Code: "23502", Message: fmt.Sprintf("column %q contains null values", def.Name)}
 	}
-	newCol := catalog.Column{Name: def.Name, Type: def.Type, NotNull: def.NotNull, Unique: def.Unique, Auto: def.Auto, Default: def.Default}
+	newCol := catalog.Column{Name: def.Name, Type: def.Type, NotNull: def.NotNull, Unique: def.Unique, Auto: def.Auto, Default: def.Default, Generated: def.Generated}
 	if def.References != nil {
 		newCol.References = catalog.ColumnRef{
 			Table:    def.References.Table,
@@ -2047,10 +2047,16 @@ func (i *insertOp) runOnce() error {
 				}
 				continue
 			}
+			if i.ct.Columns[idx].Generated != nil {
+				return &SQLError{Code: "428C9", Message: fmt.Sprintf("cannot insert a non-DEFAULT value into column %q", i.ct.Columns[idx].Name)}
+			}
 			row[idx] = v
 		}
 		fillAutoMask(row, i.ct, needAuto, i.table)
 		if err := applyDefaults(row, defaultCols, needDefault, i.env); err != nil {
+			return err
+		}
+		if err := applyGenerated(row, i.ct, i.env); err != nil {
 			return err
 		}
 		if err := checkNotNull(i.ct, row); err != nil {
@@ -2273,6 +2279,42 @@ func applyDefaults(row storage.Row, defaults []defaultColumn, needsFill []bool, 
 		row[d.idx] = v
 	}
 	return nil
+}
+
+// applyGenerated evaluates each GENERATED ALWAYS AS (expr) column
+// against the row's other columns and writes the result into the
+// generated slot. The expression resolves against the table's schema
+// each call — generated columns recompute on every INSERT/UPDATE,
+// matching real PG.
+func applyGenerated(row storage.Row, ct catalog.Table, env *Env) error {
+	if !hasGeneratedColumn(ct) {
+		return nil
+	}
+	schema := tableSchemaCols(ct)
+	for idx, c := range ct.Columns {
+		if c.Generated == nil {
+			continue
+		}
+		resolved, err := resolveExpr(c.Generated, schema, env)
+		if err != nil {
+			return err
+		}
+		v, err := evalExpr(resolved, Row(row), env)
+		if err != nil {
+			return err
+		}
+		row[idx] = v
+	}
+	return nil
+}
+
+func hasGeneratedColumn(ct catalog.Table) bool {
+	for _, c := range ct.Columns {
+		if c.Generated != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // fillAutoMask writes the next sequence value into every Auto column
@@ -2832,6 +2874,9 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 		if colIdx < 0 {
 			return nil, fmt.Errorf("exec: update %q: unknown column %q", p.Table, a.Column)
 		}
+		if ct.Columns[colIdx].Generated != nil {
+			return nil, &SQLError{Code: "428C9", Message: fmt.Sprintf("column %q can only be updated to DEFAULT", a.Column)}
+		}
 		expr, err := resolveExpr(a.Expr, resolveSchema, env)
 		if err != nil {
 			return nil, err
@@ -2926,6 +2971,10 @@ func (u *updateOp) runOnce() error {
 			}
 			updated, err := u.applyAssignmentsCombined(row, combined)
 			if err != nil {
+				evalErr = err
+				return rows
+			}
+			if err := applyGenerated(updated, u.ct, u.env); err != nil {
 				evalErr = err
 				return rows
 			}

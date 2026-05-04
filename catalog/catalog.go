@@ -29,6 +29,11 @@ type Column struct {
 	// omits this column. Auto columns ignore Default — the SERIAL
 	// fill happens first.
 	Default ir.Expr
+	// Generated, when non-nil, marks the column as `GENERATED ALWAYS
+	// AS (expr) STORED`. The exec layer recomputes the column from
+	// the row's other columns on every INSERT/UPDATE; users may not
+	// supply values for a generated column.
+	Generated ir.Expr
 }
 
 // ColumnRef names a (table, column) pair on the catalog. Used by

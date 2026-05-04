@@ -429,6 +429,11 @@ type ColumnDef struct {
 	// executor resolves it against an empty schema and evaluates it
 	// per-INSERT for any row that omitted the column.
 	Default Expr
+	// Generated, when non-nil, marks the column as `GENERATED ALWAYS
+	// AS (expr) STORED`. The expression resolves against the row's
+	// other columns and is recomputed on every INSERT/UPDATE; users
+	// can't supply a value for a generated column.
+	Generated Expr
 }
 
 // ColumnRefSpec is the (table, column) pair a FOREIGN KEY references,
