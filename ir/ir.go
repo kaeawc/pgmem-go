@@ -490,9 +490,13 @@ func (f *FuncCall) Type() types.Type { return f.T }
 // inner plan must produce a single column; producing more than one row
 // is a runtime error (PG SQLSTATE 21000). Type is filled in at
 // exec.Build time from the inner plan's first column.
+//
+// OuterSchema, when non-nil, lets the inner plan reference outer-
+// scope columns — same pattern as ExistsExpr for correlated EXISTS.
 type ScalarSubquery struct {
-	Plan Node
-	T    types.Type
+	Plan        Node
+	T           types.Type
+	OuterSchema []OuterField
 }
 
 func (*ScalarSubquery) expr()              {}

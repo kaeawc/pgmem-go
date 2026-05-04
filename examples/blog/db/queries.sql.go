@@ -326,6 +326,26 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
+const postWithCommentCount = `-- name: PostWithCommentCount :one
+SELECT p.id, p.title,
+       (SELECT count(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+FROM posts p
+WHERE p.id = $1
+`
+
+type PostWithCommentCountRow struct {
+	ID           int64
+	Title        string
+	CommentCount int64
+}
+
+func (q *Queries) PostWithCommentCount(ctx context.Context, id int64) (PostWithCommentCountRow, error) {
+	row := q.db.QueryRow(ctx, postWithCommentCount, id)
+	var i PostWithCommentCountRow
+	err := row.Scan(&i.ID, &i.Title, &i.CommentCount)
+	return i, err
+}
+
 const publishPost = `-- name: PublishPost :one
 UPDATE posts SET published = true WHERE id = $1 RETURNING id, author_id, title, body, published, created_at
 `

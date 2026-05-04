@@ -52,8 +52,8 @@ FROM comments
 GROUP BY post_id
 ORDER BY post_id;
 
--- Note: a correlated scalar subquery (`(SELECT … WHERE c.post_id =
--- p.id)`) is the natural way to express "post + its comment count"
--- but pgmem-go's scalar-subquery support is uncorrelated only. Use
--- CountCommentsPerPost + a join in client code, or wait for the
--- correlated-subquery piece.
+-- name: PostWithCommentCount :one
+SELECT p.id, p.title,
+       (SELECT count(*) FROM comments c WHERE c.post_id = p.id) AS comment_count
+FROM posts p
+WHERE p.id = $1;
