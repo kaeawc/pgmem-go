@@ -282,6 +282,17 @@ func (p *parser) parseIsNull(left ir.Expr) (ir.Expr, error) {
 	return &ir.UnaryOp{Op: op, Expr: left, T: types.Bool}, nil
 }
 
+// isParenlessNow reports whether the identifier names one of PG's
+// SQL-standard parenless datetime keywords. The lowercase name is what
+// our builtin registry expects.
+func isParenlessNow(name string) bool {
+	switch strings.ToLower(name) {
+	case "current_timestamp", "current_date", "current_time":
+		return true
+	}
+	return false
+}
+
 func likeOp(k tokenKind) (string, bool) {
 	switch k {
 	case kwLike:
@@ -510,6 +521,13 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 			return p.parseExtract()
 		}
 		p.consume()
+		// PG keeps a few SQL-standard datetime keywords as bare names:
+		// `current_timestamp`, `current_date`, `current_time` are valid
+		// expressions on their own. We desugar to a paren-less builtin
+		// call so the rest of the pipeline doesn't need a special node.
+		if isParenlessNow(t.val) && p.peek().kind != tLParen && p.peek().kind != tDot {
+			return &ir.FuncCall{Name: strings.ToLower(t.val)}, nil
+		}
 		// `ident(args)` is a function call. `ident.ident` is a qualified
 		// column reference. Bare identifiers stay as unqualified column
 		// refs. We commit to each shape only after the disambiguating
