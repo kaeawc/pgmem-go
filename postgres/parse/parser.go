@@ -85,6 +85,8 @@ func (p *parser) parseStmt() (ir.Node, error) {
 		return p.parseCreateTable()
 	case kwDrop:
 		return p.parseDropTable()
+	case kwTruncate:
+		return p.parseTruncate()
 	default:
 		return nil, fmt.Errorf("parse: unsupported leading token %q", tok.val)
 	}
@@ -304,6 +306,43 @@ func (p *parser) parseDelete() (ir.Node, error) {
 }
 
 // --- DROP TABLE ---
+
+// parseTruncate consumes
+// `TRUNCATE [TABLE] name [, name ...] [RESTART IDENTITY] [CONTINUE
+// IDENTITY] [CASCADE | RESTRICT]`. Trailing options are accepted but
+// don't change behaviour.
+func (p *parser) parseTruncate() (ir.Node, error) {
+	p.consume() // TRUNCATE
+	p.accept(kwTable)
+	stmt := &ir.Truncate{}
+	for {
+		name, err := p.expect(tIdent, "table name")
+		if err != nil {
+			return nil, err
+		}
+		stmt.Tables = append(stmt.Tables, name.val)
+		if !p.accept(tComma) {
+			break
+		}
+	}
+	for {
+		switch {
+		case p.acceptIdent("restart"):
+			if !p.acceptIdent("identity") {
+				return nil, fmt.Errorf("parse: expected IDENTITY after RESTART at %d", p.peek().pos)
+			}
+			stmt.RestartIdentity = true
+		case p.acceptIdent("continue"):
+			if !p.acceptIdent("identity") {
+				return nil, fmt.Errorf("parse: expected IDENTITY after CONTINUE at %d", p.peek().pos)
+			}
+		case p.accept(kwCascade):
+		case p.acceptIdent("restrict"):
+		default:
+			return stmt, nil
+		}
+	}
+}
 
 func (p *parser) parseDropTable() (ir.Node, error) {
 	p.consume() // DROP

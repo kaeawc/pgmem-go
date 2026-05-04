@@ -87,6 +87,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildLimit(p, env)
 	case *ir.CreateTable:
 		return buildCreateTable(p, env), nil
+	case *ir.Truncate:
+		return buildTruncate(p, env)
 	case *ir.DropTable:
 		return buildDropTable(p, env), nil
 	case *ir.Insert:
@@ -803,6 +805,24 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		env.Engine.CreateTable(p.Name, len(cols))
 		return nil
 	}}
+}
+
+func buildTruncate(p *ir.Truncate, env *Env) (Operator, error) {
+	for _, name := range p.Tables {
+		if _, ok := env.Schema.Table(name); !ok {
+			return nil, &SQLError{Code: "42P01", Message: fmt.Sprintf("table %q does not exist", name)}
+		}
+	}
+	return &ddlOp{tag: "TRUNCATE TABLE", do: func() error {
+		for _, name := range p.Tables {
+			st, ok := env.Txn.Table(name)
+			if !ok {
+				return fmt.Errorf("exec: storage missing table %q", name)
+			}
+			st.Mutate(func(_ []storage.Row) []storage.Row { return nil })
+		}
+		return nil
+	}}, nil
 }
 
 func buildDropTable(p *ir.DropTable, env *Env) Operator {

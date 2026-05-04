@@ -190,6 +190,17 @@ type CreateTable struct {
 
 func (*CreateTable) node() {}
 
+// Truncate empties the listed tables. Real PG also resets identity
+// sequences when RESTART IDENTITY is given; we accept the option as a
+// no-op for now since we don't yet model sequences as first-class
+// catalog objects.
+type Truncate struct {
+	Tables          []string
+	RestartIdentity bool
+}
+
+func (*Truncate) node() {}
+
 // DropTable removes a table from the catalog and the storage engine.
 // IfExists makes a missing table a no-op rather than an error.
 type DropTable struct {
