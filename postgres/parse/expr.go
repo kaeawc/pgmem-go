@@ -123,6 +123,23 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	return left, nil
 }
 
+// parseExists consumes `EXISTS ( SELECT ... )`. The leading EXISTS
+// has not been consumed yet.
+func (p *parser) parseExists() (ir.Expr, error) {
+	p.consume() // EXISTS
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	plan, err := p.parseSelect()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	return &ir.ExistsExpr{Plan: plan}, nil
+}
+
 // parseCase consumes a `CASE [operand] WHEN ... THEN ... [ELSE ...] END`
 // expression. Both forms share the same IR shape: Operand is nil for
 // the searched form; for the simple form it's the value compared
@@ -421,6 +438,8 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 		return &ir.Literal{Value: nil, T: nil}, nil
 	case kwCase:
 		return p.parseCase()
+	case kwExists:
+		return p.parseExists()
 	case tParam:
 		p.consume()
 		idx, err := strconv.Atoi(t.val)

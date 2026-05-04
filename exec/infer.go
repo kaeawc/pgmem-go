@@ -276,6 +276,8 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
 	case *ir.ScalarSubquery:
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
+	case *ir.ExistsExpr:
+		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
 	case *ir.Cast:
 		// `$1::text` constrains $1 to text. Pass the cast target down
 		// as the expected type — exactly the case sqlc-generated NULL

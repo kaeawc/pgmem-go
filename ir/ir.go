@@ -374,6 +374,17 @@ type ScalarSubquery struct {
 func (*ScalarSubquery) expr()              {}
 func (s *ScalarSubquery) Type() types.Type { return s.T }
 
+// ExistsExpr is `EXISTS (SELECT ...)` — true when the inner plan
+// produces at least one row, false otherwise. The inner plan's column
+// list is irrelevant (we never read it), so the parser may build a
+// vanilla SELECT node and it just works.
+type ExistsExpr struct {
+	Plan Node
+}
+
+func (*ExistsExpr) expr()            {}
+func (*ExistsExpr) Type() types.Type { return boolType }
+
 // CaseWhen is one branch of a Case expression.
 type CaseWhen struct {
 	// Match is the WHEN expression. For a "searched" CASE (no operand)
