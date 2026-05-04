@@ -96,6 +96,7 @@ func walkParamsProject(p *ir.Project, sch catalog.Schema, scopeTable string, hin
 func walkParamsFilter(p *ir.Filter, sch catalog.Schema, scopeTable string, hint map[int]types.Type, maxIdx *int) {
 	next := scopeFor(p.Input, scopeTable)
 	walkParams(p.Input, sch, next, hint, maxIdx)
+	prefillQualifiedColumnTypes(p.Cond, sch, collectScans(p.Input))
 	walkExprParams(p.Cond, nil, sch, next, hint, maxIdx)
 }
 
@@ -107,6 +108,8 @@ func walkParamsJoin(p *ir.Join, sch catalog.Schema, scopeTable string, hint map[
 	walkParams(p.Left, sch, scopeFor(p.Left, scopeTable), hint, maxIdx)
 	walkParams(p.Right, sch, scopeFor(p.Right, scopeTable), hint, maxIdx)
 	if p.Cond != nil {
+		scans := append(collectScans(p.Left), collectScans(p.Right)...)
+		prefillQualifiedColumnTypes(p.Cond, sch, scans)
 		walkExprParams(p.Cond, nil, sch, scopeTable, hint, maxIdx)
 	}
 }
@@ -214,6 +217,118 @@ func scopeFor(n ir.Node, fallback string) string {
 			return fallback
 		}
 	}
+}
+
+// collectScans walks a plan tree and returns every Scan it can reach
+// without crossing into nested subqueries. The result lets static
+// type resolution find the right table for a qualified column
+// reference when scopeFor could only return a single fallback.
+func collectScans(n ir.Node) []*ir.Scan {
+	var out []*ir.Scan
+	var walk func(n ir.Node)
+	walk = func(n ir.Node) {
+		switch x := n.(type) {
+		case *ir.Scan:
+			out = append(out, x)
+		case *ir.Project:
+			walk(x.Input)
+		case *ir.Filter:
+			walk(x.Input)
+		case *ir.Sort:
+			walk(x.Input)
+		case *ir.Limit:
+			walk(x.Input)
+		case *ir.Join:
+			walk(x.Left)
+			walk(x.Right)
+		case *ir.Distinct:
+			walk(x.Input)
+		case *ir.Aggregate:
+			walk(x.Input)
+		case *ir.SubqueryAlias:
+			walk(x.Inner)
+		case *ir.Union:
+			walk(x.Left)
+			walk(x.Right)
+		}
+	}
+	walk(n)
+	return out
+}
+
+// prefillQualifiedColumnTypes walks the expression tree and, for any
+// ColumnRef carrying a qualifier that maps onto one of the supplied
+// scans, fills in the catalog column type. This lets the parameter
+// type inference downstream see qualified refs like `c.post_id` even
+// when the surrounding scope is a Join (whose scopeFor yields the
+// fallback "" with no usable scopeTable).
+func prefillQualifiedColumnTypes(e ir.Expr, sch catalog.Schema, scans []*ir.Scan) {
+	switch x := e.(type) {
+	case nil:
+		return
+	case *ir.ColumnRef:
+		if x.T != nil || x.Qualifier == "" {
+			return
+		}
+		s := scanForQualifier(scans, x.Qualifier)
+		if s == nil {
+			return
+		}
+		ct, ok := sch.Table(s.Table)
+		if !ok {
+			return
+		}
+		for _, col := range ct.Columns {
+			if col.Name == x.Name {
+				x.T = col.Type
+				return
+			}
+		}
+	case *ir.BinOp:
+		prefillQualifiedColumnTypes(x.Left, sch, scans)
+		prefillQualifiedColumnTypes(x.Right, sch, scans)
+	case *ir.UnaryOp:
+		prefillQualifiedColumnTypes(x.Expr, sch, scans)
+	case *ir.FuncCall:
+		for _, a := range x.Args {
+			prefillQualifiedColumnTypes(a, sch, scans)
+		}
+	case *ir.InListExpr:
+		prefillQualifiedColumnTypes(x.Probe, sch, scans)
+		for _, item := range x.List {
+			prefillQualifiedColumnTypes(item, sch, scans)
+		}
+	case *ir.InSubqueryExpr:
+		prefillQualifiedColumnTypes(x.Probe, sch, scans)
+	case *ir.Cast:
+		prefillQualifiedColumnTypes(x.Expr, sch, scans)
+	case *ir.Case:
+		prefillQualifiedColumnTypes(x.Operand, sch, scans)
+		for _, w := range x.Whens {
+			prefillQualifiedColumnTypes(w.Match, sch, scans)
+			prefillQualifiedColumnTypes(w.Result, sch, scans)
+		}
+		prefillQualifiedColumnTypes(x.Else, sch, scans)
+	}
+}
+
+// scanForQualifier returns the scan whose alias (if set) or table
+// name matches the qualifier. Used to find the table backing a
+// qualified column ref in a join scope.
+func scanForQualifier(scans []*ir.Scan, qualifier string) *ir.Scan {
+	if qualifier == "" {
+		return nil
+	}
+	for _, s := range scans {
+		key := s.Table
+		if s.Alias != "" {
+			key = s.Alias
+		}
+		if key == qualifier {
+			return s
+		}
+	}
+	return nil
 }
 
 func insertColMap(ct catalog.Table, cols []string) []int {
