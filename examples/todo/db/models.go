@@ -13,14 +13,14 @@ type Item struct {
 	ListID    int64
 	Title     string
 	Done      bool
-	DueAt     **time.Time
+	DueAt     *time.Time
 	CreatedAt time.Time
-	DeletedAt **time.Time
+	DeletedAt *time.Time
 }
 
 type List struct {
 	ID        int64
 	Name      string
 	CreatedAt time.Time
-	DeletedAt **time.Time
+	DeletedAt *time.Time
 }

@@ -8,6 +8,8 @@ package db
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const postMessage = `-- name: PostMessage :one
@@ -20,7 +22,7 @@ RETURNING id, room_id, author_id, parent_id, body, sent_at
 type PostMessageParams struct {
 	RoomID   int64
 	AuthorID int64
-	ParentID *int64
+	ParentID pgtype.Int8
 	Body     string
 	SentAt   time.Time
 }
@@ -87,7 +89,7 @@ type ReplyThreadRow struct {
 	ParentBody string
 }
 
-func (q *Queries) ReplyThread(ctx context.Context, parentID *int64) ([]ReplyThreadRow, error) {
+func (q *Queries) ReplyThread(ctx context.Context, parentID pgtype.Int8) ([]ReplyThreadRow, error) {
 	rows, err := q.db.Query(ctx, replyThread, parentID)
 	if err != nil {
 		return nil, err
