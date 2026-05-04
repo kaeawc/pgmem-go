@@ -209,6 +209,67 @@ func (*boolType) DecodeBinary(b []byte) (any, error) {
 	return b[0] != 0, nil
 }
 
+// Bytea is PG bytea (variable-length binary). Internally we hold
+// values as []byte. PG's text format is `\xHEX` (lower-case hex with
+// a `\x` prefix); binary is the raw bytes themselves.
+var Bytea Type = &byteaType{}
+
+type byteaType struct{}
+
+func (*byteaType) Name() string { return "bytea" }
+func (*byteaType) OID() uint32  { return 17 }
+func (*byteaType) Size() int16  { return -1 }
+
+func (*byteaType) EncodeText(v any) ([]byte, error) {
+	b, err := byteaBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("bytea EncodeText: %w", err)
+	}
+	out := make([]byte, 2+hex.EncodedLen(len(b)))
+	out[0] = '\\'
+	out[1] = 'x'
+	hex.Encode(out[2:], b)
+	return out, nil
+}
+
+func (*byteaType) EncodeBinary(v any) ([]byte, error) {
+	b, err := byteaBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("bytea EncodeBinary: %w", err)
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out, nil
+}
+
+func (*byteaType) DecodeText(b []byte) (any, error) {
+	if len(b) >= 2 && b[0] == '\\' && (b[1] == 'x' || b[1] == 'X') {
+		out := make([]byte, hex.DecodedLen(len(b)-2))
+		if _, err := hex.Decode(out, b[2:]); err != nil {
+			return nil, fmt.Errorf("bytea DecodeText: %w", err)
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("bytea DecodeText: only the \\xHEX form is supported (got %q)", b)
+}
+
+func (*byteaType) DecodeBinary(b []byte) (any, error) {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out, nil
+}
+
+func byteaBytes(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		return []byte(x), nil
+	default:
+		return nil, fmt.Errorf("unsupported %T", v)
+	}
+}
+
 // UUID is PG uuid (16 raw bytes). Internally we hold values as
 // [16]byte so they're comparable (UNIQUE / map keys).
 var UUID Type = &uuidType{}
@@ -394,6 +455,8 @@ func ByOID(oid uint32) (Type, bool) {
 	switch oid {
 	case 16:
 		return Bool, true
+	case 17:
+		return Bytea, true
 	case 20:
 		return Int8, true
 	case 23:
@@ -421,6 +484,8 @@ func ByName(name string) (Type, bool) {
 		return Text, true
 	case "bool", "boolean":
 		return Bool, true
+	case "bytea":
+		return Bytea, true
 	case "uuid":
 		return UUID, true
 	case "timestamptz":
