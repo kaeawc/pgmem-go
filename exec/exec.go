@@ -154,21 +154,59 @@ func buildProject(p *ir.Project, env *Env) (Operator, error) {
 		return nil, err
 	}
 	inSchema := in.OutputSchema()
-	exprs := make([]ir.Expr, len(p.Exprs))
-	cols := make([]Column, len(p.Exprs))
-	for i, e := range p.Exprs {
+	// Expand any StarRef sentinels into one entry per input column
+	// before resolving — the rest of the planning pipeline never sees
+	// stars.
+	expandedExprs, expandedNames := expandStarRefs(p.Exprs, p.OutputNames, inSchema)
+	exprs := make([]ir.Expr, len(expandedExprs))
+	cols := make([]Column, len(expandedExprs))
+	for i, e := range expandedExprs {
 		resolved, err := resolveExpr(e, inSchema, env)
 		if err != nil {
 			return nil, err
 		}
 		exprs[i] = resolved
 		name := ""
-		if i < len(p.OutputNames) {
-			name = p.OutputNames[i]
+		if i < len(expandedNames) {
+			name = expandedNames[i]
 		}
 		cols[i] = Column{Name: name, Type: resolved.Type()}
 	}
 	return &projectOp{in: in, cols: cols, exprs: exprs, env: env}, nil
+}
+
+// expandStarRefs replaces every StarRef in exprs with one ColumnRef
+// per column in schema. OutputNames grow in lockstep so each expanded
+// column carries the source column's name.
+func expandStarRefs(exprs []ir.Expr, names []string, schema []Column) ([]ir.Expr, []string) {
+	hasStar := false
+	for _, e := range exprs {
+		if _, ok := e.(*ir.StarRef); ok {
+			hasStar = true
+			break
+		}
+	}
+	if !hasStar {
+		return exprs, names
+	}
+	outExprs := make([]ir.Expr, 0, len(exprs)+len(schema))
+	outNames := make([]string, 0, len(exprs)+len(schema))
+	for i, e := range exprs {
+		if _, ok := e.(*ir.StarRef); ok {
+			for _, c := range schema {
+				outExprs = append(outExprs, &ir.ColumnRef{Qualifier: c.Qualifier, Name: c.Name})
+				outNames = append(outNames, c.Name)
+			}
+			continue
+		}
+		outExprs = append(outExprs, e)
+		var name string
+		if i < len(names) {
+			name = names[i]
+		}
+		outNames = append(outNames, name)
+	}
+	return outExprs, outNames
 }
 
 type projectOp struct {

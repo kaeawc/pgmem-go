@@ -324,6 +324,14 @@ type UnaryOp struct {
 func (*UnaryOp) expr()              {}
 func (u *UnaryOp) Type() types.Type { return u.T }
 
+// StarRef is the `*` placeholder in a SELECT list. Planning expands
+// it to the full set of input-schema columns (`expand` in
+// exec/project.go) — it never reaches evaluation time.
+type StarRef struct{}
+
+func (*StarRef) expr()            {}
+func (*StarRef) Type() types.Type { return nil }
+
 // Cast is `expr::type` — runtime conversion to a named type. The exec
 // layer's converter table covers a small subset of PG's implicit-cast
 // lattice (DESIGN.md §5: "implement only the casts sqlc-generated

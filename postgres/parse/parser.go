@@ -812,6 +812,12 @@ func (p *parser) parseSelectList() ([]ir.Expr, []string, error) {
 }
 
 func (p *parser) parseSelectItem() (ir.Expr, string, error) {
+	// `SELECT *` and `SELECT a, b, *` are both valid; expansion happens
+	// in the planner against the FROM-clause schema.
+	if p.peek().kind == tStar {
+		p.consume()
+		return &ir.StarRef{}, "", nil
+	}
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, "", err
