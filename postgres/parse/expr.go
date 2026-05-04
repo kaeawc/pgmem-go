@@ -448,6 +448,8 @@ func comparisonOp(k tokenKind) (string, bool) {
 		return "@>", true
 	case tContained:
 		return "<@", true
+	case tQuestion:
+		return "?", true
 	default:
 		return "", false
 	}
