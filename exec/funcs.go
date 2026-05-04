@@ -135,6 +135,64 @@ var builtins = map[string]builtinFunc{
 		// keyword syntax we don't parse yet.
 		Eval: evalUnaryString(strings.TrimSpace),
 	},
+	"ltrim": {
+		ResultType: trimResultType("ltrim"),
+		Eval:       evalTrim(strings.TrimLeft, " \t\n\r\v\f"),
+	},
+	"rtrim": {
+		ResultType: trimResultType("rtrim"),
+		Eval:       evalTrim(strings.TrimRight, " \t\n\r\v\f"),
+	},
+	"btrim": {
+		ResultType: trimResultType("btrim"),
+		Eval:       evalTrim(trimBoth, " \t\n\r\v\f"),
+	},
+	"char_length": {
+		ResultType: oneArg(types.Int4),
+		// char_length / character_length: same character count as
+		// length(text) — runes, not bytes.
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("char_length: want text, got %T", args[0])
+			}
+			return int32(len([]rune(s))), nil
+		},
+	},
+	"character_length": {
+		ResultType: oneArg(types.Int4),
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			s, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("character_length: want text, got %T", args[0])
+			}
+			return int32(len([]rune(s))), nil
+		},
+	},
+	"octet_length": {
+		ResultType: oneArg(types.Int4),
+		// octet_length: byte length of the UTF-8 encoding for text;
+		// raw byte length for bytea.
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			switch v := args[0].(type) {
+			case string:
+				return int32(len(v)), nil
+			case []byte:
+				return int32(len(v)), nil
+			default:
+				return nil, fmt.Errorf("octet_length: want text or bytea, got %T", args[0])
+			}
+		},
+	},
 	"replace": {
 		// replace(s, from, to) replaces *every* non-overlapping
 		// occurrence of from with to. Three text args; returns text.
@@ -348,6 +406,51 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
 		},
 	},
+}
+
+// trimResultType validates the arity and returns text. ltrim, rtrim,
+// btrim accept either one argument (default whitespace) or two
+// arguments (custom character set).
+func trimResultType(name string) func(args []ir.Expr) (types.Type, error) {
+	return func(args []ir.Expr) (types.Type, error) {
+		if len(args) != 1 && len(args) != 2 {
+			return nil, fmt.Errorf("%s: takes 1 or 2 arguments, got %d", name, len(args))
+		}
+		return types.Text, nil
+	}
+}
+
+// trimBoth strips a cutset from both ends. Closure-compatible with
+// strings.TrimLeft / TrimRight so all three trims share evalTrim.
+func trimBoth(s, cutset string) string {
+	return strings.Trim(s, cutset)
+}
+
+// evalTrim builds an Eval that trims using the supplied function. The
+// trim character set comes from args[1] when present, otherwise the
+// fallback (whitespace) is used. NULLs propagate.
+func evalTrim(fn func(string, string) string, defaultCutset string) func(env *Env, args []any) (any, error) {
+	return func(_ *Env, args []any) (any, error) {
+		if args[0] == nil {
+			return nil, nil
+		}
+		s, ok := args[0].(string)
+		if !ok {
+			return nil, fmt.Errorf("trim: want text, got %T", args[0])
+		}
+		cutset := defaultCutset
+		if len(args) == 2 {
+			if args[1] == nil {
+				return nil, nil
+			}
+			c, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("trim: cutset must be text, got %T", args[1])
+			}
+			cutset = c
+		}
+		return fn(s, cutset), nil
+	}
 }
 
 // variadicSameType is the ResultType for greatest/least: the result
