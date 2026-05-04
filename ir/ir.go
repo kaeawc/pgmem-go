@@ -261,14 +261,22 @@ type Delete struct {
 
 func (*Delete) node() {}
 
-// OnConflict carries the policy for INSERT ... ON CONFLICT. M5 ships
-// the DO NOTHING form; DO UPDATE arrives later. Columns names the
-// conflict-target columns. In real PG this must match a unique
-// constraint or index — we don't enforce that yet, so the policy
-// applies whenever the named columns alone match an existing row.
+// OnConflict carries the policy for INSERT ... ON CONFLICT. Columns
+// names the conflict-target columns. In real PG these must match a
+// unique constraint or index — we don't enforce that yet, so the
+// policy applies whenever the named columns alone match an existing
+// row. DoNothing and DoUpdate are mutually exclusive; exactly one is
+// set when OnConflict itself is non-nil.
 type OnConflict struct {
 	Columns   []string
 	DoNothing bool
+	// DoUpdate, when non-empty, rewrites the conflicting row's columns
+	// using these assignments. Each assignment's expression sees both
+	// the existing row's columns and the proposed row's columns as a
+	// catalog-ordered concatenation — qualified `excluded.col` refers
+	// to the proposed-but-blocked value, bare `col` refers to the
+	// existing value (matching real PG).
+	DoUpdate []Assignment
 }
 
 // Insert appends rows to the named table. Columns names the target

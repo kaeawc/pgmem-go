@@ -880,6 +880,11 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 			return nil, err
 		}
 		op.conflictColIdx = idxs
+		updates, err := buildConflictUpdates(ct, p.OnConflict, env)
+		if err != nil {
+			return nil, err
+		}
+		op.updateExprs = updates
 	}
 	if len(p.Returning) > 0 {
 		// RETURNING expressions see the post-INSERT row, so their column
@@ -905,6 +910,54 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		}
 	}
 	return op, nil
+}
+
+// conflictUpdate is a resolved DO UPDATE SET assignment.
+type conflictUpdate struct {
+	colIdx int     // catalog column index this assignment targets
+	expr   ir.Expr // resolved against [existing ++ excluded] schema
+}
+
+// buildConflictUpdates resolves DO UPDATE SET assignments against a
+// schema that exposes both the existing row (qualifier = table name)
+// and the proposed row (qualifier = "excluded"), so an expression can
+// reference either side and the resolver disambiguates by qualifier.
+func buildConflictUpdates(ct catalog.Table, oc *ir.OnConflict, env *Env) ([]conflictUpdate, error) {
+	if len(oc.DoUpdate) == 0 {
+		return nil, nil
+	}
+	// Existing-row columns get an empty qualifier so bare `name`
+	// resolves to them unambiguously. Excluded-row columns carry the
+	// "excluded" qualifier so `excluded.name` finds them. Real PG
+	// also accepts the table name as an explicit qualifier for the
+	// existing side, but we don't yet — bare names are enough for
+	// the typical sqlc upsert.
+	merged := make([]Column, 0, len(ct.Columns)*2)
+	for _, c := range ct.Columns {
+		merged = append(merged, Column{Name: c.Name, Type: c.Type})
+	}
+	for _, c := range ct.Columns {
+		merged = append(merged, Column{Qualifier: "excluded", Name: c.Name, Type: c.Type})
+	}
+	out := make([]conflictUpdate, len(oc.DoUpdate))
+	for k, a := range oc.DoUpdate {
+		idx := -1
+		for j, c := range ct.Columns {
+			if c.Name == a.Column {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("exec: ON CONFLICT DO UPDATE: unknown column %q", a.Column)
+		}
+		r, err := resolveExpr(a.Expr, merged, env)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = conflictUpdate{colIdx: idx, expr: r}
+	}
+	return out, nil
 }
 
 // resolveConflictColumns maps each ON CONFLICT target column name to
@@ -1001,8 +1054,13 @@ type insertOp struct {
 	env            *Env
 	onConflict     *ir.OnConflict
 	conflictColIdx []int
-	done           bool
-	inserted       int
+	// updateExprs is parallel to onConflict.DoUpdate: each entry's
+	// expression is resolved against the [existing ++ excluded]
+	// schema. The Column field carries the catalog index of the
+	// target column.
+	updateExprs []conflictUpdate
+	done        bool
+	inserted    int
 
 	// Optional RETURNING projection. Non-nil iff the INSERT has a
 	// RETURNING clause; in that case OutputSchema is non-empty and
@@ -1059,6 +1117,14 @@ func (i *insertOp) runOnce() error {
 	if i.onConflict != nil && i.onConflict.DoNothing {
 		built = filterConflicts(built, i.table.Rows(), i.conflictColIdx)
 	}
+	var updated []storage.Row
+	if i.onConflict != nil && len(i.updateExprs) > 0 {
+		var err error
+		built, updated, err = i.applyDoUpdate(built)
+		if err != nil {
+			return err
+		}
+	}
 	if err := checkUnique(i.ct, i.table.Rows(), built); err != nil {
 		return err
 	}
@@ -1073,8 +1139,9 @@ func (i *insertOp) runOnce() error {
 		i.inserted++
 	}
 	if len(i.returning) > 0 {
-		i.pending = make([]Row, len(built))
-		for k, row := range built {
+		all := append(append([]storage.Row(nil), built...), updated...)
+		i.pending = make([]Row, len(all))
+		for k, row := range all {
 			out := make(Row, len(i.returning))
 			for j, e := range i.returning {
 				v, err := evalExpr(e, Row(row), i.env)
@@ -1087,6 +1154,97 @@ func (i *insertOp) runOnce() error {
 		}
 	}
 	return nil
+}
+
+// applyDoUpdate splits `built` into rows that don't conflict (returned
+// as the new built list) and rows that do (rewritten in storage). The
+// second return is the list of post-update rows, used so RETURNING can
+// emit a row per UPDATE just like real PG.
+func (i *insertOp) applyDoUpdate(built []storage.Row) (kept, updated []storage.Row, err error) {
+	existing := i.table.Rows()
+	kept = built[:0]
+	for _, proposed := range built {
+		idx := findConflictRow(existing, proposed, i.conflictColIdx)
+		if idx < 0 {
+			kept = append(kept, proposed)
+			continue
+		}
+		merged := append(append(Row(nil), Row(existing[idx])...), Row(proposed)...)
+		newRow := append(storage.Row(nil), existing[idx]...)
+		for _, u := range i.updateExprs {
+			v, evalErr := evalExpr(u.expr, merged, i.env)
+			if evalErr != nil {
+				return nil, nil, evalErr
+			}
+			newRow[u.colIdx] = v
+		}
+		if err := checkNotNull(i.ct, newRow); err != nil {
+			return nil, nil, err
+		}
+		i.table.Mutate(func(rows []storage.Row) []storage.Row {
+			for j := range rows {
+				if rowsEqual(rows[j], existing[idx]) {
+					rows[j] = newRow
+					break
+				}
+			}
+			return rows
+		})
+		// Refresh existing snapshot so the next conflict check sees the
+		// updated row — relevant when the update changes a conflict-target
+		// column.
+		existing = i.table.Rows()
+		updated = append(updated, newRow)
+		i.inserted++
+	}
+	return kept, updated, nil
+}
+
+// findConflictRow returns the index of the first row in `existing`
+// that matches `row` on every conflict-target column, or -1 if none.
+func findConflictRow(existing []storage.Row, row storage.Row, idxs []int) int {
+	for j, ex := range existing {
+		match := true
+		for _, idx := range idxs {
+			a, b := row[idx], ex[idx]
+			if a == nil || b == nil {
+				match = false
+				break
+			}
+			cmp, err := compareValues(a, b)
+			if err != nil || cmp != 0 {
+				match = false
+				break
+			}
+		}
+		if match {
+			return j
+		}
+	}
+	return -1
+}
+
+// rowsEqual is a simple identity test used by Mutate's update closure
+// to find the slot for the row we're rewriting. Pointer equality on
+// the underlying slice would be cleaner but storage.Row is a slice,
+// not a pointer, so we compare element by element.
+func rowsEqual(a, b storage.Row) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] == nil && b[i] == nil {
+			continue
+		}
+		if a[i] == nil || b[i] == nil {
+			return false
+		}
+		cmp, err := compareValues(a[i], b[i])
+		if err != nil || cmp != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // autoColumnIndexes returns the catalog column indexes that carry the
@@ -1838,6 +1996,24 @@ func resolveColumnRef(ref *ir.ColumnRef, schema []Column) (int, error) {
 		return 0, fmt.Errorf("exec: unknown column %s", refDisplayName(ref))
 	}
 	if len(matches) > 1 {
+		// A bare reference can be disambiguated when exactly one match
+		// has an empty qualifier — that's how DO UPDATE SET resolves
+		// `name` (existing row) vs `excluded.name` (proposed row).
+		if ref.Qualifier == "" {
+			unq := -1
+			for _, m := range matches {
+				if schema[m].Qualifier == "" {
+					if unq != -1 {
+						unq = -1
+						break
+					}
+					unq = m
+				}
+			}
+			if unq >= 0 {
+				return unq, nil
+			}
+		}
 		return 0, fmt.Errorf("exec: column reference %q is ambiguous", ref.Name)
 	}
 	return matches[0], nil
