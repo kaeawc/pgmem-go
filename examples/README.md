@@ -9,11 +9,12 @@ workloads.
 
 ```
 examples/
-  blog/          users · posts · comments    (CRUD, joins, RETURNING)
+  blog/          users · posts · comments    (CRUD, joins, RETURNING, correlated subquery)
   todo/          lists · items               (upsert, soft delete, intervals)
   inventory/     products · stock · txns     (aggregates, CTEs, CASE)
   events/        events with jsonb payloads  (jsonb ops, regex, date funcs)
-  chat/          users · rooms · messages    (UNION, self-joins, EXISTS)
+  chat/          users · rooms · messages    (UNION, self-joins, correlated EXISTS)
+  analytics/     players · matches           (window funcs, arrays + ANY, array_agg, unnest)
 ```
 
 Each project owns:
@@ -54,10 +55,15 @@ Each project owns:
 
 ### chat
 - `UNION ALL` across `messages` and `system_messages` for an inbox view
-- `EXISTS (SELECT 1 FROM subscriptions …)` to test membership
+- Correlated `EXISTS (SELECT 1 FROM subscriptions WHERE … s.room_id = r.id)` to test membership
 - Self-join for threaded replies (`messages m JOIN messages r ON r.parent_id = m.id`)
-- Window-function shapes are intentionally avoided here — those land
-  with the window-functions piece
+
+### analytics
+- `row_number() OVER (PARTITION BY region ORDER BY score DESC)`
+- `rank() OVER (ORDER BY score DESC)` with tied scores
+- `array_agg(score)` aggregating per player
+- `WHERE id = ANY($1::bigint[])` parameter list filter
+- `FROM unnest($1::bigint[])` set-returning expansion
 
 ## Running
 
