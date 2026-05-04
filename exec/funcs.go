@@ -12,10 +12,12 @@ import (
 
 // builtinFunc is the runtime shape of a SQL builtin: it reports its
 // return type given the (already type-resolved) argument list and
-// computes the value from the evaluated argument values.
+// computes the value from the evaluated argument values. Eval gets
+// env so functions like now() can consult the per-server clock the
+// test harness pinned via Server.SetNow.
 type builtinFunc struct {
 	ResultType func(args []ir.Expr) (types.Type, error)
-	Eval       func(args []any) (any, error)
+	Eval       func(env *Env, args []any) (any, error)
 }
 
 // builtins is the static registry of supported builtins. Lower-case
@@ -24,7 +26,7 @@ type builtinFunc struct {
 var builtins = map[string]builtinFunc{
 	"gen_random_uuid": {
 		ResultType: noArgs(types.UUID),
-		Eval: func(_ []any) (any, error) {
+		Eval: func(_ *Env, _ []any) (any, error) {
 			var b [16]byte
 			if _, err := rand.Read(b[:]); err != nil {
 				return nil, fmt.Errorf("gen_random_uuid: %w", err)
@@ -38,12 +40,17 @@ var builtins = map[string]builtinFunc{
 	},
 	"now": {
 		ResultType: noArgs(types.Timestamptz),
-		// Real PG's now() returns the transaction start time (constant
-		// within a tx). We return the wall clock at evaluation time —
-		// good enough for sqlc test assertions on "is created_at
-		// roughly now". The clock-injection hook on Server (DESIGN.md
-		// §5) will replace time.Now once it lands.
-		Eval: func(_ []any) (any, error) { return time.Now().UTC(), nil },
+		// PG's real now() returns the transaction start time (constant
+		// within a tx). We approximate with the engine clock at eval
+		// time so test code that pinned Server.SetNow(...) sees a
+		// deterministic value; if no clock is pinned we fall back to
+		// time.Now().
+		Eval: func(env *Env, _ []any) (any, error) {
+			if env != nil && env.Now != nil {
+				return env.Now().UTC(), nil
+			}
+			return time.Now().UTC(), nil
+		},
 	},
 	"lower": {
 		ResultType: oneArg(types.Text),
@@ -65,7 +72,7 @@ var builtins = map[string]builtinFunc{
 			}
 			return firstNonNilType(args), nil
 		},
-		Eval: func(args []any) (any, error) {
+		Eval: func(_ *Env, args []any) (any, error) {
 			for _, a := range args {
 				if a != nil {
 					return a, nil
@@ -90,7 +97,7 @@ var builtins = map[string]builtinFunc{
 			}
 			return t, nil
 		},
-		Eval: func(args []any) (any, error) {
+		Eval: func(_ *Env, args []any) (any, error) {
 			a, b := args[0], args[1]
 			if a == nil || b == nil {
 				return a, nil
@@ -110,7 +117,7 @@ var builtins = map[string]builtinFunc{
 		// PG length() on text returns int (int4) and counts characters
 		// — UTF-8 code points, not bytes. We use rune count for the
 		// same behaviour.
-		Eval: func(args []any) (any, error) {
+		Eval: func(_ *Env, args []any) (any, error) {
 			if args[0] == nil {
 				return nil, nil
 			}
@@ -159,8 +166,8 @@ func oneArg(t types.Type) func([]ir.Expr) (types.Type, error) {
 
 // evalUnaryString lifts a string→string function into the builtin
 // Eval shape. NULL input → NULL output. Non-string input is rejected.
-func evalUnaryString(fn func(string) string) func([]any) (any, error) {
-	return func(args []any) (any, error) {
+func evalUnaryString(fn func(string) string) func(*Env, []any) (any, error) {
+	return func(_ *Env, args []any) (any, error) {
 		if args[0] == nil {
 			return nil, nil
 		}

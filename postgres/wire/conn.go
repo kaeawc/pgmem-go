@@ -549,6 +549,7 @@ func (c *conn) runQuery(ctx context.Context, stmt *prepared, formats []int16, se
 		Engine: c.deps.Engine,
 		Txn:    txn,
 		Params: params,
+		Now:    c.deps.Now,
 	})
 	if err != nil {
 		c.markTxFailedIfInBlock()
@@ -643,6 +644,7 @@ func (c *conn) rowDescriptionFor(stmt *prepared) (*pgproto3.RowDescription, erro
 		Engine: c.deps.Engine,
 		Txn:    txn,
 		Params: dummyParams(stmt.paramTypes),
+		Now:    c.deps.Now,
 	})
 	if err != nil {
 		return nil, err

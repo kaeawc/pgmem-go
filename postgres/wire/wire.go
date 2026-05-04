@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/kaeawc/pgmem-go/catalog"
 	"github.com/kaeawc/pgmem-go/storage"
@@ -22,6 +23,10 @@ import (
 type Deps struct {
 	Schema catalog.Schema
 	Engine storage.Engine
+	// Now is the clock the now() builtin reads. nil means "use the
+	// real wall clock" — the wire layer doesn't fall back to time.Now
+	// itself; that's the builtin's job.
+	Now func() time.Time
 }
 
 // Serve accepts connections on l and spawns a goroutine per connection.

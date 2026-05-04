@@ -46,11 +46,16 @@ type Param struct {
 // Env bundles everything an operator pipeline needs to be built and
 // run. We pass it explicitly rather than storing it on package-level
 // state so a single process can host many isolated servers.
+//
+// Now is the clock the now() builtin reads when set. nil means "use
+// the real wall clock"; tests set this through Server.SetNow to make
+// time deterministic.
 type Env struct {
 	Schema catalog.Schema
 	Engine storage.Engine
 	Txn    storage.Txn
 	Params []Param
+	Now    func() time.Time
 }
 
 // Operator is the runtime instantiation of an ir.Node.
@@ -159,14 +164,14 @@ func buildProject(p *ir.Project, env *Env) (Operator, error) {
 		}
 		cols[i] = Column{Name: name, Type: resolved.Type()}
 	}
-	return &projectOp{in: in, cols: cols, exprs: exprs, params: env.Params}, nil
+	return &projectOp{in: in, cols: cols, exprs: exprs, env: env}, nil
 }
 
 type projectOp struct {
-	in     Operator
-	cols   []Column
-	exprs  []ir.Expr
-	params []Param
+	in    Operator
+	cols  []Column
+	exprs []ir.Expr
+	env   *Env
 }
 
 func (p *projectOp) OutputSchema() []Column { return p.cols }
@@ -179,7 +184,7 @@ func (p *projectOp) Next(ctx context.Context) (Row, error) {
 	}
 	out := make(Row, len(p.exprs))
 	for i, e := range p.exprs {
-		v, err := evalExpr(e, r, p.params)
+		v, err := evalExpr(e, r, p.env)
 		if err != nil {
 			return nil, err
 		}
@@ -197,14 +202,14 @@ func buildValues(p *ir.Values, env *Env) (Operator, error) {
 			cols = append(cols, Column{Name: fmt.Sprintf("column%d", i+1), Type: e.Type()})
 		}
 	}
-	return &valuesOp{rows: p.Rows, cols: cols, params: env.Params}, nil
+	return &valuesOp{rows: p.Rows, cols: cols, env: env}, nil
 }
 
 type valuesOp struct {
-	rows   [][]ir.Expr
-	cols   []Column
-	params []Param
-	pos    int
+	rows [][]ir.Expr
+	cols []Column
+	env  *Env
+	pos  int
 }
 
 func (v *valuesOp) OutputSchema() []Column { return v.cols }
@@ -218,7 +223,7 @@ func (v *valuesOp) Next(_ context.Context) (Row, error) {
 	v.pos++
 	out := make(Row, len(src))
 	for i, e := range src {
-		val, err := evalExpr(e, nil, v.params)
+		val, err := evalExpr(e, nil, v.env)
 		if err != nil {
 			return nil, err
 		}
@@ -238,13 +243,13 @@ func buildFilter(p *ir.Filter, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &filterOp{in: in, cond: cond, params: env.Params}, nil
+	return &filterOp{in: in, cond: cond, env: env}, nil
 }
 
 type filterOp struct {
-	in     Operator
-	cond   ir.Expr
-	params []Param
+	in   Operator
+	cond ir.Expr
+	env  *Env
 }
 
 func (f *filterOp) OutputSchema() []Column { return f.in.OutputSchema() }
@@ -256,7 +261,7 @@ func (f *filterOp) Next(ctx context.Context) (Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		v, err := evalExpr(f.cond, r, f.params)
+		v, err := evalExpr(f.cond, r, f.env)
 		if err != nil {
 			return nil, err
 		}
@@ -308,7 +313,7 @@ func buildJoin(p *ir.Join, env *Env) (Operator, error) {
 		right:    right,
 		cond:     cond,
 		cols:     combined,
-		params:   env.Params,
+		env:      env,
 		joinType: p.Type,
 		rightWid: len(right.OutputSchema()),
 	}, nil
@@ -319,7 +324,7 @@ type joinOp struct {
 	right    Operator
 	cond     ir.Expr
 	cols     []Column
-	params   []Param
+	env      *Env
 	joinType ir.JoinType
 	rightWid int // width of right's row, used to NULL-pad LEFT misses
 
@@ -391,7 +396,7 @@ func (j *joinOp) evalCond(row Row) (bool, error) {
 	if j.cond == nil {
 		return true, nil
 	}
-	v, err := evalExpr(j.cond, row, j.params)
+	v, err := evalExpr(j.cond, row, j.env)
 	if err != nil {
 		return false, err
 	}
@@ -427,25 +432,25 @@ func buildSort(p *ir.Sort, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sortRows(rows, keys, env.Params); err != nil {
+	if err := sortRows(rows, keys, env); err != nil {
 		return nil, err
 	}
 	return &materializedOp{cols: in.OutputSchema(), rows: rows}, nil
 }
 
-func sortRows(rows []Row, keys []ir.SortKey, params []Param) error {
+func sortRows(rows []Row, keys []ir.SortKey, env *Env) error {
 	var sortErr error
 	sort.SliceStable(rows, func(i, j int) bool {
 		if sortErr != nil {
 			return false
 		}
 		for _, k := range keys {
-			a, err := evalExpr(k.Expr, rows[i], params)
+			a, err := evalExpr(k.Expr, rows[i], env)
 			if err != nil {
 				sortErr = err
 				return false
 			}
-			b, err := evalExpr(k.Expr, rows[j], params)
+			b, err := evalExpr(k.Expr, rows[j], env)
 			if err != nil {
 				sortErr = err
 				return false
@@ -488,7 +493,7 @@ func buildLimit(p *ir.Limit, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("OFFSET: %w", err)
 	}
-	return &limitOp{in: in, countExpr: count, offsetExpr: offset, params: env.Params}, nil
+	return &limitOp{in: in, countExpr: count, offsetExpr: offset, env: env}, nil
 }
 
 func resolveOrNil(e ir.Expr, env *Env) (ir.Expr, error) {
@@ -502,7 +507,7 @@ type limitOp struct {
 	in         Operator
 	countExpr  ir.Expr
 	offsetExpr ir.Expr
-	params     []Param
+	env        *Env
 
 	resolved bool
 	limit    int64 // -1 = unbounded
@@ -520,7 +525,7 @@ func (l *limitOp) resolve() error {
 	}
 	l.limit = -1
 	if l.countExpr != nil {
-		v, err := evalExpr(l.countExpr, nil, l.params)
+		v, err := evalExpr(l.countExpr, nil, l.env)
 		if err != nil {
 			return fmt.Errorf("LIMIT: %w", err)
 		}
@@ -531,7 +536,7 @@ func (l *limitOp) resolve() error {
 		l.limit = n
 	}
 	if l.offsetExpr != nil {
-		v, err := evalExpr(l.offsetExpr, nil, l.params)
+		v, err := evalExpr(l.offsetExpr, nil, l.env)
 		if err != nil {
 			return fmt.Errorf("OFFSET: %w", err)
 		}
@@ -689,7 +694,6 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		colMap: colMap,
 		rows:   resolvedRows,
 		env:    env,
-		params: env.Params,
 	}
 	if len(p.Returning) > 0 {
 		// RETURNING expressions see the post-INSERT row, so their column
@@ -751,7 +755,6 @@ type insertOp struct {
 	colMap   []int
 	rows     [][]ir.Expr
 	env      *Env
-	params   []Param // env.Params snapshot, kept for evalExpr brevity
 	done     bool
 	inserted int
 
@@ -795,7 +798,7 @@ func (i *insertOp) runOnce() error {
 	for r, exprRow := range i.rows {
 		row := make(storage.Row, len(i.ct.Columns))
 		for j, e := range exprRow {
-			v, err := evalExpr(e, nil, i.params)
+			v, err := evalExpr(e, nil, i.env)
 			if err != nil {
 				return err
 			}
@@ -825,7 +828,7 @@ func (i *insertOp) runOnce() error {
 		for k, row := range built {
 			out := make(Row, len(i.returning))
 			for j, e := range i.returning {
-				v, err := evalExpr(e, Row(row), i.params)
+				v, err := evalExpr(e, Row(row), i.env)
 				if err != nil {
 					return err
 				}
@@ -1111,7 +1114,7 @@ func checkChecks(ct catalog.Table, rows []storage.Row, env *Env) error {
 			return err
 		}
 		for _, row := range rows {
-			v, err := evalExpr(resolved, Row(row), env.Params)
+			v, err := evalExpr(resolved, Row(row), env)
 			if err != nil {
 				return err
 			}
@@ -1204,7 +1207,7 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 	for i, c := range ct.Columns {
 		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
 	}
-	op := &deleteOp{table: st, ct: ct, env: env, params: env.Params, tableSchema: tableSchema}
+	op := &deleteOp{table: st, ct: ct, env: env, tableSchema: tableSchema}
 	if p.Where != nil {
 		cond, err := resolveExpr(p.Where, tableSchema, env)
 		if err != nil {
@@ -1237,7 +1240,6 @@ type deleteOp struct {
 	tableSchema []Column
 	where       ir.Expr // nil → delete all
 	env         *Env
-	params      []Param
 
 	done    bool
 	deleted int
@@ -1307,7 +1309,7 @@ func (d *deleteOp) runOnce() error {
 		for i, row := range deleted {
 			out := make(Row, len(d.returning))
 			for j, e := range d.returning {
-				v, err := evalExpr(e, Row(row), d.params)
+				v, err := evalExpr(e, Row(row), d.env)
 				if err != nil {
 					return err
 				}
@@ -1323,7 +1325,7 @@ func (d *deleteOp) matches(row storage.Row) (bool, error) {
 	if d.where == nil {
 		return true, nil
 	}
-	v, err := evalExpr(d.where, Row(row), d.params)
+	v, err := evalExpr(d.where, Row(row), d.env)
 	if err != nil {
 		return false, err
 	}
@@ -1349,7 +1351,7 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	for i, c := range ct.Columns {
 		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
 	}
-	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, env: env, params: env.Params}
+	op := &updateOp{table: st, ct: ct, tableSchema: tableSchema, env: env}
 
 	op.assigns = make([]resolvedAssign, len(p.Assignments))
 	for i, a := range p.Assignments {
@@ -1409,7 +1411,6 @@ type updateOp struct {
 	assigns     []resolvedAssign
 	where       ir.Expr
 	env         *Env
-	params      []Param
 
 	done    bool
 	updated int
@@ -1492,7 +1493,7 @@ func (u *updateOp) runOnce() error {
 		for i, row := range updatedRows {
 			out := make(Row, len(u.returning))
 			for j, e := range u.returning {
-				v, err := evalExpr(e, Row(row), u.params)
+				v, err := evalExpr(e, Row(row), u.env)
 				if err != nil {
 					return err
 				}
@@ -1508,7 +1509,7 @@ func (u *updateOp) matches(row storage.Row) (bool, error) {
 	if u.where == nil {
 		return true, nil
 	}
-	v, err := evalExpr(u.where, Row(row), u.params)
+	v, err := evalExpr(u.where, Row(row), u.env)
 	if err != nil {
 		return false, err
 	}
@@ -1522,7 +1523,7 @@ func (u *updateOp) matches(row storage.Row) (bool, error) {
 func (u *updateOp) applyAssignments(orig storage.Row) (storage.Row, error) {
 	out := append(storage.Row(nil), orig...)
 	for _, a := range u.assigns {
-		v, err := evalExpr(a.expr, Row(orig), u.params)
+		v, err := evalExpr(a.expr, Row(orig), u.env)
 		if err != nil {
 			return nil, err
 		}
@@ -1774,7 +1775,7 @@ func evalInSubquery(s *ir.InSubqueryExpr, env *Env) ([]ir.Expr, error) {
 	}
 }
 
-func evalExpr(e ir.Expr, in Row, params []Param) (any, error) {
+func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 	switch x := e.(type) {
 	case *ir.Literal:
 		return x.Value, nil
@@ -1784,18 +1785,19 @@ func evalExpr(e ir.Expr, in Row, params []Param) (any, error) {
 		}
 		return in[x.Index], nil
 	case *ir.ParamRef:
+		params := envParams(env)
 		if x.Index < 0 || x.Index >= len(params) {
 			return nil, fmt.Errorf("exec: $%d not bound", x.Index+1)
 		}
 		return params[x.Index].Value, nil
 	case *ir.BinOp:
-		return evalBinOp(x, in, params)
+		return evalBinOp(x, in, env)
 	case *ir.UnaryOp:
-		return evalUnaryOp(x, in, params)
+		return evalUnaryOp(x, in, env)
 	case *ir.FuncCall:
-		return evalFuncCall(x, in, params)
+		return evalFuncCall(x, in, env)
 	case *ir.InListExpr:
-		return evalInList(x, in, params)
+		return evalInList(x, in, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
@@ -1804,8 +1806,8 @@ func evalExpr(e ir.Expr, in Row, params []Param) (any, error) {
 // evalInList: SQL three-valued IN. NULL probe ⇒ NULL. Probe equal to
 // any non-NULL list value ⇒ TRUE. Probe not equal to any non-NULL value,
 // but at least one NULL in list ⇒ NULL. Otherwise FALSE.
-func evalInList(x *ir.InListExpr, in Row, params []Param) (any, error) {
-	probe, err := evalExpr(x.Probe, in, params)
+func evalInList(x *ir.InListExpr, in Row, env *Env) (any, error) {
+	probe, err := evalExpr(x.Probe, in, env)
 	if err != nil {
 		return nil, err
 	}
@@ -1814,7 +1816,7 @@ func evalInList(x *ir.InListExpr, in Row, params []Param) (any, error) {
 	}
 	sawNull := false
 	for _, e := range x.List {
-		v, err := evalExpr(e, in, params)
+		v, err := evalExpr(e, in, env)
 		if err != nil {
 			return nil, err
 		}
@@ -1840,34 +1842,34 @@ func evalInList(x *ir.InListExpr, in Row, params []Param) (any, error) {
 // against the current row, and dispatches to the registered impl.
 // Errors from the impl bubble up unchanged so SQLError-typed failures
 // (which there aren't any of yet) reach the wire layer.
-func evalFuncCall(f *ir.FuncCall, in Row, params []Param) (any, error) {
+func evalFuncCall(f *ir.FuncCall, in Row, env *Env) (any, error) {
 	fn, err := lookupBuiltin(f.Name)
 	if err != nil {
 		return nil, err
 	}
 	values := make([]any, len(f.Args))
 	for i, a := range f.Args {
-		v, err := evalExpr(a, in, params)
+		v, err := evalExpr(a, in, env)
 		if err != nil {
 			return nil, err
 		}
 		values[i] = v
 	}
-	return fn.Eval(values)
+	return fn.Eval(env, values)
 }
 
-func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
+func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 	switch b.Op {
 	case "and":
-		return evalAnd(b, in, params)
+		return evalAnd(b, in, env)
 	case "or":
-		return evalOr(b, in, params)
+		return evalOr(b, in, env)
 	}
-	l, err := evalExpr(b.Left, in, params)
+	l, err := evalExpr(b.Left, in, env)
 	if err != nil {
 		return nil, err
 	}
-	r, err := evalExpr(b.Right, in, params)
+	r, err := evalExpr(b.Right, in, env)
 	if err != nil {
 		return nil, err
 	}
@@ -1985,15 +1987,15 @@ func evalArith(op string, l, r any, resultT types.Type) (any, error) {
 	return out, nil
 }
 
-func evalAnd(b *ir.BinOp, in Row, params []Param) (any, error) {
-	lv, err := evalExpr(b.Left, in, params)
+func evalAnd(b *ir.BinOp, in Row, env *Env) (any, error) {
+	lv, err := evalExpr(b.Left, in, env)
 	if err != nil {
 		return nil, err
 	}
 	if lb, ok := lv.(bool); ok && !lb {
 		return false, nil
 	}
-	rv, err := evalExpr(b.Right, in, params)
+	rv, err := evalExpr(b.Right, in, env)
 	if err != nil {
 		return nil, err
 	}
@@ -2006,15 +2008,15 @@ func evalAnd(b *ir.BinOp, in Row, params []Param) (any, error) {
 	return true, nil
 }
 
-func evalOr(b *ir.BinOp, in Row, params []Param) (any, error) {
-	lv, err := evalExpr(b.Left, in, params)
+func evalOr(b *ir.BinOp, in Row, env *Env) (any, error) {
+	lv, err := evalExpr(b.Left, in, env)
 	if err != nil {
 		return nil, err
 	}
 	if lb, ok := lv.(bool); ok && lb {
 		return true, nil
 	}
-	rv, err := evalExpr(b.Right, in, params)
+	rv, err := evalExpr(b.Right, in, env)
 	if err != nil {
 		return nil, err
 	}
@@ -2027,8 +2029,8 @@ func evalOr(b *ir.BinOp, in Row, params []Param) (any, error) {
 	return false, nil
 }
 
-func evalUnaryOp(u *ir.UnaryOp, in Row, params []Param) (any, error) {
-	v, err := evalExpr(u.Expr, in, params)
+func evalUnaryOp(u *ir.UnaryOp, in Row, env *Env) (any, error) {
+	v, err := evalExpr(u.Expr, in, env)
 	if err != nil {
 		return nil, err
 	}
