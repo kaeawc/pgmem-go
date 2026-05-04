@@ -36,6 +36,8 @@ const (
 	tRegexI    // ~*
 	tNRegex    // !~
 	tNRegexI   // !~*
+	tContains  // @>
+	tContained // <@
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -191,59 +193,71 @@ func lex(src string) ([]token, error) {
 	i := 0
 	for i < len(src) {
 		c := src[i]
-		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+		switch c {
+		case ' ', '\t', '\n', '\r':
 			i++
-		case c == '-' && i+1 < len(src) && src[i+1] == '-':
-			i = skipLineComment(src, i)
-		case c == '-' && i+2 < len(src) && src[i+1] == '>' && src[i+2] == '>':
-			out = append(out, token{tArrowText, "->>", i})
-			i += 3
-		case c == '-' && i+1 < len(src) && src[i+1] == '>':
-			out = append(out, token{tArrow, "->", i})
-			i += 2
-		case c == '-':
-			out = append(out, token{tMinus, "-", i})
-			i++
-		case c == '<':
+			continue
+		case '-':
+			if i+1 < len(src) && src[i+1] == '-' {
+				i = skipLineComment(src, i)
+				continue
+			}
+			tok, n := lexMinus(src, i)
+			out = append(out, tok)
+			i += n
+			continue
+		case '<':
 			tok, n := lexLt(src, i)
 			out = append(out, tok)
 			i += n
-		case c == '>':
+			continue
+		case '>':
 			tok, n := lexGt(src, i)
 			out = append(out, tok)
 			i += n
-		case c == '!':
+			continue
+		case '!':
 			tok, n, err := lexBang(src, i)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, tok)
 			i += n
-		case c == '~':
-			tok, n := lexTilde(src, i)
-			out = append(out, tok)
-			i += n
-		case c == '|':
-			if i+1 >= len(src) || src[i+1] != '|' {
-				return nil, fmt.Errorf("lex: stray '|' at %d (expected ||)", i)
-			}
-			out = append(out, token{tConcat, "||", i})
-			i += 2
-		case c == ':':
-			if i+1 >= len(src) || src[i+1] != ':' {
-				return nil, fmt.Errorf("lex: stray ':' at %d (expected ::)", i)
-			}
-			out = append(out, token{tCast, "::", i})
-			i += 2
-		default:
-			tok, n, err := lexDefault(src, i)
+			continue
+		case '@':
+			tok, n, err := lexAt(src, i)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, tok)
 			i += n
+			continue
+		case '~':
+			tok, n := lexTilde(src, i)
+			out = append(out, tok)
+			i += n
+			continue
+		case '|':
+			if i+1 >= len(src) || src[i+1] != '|' {
+				return nil, fmt.Errorf("lex: stray '|' at %d (expected ||)", i)
+			}
+			out = append(out, token{tConcat, "||", i})
+			i += 2
+			continue
+		case ':':
+			if i+1 >= len(src) || src[i+1] != ':' {
+				return nil, fmt.Errorf("lex: stray ':' at %d (expected ::)", i)
+			}
+			out = append(out, token{tCast, "::", i})
+			i += 2
+			continue
 		}
+		tok, n, err := lexDefault(src, i)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, tok)
+		i += n
 	}
 	out = append(out, token{tEOF, "", len(src)})
 	return out, nil
@@ -283,6 +297,23 @@ func skipLineComment(src string, i int) int {
 	return i
 }
 
+func lexMinus(src string, i int) (token, int) {
+	if i+2 < len(src) && src[i+1] == '>' && src[i+2] == '>' {
+		return token{tArrowText, "->>", i}, 3
+	}
+	if i+1 < len(src) && src[i+1] == '>' {
+		return token{tArrow, "->", i}, 2
+	}
+	return token{tMinus, "-", i}, 1
+}
+
+func lexAt(src string, i int) (token, int, error) {
+	if i+1 < len(src) && src[i+1] == '>' {
+		return token{tContains, "@>", i}, 2, nil
+	}
+	return token{}, 0, fmt.Errorf("lex: stray '@' at %d", i)
+}
+
 func lexBang(src string, i int) (token, int, error) {
 	switch {
 	case i+1 < len(src) && src[i+1] == '=':
@@ -309,6 +340,8 @@ func lexLt(src string, i int) (token, int) {
 			return token{tLte, "<=", i}, 2
 		case '>':
 			return token{tNeq, "<>", i}, 2
+		case '@':
+			return token{tContained, "<@", i}, 2
 		}
 	}
 	return token{tLt, "<", i}, 1
