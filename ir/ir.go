@@ -95,6 +95,29 @@ type Limit struct {
 
 func (*Limit) node() {}
 
+// AggregateCall is one entry in an Aggregate node's Calls slice.
+//
+//	Func — lower-case name (count, sum, min, max, avg).
+//	Arg  — the argument expression, or nil for COUNT(*).
+//	Output — the result column name in the Aggregate's output schema.
+type AggregateCall struct {
+	Func   string
+	Arg    Expr
+	Output string
+}
+
+// Aggregate computes whole-input aggregation: it drains Input, runs
+// each Calls[i] over the rows, and emits exactly one output row whose
+// columns are the Calls' results in order. GROUP BY is a follow-up;
+// without it Aggregate is the only shape that produces a row even when
+// the input is empty (COUNT yields 0; MIN/MAX/SUM/AVG yield NULL).
+type Aggregate struct {
+	Input Node
+	Calls []AggregateCall
+}
+
+func (*Aggregate) node() {}
+
 // --- DDL / DML ---
 
 // CreateTable declares a new table in the catalog and storage.
@@ -298,10 +321,15 @@ func (c *Cast) Type() types.Type { return c.T }
 // coalesce(), …). Name is lower-cased by the parser. Type is filled in
 // at exec.Build time from the function registry — the parser doesn't
 // know what each builtin returns.
+//
+// Star is the count(*) marker. Aggregate-aware planning checks it to
+// turn a FuncCall into an AggregateCall. For non-aggregate builtins
+// Star is always false and the executor treats Star as an arity error.
 type FuncCall struct {
 	Name string
 	Args []Expr
 	T    types.Type
+	Star bool
 }
 
 func (*FuncCall) expr()              {}

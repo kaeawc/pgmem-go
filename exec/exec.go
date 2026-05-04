@@ -93,6 +93,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildDelete(p, env)
 	case *ir.Update:
 		return buildUpdate(p, env)
+	case *ir.Aggregate:
+		return buildAggregate(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
