@@ -53,6 +53,58 @@ var builtins = map[string]builtinFunc{
 		ResultType: oneArg(types.Text),
 		Eval:       evalUnaryString(strings.ToUpper),
 	},
+	"coalesce": {
+		// PG resolves COALESCE's result type to the common element type
+		// of its arguments. For our subset we take args[0].Type() and
+		// require subsequent args to share it (or be untyped NULL with
+		// a nil Type) — sqlc-generated calls always have homogeneous
+		// argument types.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) == 0 {
+				return nil, fmt.Errorf("coalesce: no arguments")
+			}
+			return firstNonNilType(args), nil
+		},
+		Eval: func(args []any) (any, error) {
+			for _, a := range args {
+				if a != nil {
+					return a, nil
+				}
+			}
+			return nil, nil
+		},
+	},
+	"nullif": {
+		// NULLIF(a, b) returns NULL if a == b else a, with the result
+		// type of a.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("nullif: takes 2 arguments, got %d", len(args))
+			}
+			t := args[0].Type()
+			if t == nil {
+				t = args[1].Type()
+			}
+			if t == nil {
+				t = types.Text
+			}
+			return t, nil
+		},
+		Eval: func(args []any) (any, error) {
+			a, b := args[0], args[1]
+			if a == nil || b == nil {
+				return a, nil
+			}
+			cmp, err := compareForEquality(a, b)
+			if err != nil {
+				return nil, err
+			}
+			if cmp {
+				return nil, nil
+			}
+			return a, nil
+		},
+	},
 	"length": {
 		ResultType: oneArg(types.Int4),
 		// PG length() on text returns int (int4) and counts characters
@@ -69,6 +121,30 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(s))), nil
 		},
 	},
+}
+
+// firstNonNilType returns the first arg's non-nil Type, falling back
+// to text if every arg is an untyped NULL literal. PG would error in
+// that case ("could not determine data type"); we pick a defensible
+// stand-in so the wire layer doesn't crash on a nil OID lookup.
+func firstNonNilType(args []ir.Expr) types.Type {
+	for _, a := range args {
+		if t := a.Type(); t != nil {
+			return t
+		}
+	}
+	return types.Text
+}
+
+// compareForEquality is a thin wrapper around exec.compareValues that
+// returns true iff the two values compare equal. Both are guaranteed
+// non-nil by the caller.
+func compareForEquality(a, b any) (bool, error) {
+	cmp, err := compareValues(a, b)
+	if err != nil {
+		return false, err
+	}
+	return cmp == 0, nil
 }
 
 // oneArg is a ResultType for fixed-1-arg functions returning t.
