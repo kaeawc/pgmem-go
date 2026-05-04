@@ -15,6 +15,13 @@ import (
 type parser struct {
 	toks []token
 	pos  int
+	// ctes maps a Common Table Expression name (lower-case) to its
+	// plan. Entries are added by parseWith and consulted by
+	// parseTableRef when it sees a name that isn't a real catalog
+	// table. CTE scope is statement-wide for now: nested SELECTs see
+	// the outer WITH's bindings, which matches PG for non-recursive
+	// CTEs in the common case.
+	ctes map[string]ir.Node
 }
 
 func (p *parser) peek() token { return p.toks[p.pos] }
@@ -62,6 +69,9 @@ func (p *parser) expect(k tokenKind, ctx string) (token, error) {
 
 func (p *parser) parseStmt() (ir.Node, error) {
 	tok := p.peek()
+	if tok.kind == kwWith {
+		return p.parseWith()
+	}
 	switch tok.kind {
 	case kwSelect:
 		return p.parseSelectMaybeUnion()
@@ -145,6 +155,9 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 	t, err := p.expect(tIdent, "table name")
 	if err != nil {
 		return nil, err
+	}
+	if plan, ok := p.ctes[strings.ToLower(t.val)]; ok {
+		return plan, nil
 	}
 	return &ir.Scan{Table: t.val}, nil
 }
@@ -509,6 +522,57 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 }
 
 // --- SELECT ---
+
+// parseWith consumes `WITH name AS (SELECT ...)[, ...] <stmt>` —
+// non-recursive CTEs only. Each CTE plan is registered with the
+// parser before the body statement parses, so its FROM clause can
+// resolve CTE names. Later CTEs see earlier ones (PG-style lexical
+// scoping).
+func (p *parser) parseWith() (ir.Node, error) {
+	p.consume() // WITH
+	if p.ctes == nil {
+		p.ctes = map[string]ir.Node{}
+	}
+	for {
+		name, err := p.expect(tIdent, "CTE name")
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(kwAs, "AS"); err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tLParen, "("); err != nil {
+			return nil, err
+		}
+		plan, err := p.parseSelectMaybeUnion()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tRParen, ")"); err != nil {
+			return nil, err
+		}
+		key := strings.ToLower(name.val)
+		if _, dup := p.ctes[key]; dup {
+			return nil, fmt.Errorf("parse: duplicate CTE name %q", name.val)
+		}
+		p.ctes[key] = plan
+		if !p.accept(tComma) {
+			break
+		}
+	}
+	switch p.peek().kind {
+	case kwSelect:
+		return p.parseSelectMaybeUnion()
+	case kwInsert:
+		return p.parseInsert()
+	case kwUpdate:
+		return p.parseUpdate()
+	case kwDelete:
+		return p.parseDelete()
+	default:
+		return nil, fmt.Errorf("parse: expected SELECT/INSERT/UPDATE/DELETE after WITH at %d", p.peek().pos)
+	}
+}
 
 // parseSelectMaybeUnion parses a SELECT, then any chain of
 // `UNION [ALL] SELECT ...`. Members are left-associated: the first
