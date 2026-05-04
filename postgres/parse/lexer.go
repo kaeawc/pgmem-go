@@ -79,6 +79,8 @@ const (
 	kwDrop
 	kwIf
 	kwExists
+	kwGroup
+	kwHaving
 )
 
 type token struct {
@@ -130,6 +132,8 @@ var keywords = map[string]tokenKind{
 	"drop":       kwDrop,
 	"if":         kwIf,
 	"exists":     kwExists,
+	"group":      kwGroup,
+	"having":     kwHaving,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

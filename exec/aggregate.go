@@ -5,16 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/types"
 )
 
-// buildAggregate compiles an Aggregate IR node. We resolve each call's
-// argument against the input schema (so column refs see the underlying
-// row layout) and dispatch by name to a specific accumulator factory.
+// buildAggregate compiles an Aggregate IR node.
 //
-// Result types:
+//   - Scalar (no GroupBy): one accumulator per call, single output row.
+//   - Grouped: input rows hash by tuple of GroupBy values; per group
+//     we keep a fresh set of accumulators. Output schema is
+//     [groupKey…, aggCall…] in that order; the planning Project
+//     wraps Aggregate to surface that to the user's SELECT list.
+//
+// Result types of aggregates:
 //
 //	COUNT     → int8 (PG's bigint, matches what pgx scans into int64)
 //	SUM(int4) → int8 ; SUM(int8) → int8
@@ -27,30 +32,70 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 	}
 	inSchema := in.OutputSchema()
 
-	cols := make([]Column, len(p.Calls))
-	accs := make([]aggAcc, len(p.Calls))
+	groupKeys := make([]ir.Expr, len(p.GroupBy))
+	groupCols := make([]Column, len(p.GroupBy))
+	for i, e := range p.GroupBy {
+		resolved, err := resolveExpr(e, inSchema, env)
+		if err != nil {
+			in.Close()
+			return nil, err
+		}
+		groupKeys[i] = resolved
+		// Group output columns inherit the original column name and type
+		// so the planning Project can rewire them by name.
+		c := e.(*ir.ColumnRef)
+		groupCols[i] = Column{Qualifier: c.Qualifier, Name: c.Name, Type: resolved.Type()}
+	}
+
+	resolvedArgs := make([]ir.Expr, len(p.Calls))
 	for i, call := range p.Calls {
-		var arg ir.Expr
 		if call.Arg != nil {
-			arg, err = resolveExpr(call.Arg, inSchema, env)
+			resolvedArgs[i], err = resolveExpr(call.Arg, inSchema, env)
 			if err != nil {
 				in.Close()
 				return nil, err
 			}
 		}
-		acc, err := newAggregator(call.Func, arg)
+	}
+	// Probe accumulator types via a throwaway accumulator set — the
+	// real per-group accs are constructed lazily during Next.
+	probe, err := newAccumulatorSet(p.Calls, resolvedArgs)
+	if err != nil {
+		in.Close()
+		return nil, err
+	}
+	aggCols := make([]Column, len(p.Calls))
+	for i := range p.Calls {
+		name := p.Calls[i].Output
+		if name == "" {
+			name = p.Calls[i].Func
+		}
+		aggCols[i] = Column{Name: name, Type: probe[i].resultType()}
+	}
+
+	cols := append(groupCols, aggCols...)
+	return &aggregateOp{
+		in:        in,
+		calls:     p.Calls,
+		callArgs:  resolvedArgs,
+		groupKeys: groupKeys,
+		cols:      cols,
+		env:       env,
+	}, nil
+}
+
+// newAccumulatorSet builds one accumulator per call. resolvedArgs is
+// parallel to calls; nil entries correspond to COUNT(*).
+func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs []ir.Expr) ([]aggAcc, error) {
+	out := make([]aggAcc, len(calls))
+	for i, call := range calls {
+		acc, err := newAggregator(call.Func, resolvedArgs[i])
 		if err != nil {
-			in.Close()
 			return nil, err
 		}
-		accs[i] = acc
-		name := call.Output
-		if name == "" {
-			name = call.Func
-		}
-		cols[i] = Column{Name: name, Type: acc.resultType()}
+		out[i] = acc
 	}
-	return &aggregateOp{in: in, accs: accs, cols: cols, env: env}, nil
+	return out, nil
 }
 
 // aggAcc abstracts an accumulator: feed rows in, get the result row.
@@ -62,45 +107,140 @@ type aggAcc interface {
 }
 
 type aggregateOp struct {
-	in   Operator
-	accs []aggAcc
-	cols []Column
-	env  *Env
+	in        Operator
+	calls     []ir.AggregateCall
+	callArgs  []ir.Expr // parallel to calls; nil for COUNT(*)
+	groupKeys []ir.Expr // resolved against input schema; empty for scalar agg
+	cols      []Column
+	env       *Env
 
-	done bool
+	// Lazy state: filled on first Next, drained over subsequent Next
+	// calls. For scalar aggregation pending has exactly one entry; for
+	// grouped aggregation it's keyed by the tuple of groupKey values
+	// stringified through uniqueKey.
+	ran     bool
+	pending []Row
+	pos     int
 }
 
 func (a *aggregateOp) OutputSchema() []Column { return a.cols }
 func (a *aggregateOp) Close() error           { return a.in.Close() }
 
 func (a *aggregateOp) Next(ctx context.Context) (Row, error) {
-	if a.done {
+	_ = ctx
+	if !a.ran {
+		if err := a.runOnce(); err != nil {
+			return nil, err
+		}
+	}
+	if a.pos >= len(a.pending) {
 		return nil, io.EOF
 	}
-	a.done = true
+	r := a.pending[a.pos]
+	a.pos++
+	return r, nil
+}
+
+// runOnce drains the input, partitions by the group key tuple, and
+// computes one output row per group (or one row total when there's no
+// GROUP BY — that's the scalar-aggregate case where we still emit a
+// row even if input was empty).
+func (a *aggregateOp) runOnce() error {
+	a.ran = true
+	type bucket struct {
+		keys []any // values of the GROUP BY exprs for this group
+		accs []aggAcc
+	}
+	groups := map[string]*bucket{}
+	order := []string{} // preserve insertion order for stable output
+
+	getOrCreate := func(key string, keys []any) (*bucket, error) {
+		if b, ok := groups[key]; ok {
+			return b, nil
+		}
+		accs, err := newAccumulatorSet(a.calls, a.callArgs)
+		if err != nil {
+			return nil, err
+		}
+		b := &bucket{keys: keys, accs: accs}
+		groups[key] = b
+		order = append(order, key)
+		return b, nil
+	}
+
+	ctx := context.Background()
 	for {
 		row, err := a.in.Next(ctx)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for _, acc := range a.accs {
+		keys := make([]any, len(a.groupKeys))
+		for i, e := range a.groupKeys {
+			v, err := evalExpr(e, row, a.env)
+			if err != nil {
+				return err
+			}
+			keys[i] = v
+		}
+		b, err := getOrCreate(groupKeyString(keys), keys)
+		if err != nil {
+			return err
+		}
+		for _, acc := range b.accs {
 			if err := acc.accept(row, a.env); err != nil {
-				return nil, err
+				return err
 			}
 		}
 	}
-	out := make(Row, len(a.accs))
-	for i, acc := range a.accs {
-		v, err := acc.result()
+
+	// Scalar aggregate (no GROUP BY): always emit a single row, even
+	// when the input was empty — matches PG's COUNT-on-empty-table = 0.
+	if len(a.groupKeys) == 0 && len(groups) == 0 {
+		accs, err := newAccumulatorSet(a.calls, a.callArgs)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		out[i] = v
+		groups[""] = &bucket{accs: accs}
+		order = append(order, "")
 	}
-	return out, nil
+
+	a.pending = make([]Row, 0, len(order))
+	for _, k := range order {
+		b := groups[k]
+		out := make(Row, 0, len(b.keys)+len(b.accs))
+		out = append(out, b.keys...)
+		for _, acc := range b.accs {
+			v, err := acc.result()
+			if err != nil {
+				return err
+			}
+			out = append(out, v)
+		}
+		a.pending = append(a.pending, out)
+	}
+	return nil
+}
+
+// groupKeyString produces a stable string key for a tuple of group
+// values, using the same uniqueKey-style typing the unique constraint
+// already relies on.
+func groupKeyString(vals []any) string {
+	if len(vals) == 0 {
+		return ""
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		if v == nil {
+			parts[i] = "<null>"
+			continue
+		}
+		parts[i] = uniqueKey(v)
+	}
+	// Use a separator unlikely to collide with type-prefixed payloads.
+	return strings.Join(parts, "\x00")
 }
 
 func newAggregator(name string, arg ir.Expr) (aggAcc, error) {
