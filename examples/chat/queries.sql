@@ -33,14 +33,11 @@ ORDER BY sent_at DESC
 LIMIT $2 OFFSET $3;
 
 -- name: SubscribedRooms :many
--- The natural shape here is `WHERE EXISTS (SELECT 1 FROM
--- subscriptions WHERE user_id = $1 AND room_id = r.id)`, but
--- pgmem-go's EXISTS is uncorrelated only — the inner query can't
--- reference the outer row. A DISTINCT join produces the same
--- result and exercises JOIN + DISTINCT instead.
-SELECT DISTINCT r.id, r.name FROM rooms r
-JOIN subscriptions s ON s.room_id = r.id
-WHERE s.user_id = $1
+SELECT r.id, r.name FROM rooms r
+WHERE EXISTS (
+    SELECT 1 FROM subscriptions s
+    WHERE s.user_id = $1 AND s.room_id = r.id
+)
 ORDER BY r.name;
 
 -- name: ReplyThread :many
