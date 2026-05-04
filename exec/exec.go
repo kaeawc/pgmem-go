@@ -127,6 +127,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildWindow(p, env)
 	case *ir.Unnest:
 		return buildUnnest(p, env)
+	case *ir.GenerateSeries:
+		return buildGenerateSeries(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -899,6 +901,86 @@ func buildUnnest(p *ir.Unnest, env *Env) (Operator, error) {
 	}
 	cols := []Column{{Qualifier: p.Alias, Name: p.Alias, Type: colType}}
 	return &materializedOp{cols: cols, rows: rows}, nil
+}
+
+// --- GenerateSeries ---
+
+// buildGenerateSeries materialises rows for `generate_series(start,
+// stop[, step])`. All three args are evaluated once at build time
+// (parameters are bound by then). The output column type matches
+// the widest argument type — int8 if any arg is int8, else int4.
+// Step defaults to 1 when omitted; a zero step is rejected (PG
+// raises 22023). Empty results when the range can't progress.
+func buildGenerateSeries(p *ir.GenerateSeries, env *Env) (Operator, error) {
+	start, err := evalIntArg(p.Start, env)
+	if err != nil {
+		return nil, fmt.Errorf("generate_series: start: %w", err)
+	}
+	stop, err := evalIntArg(p.Stop, env)
+	if err != nil {
+		return nil, fmt.Errorf("generate_series: stop: %w", err)
+	}
+	step := int64(1)
+	stepWide := false
+	if p.Step != nil {
+		s, err := evalIntArg(p.Step, env)
+		if err != nil {
+			return nil, fmt.Errorf("generate_series: step: %w", err)
+		}
+		step = s.v
+		stepWide = s.wide
+		if step == 0 {
+			return nil, &SQLError{Code: "22023", Message: "step size cannot equal zero"}
+		}
+	}
+	wide := start.wide || stop.wide || stepWide
+	colType := types.Int4
+	if wide {
+		colType = types.Int8
+	}
+	var rows []Row
+	if step > 0 {
+		for v := start.v; v <= stop.v; v += step {
+			rows = append(rows, gsRow(v, wide))
+		}
+	} else {
+		for v := start.v; v >= stop.v; v += step {
+			rows = append(rows, gsRow(v, wide))
+		}
+	}
+	cols := []Column{{Qualifier: p.Alias, Name: "generate_series", Type: colType}}
+	return &materializedOp{cols: cols, rows: rows}, nil
+}
+
+type intArg struct {
+	v    int64
+	wide bool // true when the source was int64 / int8
+}
+
+func evalIntArg(e ir.Expr, env *Env) (intArg, error) {
+	resolved, err := resolveExpr(e, nil, env)
+	if err != nil {
+		return intArg{}, err
+	}
+	v, err := evalExpr(resolved, nil, env)
+	if err != nil {
+		return intArg{}, err
+	}
+	switch x := v.(type) {
+	case int32:
+		return intArg{v: int64(x), wide: false}, nil
+	case int64:
+		return intArg{v: x, wide: true}, nil
+	default:
+		return intArg{}, fmt.Errorf("expected integer, got %T", v)
+	}
+}
+
+func gsRow(v int64, wide bool) Row {
+	if wide {
+		return Row{v}
+	}
+	return Row{int32(v)}
 }
 
 // --- SubqueryAlias ---

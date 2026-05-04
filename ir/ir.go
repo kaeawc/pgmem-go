@@ -52,6 +52,22 @@ type Unnest struct {
 
 func (*Unnest) node() {}
 
+// GenerateSeries is the table-valued form `generate_series(start,
+// stop[, step]) [AS alias]`. One row per integer in the inclusive
+// range [start, stop] stepping by Step (default 1). Step may be
+// negative; if Start > Stop with positive Step, the result is
+// empty (matches PG). The output schema has a single column named
+// after the alias (default "generate_series") whose type matches
+// the argument type (int8 by default).
+type GenerateSeries struct {
+	Start Expr
+	Stop  Expr
+	Step  Expr // optional; nil means 1
+	Alias string
+}
+
+func (*GenerateSeries) node() {}
+
 // SubqueryAlias wraps an inline SELECT used in a FROM clause:
 //
 //	FROM (SELECT ...) sub
