@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strconv"
+	"time"
 )
 
 // Type identifies a value's logical type and supplies wire-format
@@ -301,6 +302,91 @@ func uuidParse(s string) ([16]byte, error) {
 	return out, nil
 }
 
+// Timestamptz is PG `timestamp with time zone` (OID 1184). PG's binary
+// format is microseconds since the 2000-01-01 UTC epoch as a big-endian
+// signed int64. The text format we emit is the canonical
+// "YYYY-MM-DD HH:MM:SS.ffffff±HH" PG produces. Internally we hold the
+// value as time.Time so Go callers can use it directly.
+var Timestamptz Type = &timestamptzType{}
+
+type timestamptzType struct{}
+
+// pgEpoch is 2000-01-01 00:00:00 UTC. PG's binary timestamp is the
+// microsecond offset from this point.
+var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+func (*timestamptzType) Name() string { return "timestamptz" }
+func (*timestamptzType) OID() uint32  { return 1184 }
+func (*timestamptzType) Size() int16  { return 8 }
+
+func (*timestamptzType) EncodeText(v any) ([]byte, error) {
+	t, err := asTime(v)
+	if err != nil {
+		return nil, fmt.Errorf("timestamptz EncodeText: %w", err)
+	}
+	return []byte(t.UTC().Format("2006-01-02 15:04:05.999999-07")), nil
+}
+
+func (*timestamptzType) EncodeBinary(v any) ([]byte, error) {
+	t, err := asTime(v)
+	if err != nil {
+		return nil, fmt.Errorf("timestamptz EncodeBinary: %w", err)
+	}
+	micros := t.UTC().Sub(pgEpoch).Microseconds()
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(micros))
+	return b, nil
+}
+
+// timestampLayouts is the (small) set of input formats we accept. PG
+// accepts more (extended ISO etc.); these cover what pgx normally
+// produces for text-format binds.
+var timestampLayouts = []string{
+	"2006-01-02 15:04:05.999999-07",
+	"2006-01-02 15:04:05.999999Z07:00",
+	"2006-01-02 15:04:05.999999",
+	"2006-01-02 15:04:05Z07:00",
+	"2006-01-02 15:04:05",
+	time.RFC3339Nano,
+	time.RFC3339,
+}
+
+func (*timestamptzType) DecodeText(b []byte) (any, error) {
+	s := string(b)
+	for _, layout := range timestampLayouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.UTC(), nil
+		}
+	}
+	return nil, fmt.Errorf("timestamptz DecodeText: unrecognized format %q", s)
+}
+
+func (*timestamptzType) DecodeBinary(b []byte) (any, error) {
+	if len(b) != 8 {
+		return nil, fmt.Errorf("timestamptz DecodeBinary: want 8 bytes, got %d", len(b))
+	}
+	micros := int64(binary.BigEndian.Uint64(b))
+	return pgEpoch.Add(time.Duration(micros) * time.Microsecond).UTC(), nil
+}
+
+// asTime normalizes the accepted Go forms (time.Time or string) into a
+// time.Time in UTC.
+func asTime(v any) (time.Time, error) {
+	switch x := v.(type) {
+	case time.Time:
+		return x, nil
+	case string:
+		for _, layout := range timestampLayouts {
+			if t, err := time.Parse(layout, x); err == nil {
+				return t, nil
+			}
+		}
+		return time.Time{}, fmt.Errorf("unrecognized time string %q", x)
+	default:
+		return time.Time{}, fmt.Errorf("unsupported %T", v)
+	}
+}
+
 // ByOID looks up one of the supported PG types by OID. The dialect
 // Registry supersedes this once it lands; until then this is the only
 // lookup path the wire layer needs.
@@ -314,6 +400,8 @@ func ByOID(oid uint32) (Type, bool) {
 		return Int4, true
 	case 25:
 		return Text, true
+	case 1184:
+		return Timestamptz, true
 	case 2950:
 		return UUID, true
 	default:
@@ -335,6 +423,8 @@ func ByName(name string) (Type, bool) {
 		return Bool, true
 	case "uuid":
 		return UUID, true
+	case "timestamptz":
+		return Timestamptz, true
 	default:
 		return nil, false
 	}
