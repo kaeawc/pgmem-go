@@ -1787,9 +1787,54 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.Cast{Expr: inner, T: x.T}, nil
+	case *ir.Case:
+		return resolveCase(x, schema, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// resolveCase recurses into the operand, every WHEN/THEN, and the
+// optional ELSE. The result type is taken from the first non-nil-typed
+// THEN — matching real PG's "first known type wins" rule for CASE
+// branches that mix in NULLs.
+func resolveCase(c *ir.Case, schema []Column, env *Env) (ir.Expr, error) {
+	var operand ir.Expr
+	if c.Operand != nil {
+		op, err := resolveExpr(c.Operand, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		operand = op
+	}
+	whens := make([]ir.CaseWhen, len(c.Whens))
+	var resultT types.Type
+	for i, w := range c.Whens {
+		match, err := resolveExpr(w.Match, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		result, err := resolveExpr(w.Result, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		whens[i] = ir.CaseWhen{Match: match, Result: result}
+		if resultT == nil {
+			resultT = result.Type()
+		}
+	}
+	var elseExpr ir.Expr
+	if c.Else != nil {
+		r, err := resolveExpr(c.Else, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		elseExpr = r
+		if resultT == nil {
+			resultT = r.Type()
+		}
+	}
+	return &ir.Case{Operand: operand, Whens: whens, Else: elseExpr, T: resultT}, nil
 }
 
 func envParams(env *Env) []Param {
@@ -1896,9 +1941,61 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 			return nil, err
 		}
 		return castValue(v, x.T)
+	case *ir.Case:
+		return evalCase(x, in, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalCase walks the WHEN branches in order and returns the first
+// matching THEN. For the simple form (Operand non-nil) the Match
+// expression is compared to Operand for equality (NULL = anything is
+// NULL, so those branches don't match). For the searched form (Operand
+// nil) the Match must evaluate to true. Falls through to ELSE; if no
+// branch matches and there is no ELSE the result is NULL.
+func evalCase(c *ir.Case, in Row, env *Env) (any, error) {
+	var operand any
+	if c.Operand != nil {
+		v, err := evalExpr(c.Operand, in, env)
+		if err != nil {
+			return nil, err
+		}
+		operand = v
+	}
+	for _, w := range c.Whens {
+		match, err := evalExpr(w.Match, in, env)
+		if err != nil {
+			return nil, err
+		}
+		if c.Operand != nil {
+			if operand == nil || match == nil {
+				continue
+			}
+			cmp, err := compareValues(operand, match)
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				return evalExpr(w.Result, in, env)
+			}
+			continue
+		}
+		b, ok := match.(bool)
+		if !ok {
+			if match == nil {
+				continue
+			}
+			return nil, fmt.Errorf("exec: CASE WHEN condition must be bool, got %T", match)
+		}
+		if b {
+			return evalExpr(w.Result, in, env)
+		}
+	}
+	if c.Else != nil {
+		return evalExpr(c.Else, in, env)
+	}
+	return nil, nil
 }
 
 // castValue implements the small slice of PG's cast lattice we care

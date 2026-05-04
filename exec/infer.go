@@ -281,6 +281,27 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 		// as the expected type — exactly the case sqlc-generated NULL
 		// inputs use to disambiguate untyped parameters.
 		walkExprParams(x.Expr, x.T, sch, scopeTable, hint, maxIdx)
+	case *ir.Case:
+		// Operand and the WHEN match expressions are compared, so each
+		// match takes the operand's type as the expected hint and vice
+		// versa (for the simple form). For the searched form WHEN must
+		// be bool.
+		var operandT types.Type
+		if x.Operand != nil {
+			walkExprParams(x.Operand, nil, sch, scopeTable, hint, maxIdx)
+			operandT = exprStaticType(x.Operand, sch, scopeTable)
+		}
+		for _, w := range x.Whens {
+			matchExpected := operandT
+			if x.Operand == nil {
+				matchExpected = types.Bool
+			}
+			walkExprParams(w.Match, matchExpected, sch, scopeTable, hint, maxIdx)
+			walkExprParams(w.Result, expected, sch, scopeTable, hint, maxIdx)
+		}
+		if x.Else != nil {
+			walkExprParams(x.Else, expected, sch, scopeTable, hint, maxIdx)
+		}
 	case *ir.Literal, nil:
 		// nothing to record.
 	case *ir.ColumnRef:
@@ -314,6 +335,8 @@ func exprStaticType(e ir.Expr, sch catalog.Schema, scopeTable string) types.Type
 	case *ir.BinOp:
 		return x.T
 	case *ir.UnaryOp:
+		return x.T
+	case *ir.Case:
 		return x.T
 	case *ir.ParamRef:
 		return x.T

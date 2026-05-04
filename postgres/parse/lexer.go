@@ -86,6 +86,11 @@ const (
 	kwIlike
 	kwIs
 	kwBetween
+	kwCase
+	kwWhen
+	kwThen
+	kwElse
+	kwEnd
 )
 
 type token struct {
@@ -144,6 +149,11 @@ var keywords = map[string]tokenKind{
 	"ilike":      kwIlike,
 	"is":         kwIs,
 	"between":    kwBetween,
+	"case":       kwCase,
+	"when":       kwWhen,
+	"then":       kwThen,
+	"else":       kwElse,
+	"end":        kwEnd,
 }
 
 // lex turns SQL into a token stream. We tokenize eagerly; the input is

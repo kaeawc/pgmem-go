@@ -123,6 +123,52 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	return left, nil
 }
 
+// parseCase consumes a `CASE [operand] WHEN ... THEN ... [ELSE ...] END`
+// expression. Both forms share the same IR shape: Operand is nil for
+// the searched form; for the simple form it's the value compared
+// against each WHEN.
+func (p *parser) parseCase() (ir.Expr, error) {
+	p.consume() // CASE
+	var operand ir.Expr
+	if p.peek().kind != kwWhen {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		operand = e
+	}
+	if p.peek().kind != kwWhen {
+		return nil, fmt.Errorf("parse: expected WHEN in CASE at %d", p.peek().pos)
+	}
+	var whens []ir.CaseWhen
+	for p.accept(kwWhen) {
+		match, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.accept(kwThen) {
+			return nil, fmt.Errorf("parse: expected THEN in CASE at %d", p.peek().pos)
+		}
+		result, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		whens = append(whens, ir.CaseWhen{Match: match, Result: result})
+	}
+	var elseExpr ir.Expr
+	if p.accept(kwElse) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		elseExpr = e
+	}
+	if !p.accept(kwEnd) {
+		return nil, fmt.Errorf("parse: expected END to close CASE at %d", p.peek().pos)
+	}
+	return &ir.Case{Operand: operand, Whens: whens, Else: elseExpr}, nil
+}
+
 // parseBetween desugars `x BETWEEN a AND b` into `x >= a AND x <= b`,
 // and `x NOT BETWEEN a AND b` into `x < a OR x > b`. The bounds are
 // parsed at parseAdditive precedence so the inner AND is the keyword
@@ -369,6 +415,8 @@ func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 	case kwNull:
 		p.consume()
 		return &ir.Literal{Value: nil, T: nil}, nil
+	case kwCase:
+		return p.parseCase()
 	case tParam:
 		p.consume()
 		idx, err := strconv.Atoi(t.val)
