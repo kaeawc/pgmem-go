@@ -115,6 +115,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildSubqueryAlias(p, env)
 	case *ir.Window:
 		return buildWindow(p, env)
+	case *ir.Unnest:
+		return buildUnnest(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -741,6 +743,54 @@ func orderKeysString(keys []ir.SortKey, in Row, env *Env) (string, error) {
 		parts[i] = uniqueKey(v)
 	}
 	return strings.Join(parts, "\x00"), nil
+}
+
+// --- Unnest ---
+
+// buildUnnest evaluates the array expression once at build time
+// (parameters are bound by then) and returns a materialised operator
+// that yields one row per element. The output schema has a single
+// column named after the alias whose type is the array's element
+// type.
+func buildUnnest(p *ir.Unnest, env *Env) (Operator, error) {
+	resolved, err := resolveExpr(p.Array, nil, env)
+	if err != nil {
+		return nil, err
+	}
+	v, err := evalExpr(resolved, nil, env)
+	if err != nil {
+		return nil, err
+	}
+	var (
+		rows    []Row
+		colType types.Type
+	)
+	switch arr := v.(type) {
+	case []int64:
+		rows = make([]Row, len(arr))
+		for i, n := range arr {
+			rows[i] = Row{n}
+		}
+		colType = types.Int8
+	case []int32:
+		rows = make([]Row, len(arr))
+		for i, n := range arr {
+			rows[i] = Row{n}
+		}
+		colType = types.Int4
+	case []string:
+		rows = make([]Row, len(arr))
+		for i, s := range arr {
+			rows[i] = Row{s}
+		}
+		colType = types.Text
+	case nil:
+		colType = types.Text
+	default:
+		return nil, fmt.Errorf("exec: unnest: unsupported array type %T", v)
+	}
+	cols := []Column{{Qualifier: p.Alias, Name: p.Alias, Type: colType}}
+	return &materializedOp{cols: cols, rows: rows}, nil
 }
 
 // --- SubqueryAlias ---
