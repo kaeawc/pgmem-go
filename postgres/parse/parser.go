@@ -516,11 +516,46 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		input = &ir.Filter{Input: input, Cond: cond}
 	}
 
-	// ORDER BY sits *below* Project so its sort keys can reference
-	// FROM-clause columns (with their original Qualifier), not just
-	// the projected output. Aliased ORDER BY (`ORDER BY <alias>`) is a
-	// separate planning concern that lands when we have alias scope.
-	if p.accept(kwOrder) {
+	// GROUP BY (and the HAVING that follows) forces an aggregate plan
+	// shape. Without GROUP BY the existing scalar-aggregate / Project
+	// path applies — buildSelectTopOf decides which.
+	var groupBy []ir.Expr
+	var having ir.Expr
+	if p.accept(kwGroup) {
+		if _, err := p.expect(kwBy, "BY"); err != nil {
+			return nil, err
+		}
+		groupBy, err = p.parseGroupByList()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if p.accept(kwHaving) {
+		having, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if groupBy == nil {
+			return nil, fmt.Errorf("parse: HAVING requires GROUP BY (not supported yet)")
+		}
+	}
+
+	// ORDER BY placement depends on whether we're aggregating: for
+	// non-aggregate plans it sits below the Project so sort keys see
+	// FROM-clause columns; for aggregate plans it sits *above* the
+	// Aggregate/Project so it sees the post-aggregate output.
+	hasGroupBy := groupBy != nil
+	hasAggregate := false
+	for _, e := range exprs {
+		if isAggregateCall(e) {
+			hasAggregate = true
+			break
+		}
+	}
+	aggregating := hasGroupBy || hasAggregate
+
+	if !aggregating && p.peek().kind == kwOrder {
+		p.consume() // ORDER
 		if _, err := p.expect(kwBy, "BY"); err != nil {
 			return nil, err
 		}
@@ -531,9 +566,20 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		input = &ir.Sort{Input: input, Keys: keys}
 	}
 
-	plan, err := buildSelectTopOf(input, exprs, names)
+	plan, err := buildSelectTopOf(input, exprs, names, groupBy, having)
 	if err != nil {
 		return nil, err
+	}
+	if aggregating && p.peek().kind == kwOrder {
+		p.consume() // ORDER
+		if _, err := p.expect(kwBy, "BY"); err != nil {
+			return nil, err
+		}
+		keys, err := p.parseSortKeys()
+		if err != nil {
+			return nil, err
+		}
+		plan = &ir.Sort{Input: plan, Keys: keys}
 	}
 	if hasLimitOrOffset(p) {
 		plan, err = p.parseLimitOffset(plan)
@@ -544,15 +590,52 @@ func (p *parser) parseSelect() (ir.Node, error) {
 	return plan, nil
 }
 
-// buildSelectTopOf wraps the (already-built) FROM/WHERE/ORDER stack in
-// either a Project (regular row-shaped SELECT) or an Aggregate
-// (whole-input aggregation; no GROUP BY yet). When some select items
-// are aggregates and others aren't, error out — that's a GROUP BY
-// situation we don't model yet.
-func buildSelectTopOf(input ir.Node, exprs []ir.Expr, names []string) (ir.Node, error) {
+// parseGroupByList consumes `expr [, expr ...]`. Each entry must be a
+// bare column reference for now — non-trivial GROUP BY expressions
+// (e.g. `GROUP BY a + b`) need expression-equality matching in the
+// Project step that wraps the Aggregate, which is a follow-up.
+func (p *parser) parseGroupByList() ([]ir.Expr, error) {
+	var out []ir.Expr
+	for {
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := e.(*ir.ColumnRef); !ok {
+			return nil, fmt.Errorf("parse: GROUP BY supports only bare column references for now")
+		}
+		out = append(out, e)
+		if p.accept(tComma) {
+			continue
+		}
+		break
+	}
+	return out, nil
+}
+
+// buildSelectTopOf wraps the (already-built) FROM/WHERE/ORDER stack
+// in the right shape:
+//
+//   - No aggregates, no GROUP BY → Project (the original case).
+//   - All-aggregate, no GROUP BY → bare Aggregate (scalar-aggregate
+//     case from PR #28: each call's Output names the user's column).
+//   - GROUP BY (with or without aggregates) → Aggregate emits a row
+//     per group with [groupKey…, aggCall…] columns, and a Project on
+//     top rewires each user select item to a ColumnRef into that
+//     output (synthetic "__agg_N" names for aggregates; original
+//     column names for grouped refs).
+func buildSelectTopOf(input ir.Node, exprs []ir.Expr, names []string, groupBy []ir.Expr, having ir.Expr) (ir.Node, error) {
+	if groupBy == nil {
+		// HAVING was already rejected without GROUP BY in parseSelect.
+		return buildScalarOrPlainSelect(input, exprs, names)
+	}
+	return buildGroupedSelect(input, exprs, names, groupBy, having)
+}
+
+func buildScalarOrPlainSelect(input ir.Node, exprs []ir.Expr, names []string) (ir.Node, error) {
 	hasAgg, allAgg := classifyAggregates(exprs)
 	if hasAgg && !allAgg {
-		return nil, fmt.Errorf("parse: mixing aggregates with non-aggregate columns requires GROUP BY (not supported yet)")
+		return nil, fmt.Errorf("parse: mixing aggregates with non-aggregate columns requires GROUP BY")
 	}
 	if !hasAgg {
 		return &ir.Project{Input: input, Exprs: exprs, OutputNames: names}, nil
@@ -567,6 +650,115 @@ func buildSelectTopOf(input ir.Node, exprs []ir.Expr, names []string) (ir.Node, 
 		calls[i] = ir.AggregateCall{Func: fc.Name, Arg: arg, Output: names[i]}
 	}
 	return &ir.Aggregate{Input: input, Calls: calls}, nil
+}
+
+func buildGroupedSelect(input ir.Node, exprs []ir.Expr, names []string, groupBy []ir.Expr, having ir.Expr) (ir.Node, error) {
+	groupBySet := make(map[string]int, len(groupBy))
+	for i, e := range groupBy {
+		c := e.(*ir.ColumnRef)
+		groupBySet[columnRefKey(c)] = i
+	}
+	rw := &aggRewriter{groupBySet: groupBySet}
+	projectExprs, err := rw.rewriteSelectList(exprs)
+	if err != nil {
+		return nil, err
+	}
+	var rewrittenHaving ir.Expr
+	if having != nil {
+		rewrittenHaving = rw.rewriteAnyExpr(having)
+	}
+	agg := &ir.Aggregate{Input: input, Calls: rw.calls, GroupBy: groupBy}
+	var top ir.Node = agg
+	if rewrittenHaving != nil {
+		top = &ir.Filter{Input: top, Cond: rewrittenHaving}
+	}
+	return &ir.Project{Input: top, Exprs: projectExprs, OutputNames: names}, nil
+}
+
+// aggRewriter rewrites SELECT-list and HAVING expressions so they
+// reference the Aggregate operator's output schema:
+//   - Bare ColumnRefs that match a GROUP BY column pass through.
+//   - Aggregate calls become ColumnRef{Name: "__agg_N"} and the
+//     corresponding AggregateCall lands in calls.
+//
+// Any aggregates encountered while rewriting HAVING but missing from
+// the SELECT list still get added to calls so the Aggregate node
+// computes them — they just don't appear in the final Project.
+type aggRewriter struct {
+	groupBySet map[string]int
+	calls      []ir.AggregateCall
+}
+
+func (r *aggRewriter) rewriteSelectList(exprs []ir.Expr) ([]ir.Expr, error) {
+	out := make([]ir.Expr, len(exprs))
+	for i, e := range exprs {
+		switch v := e.(type) {
+		case *ir.ColumnRef:
+			if _, ok := r.groupBySet[columnRefKey(v)]; !ok {
+				return nil, fmt.Errorf("parse: column %q must appear in GROUP BY or be used in an aggregate", v.Name)
+			}
+			out[i] = &ir.ColumnRef{Name: v.Name, Qualifier: v.Qualifier}
+		default:
+			if !isAggregateCall(e) {
+				return nil, fmt.Errorf("parse: select expression must reference a GROUP BY column or be an aggregate")
+			}
+			out[i] = r.replaceAggregate(e.(*ir.FuncCall))
+		}
+	}
+	return out, nil
+}
+
+// rewriteAnyExpr walks an arbitrary expression tree replacing every
+// aggregate call with a synthetic ColumnRef. Used for HAVING which may
+// embed aggregates inside boolean / comparison ops.
+func (r *aggRewriter) rewriteAnyExpr(e ir.Expr) ir.Expr {
+	switch v := e.(type) {
+	case *ir.FuncCall:
+		if isAggregateCall(v) {
+			return r.replaceAggregate(v)
+		}
+		args := make([]ir.Expr, len(v.Args))
+		for i, a := range v.Args {
+			args[i] = r.rewriteAnyExpr(a)
+		}
+		cp := *v
+		cp.Args = args
+		return &cp
+	case *ir.BinOp:
+		return &ir.BinOp{Op: v.Op, Left: r.rewriteAnyExpr(v.Left), Right: r.rewriteAnyExpr(v.Right), T: v.T}
+	case *ir.UnaryOp:
+		return &ir.UnaryOp{Op: v.Op, Expr: r.rewriteAnyExpr(v.Expr), T: v.T}
+	case *ir.Cast:
+		return &ir.Cast{Expr: r.rewriteAnyExpr(v.Expr), T: v.T}
+	case *ir.InListExpr:
+		list := make([]ir.Expr, len(v.List))
+		for i, le := range v.List {
+			list[i] = r.rewriteAnyExpr(le)
+		}
+		return &ir.InListExpr{Probe: r.rewriteAnyExpr(v.Probe), List: list}
+	default:
+		return e
+	}
+}
+
+func (r *aggRewriter) replaceAggregate(fc *ir.FuncCall) ir.Expr {
+	synth := fmt.Sprintf("__agg_%d", len(r.calls))
+	var arg ir.Expr
+	if !fc.Star && len(fc.Args) > 0 {
+		arg = fc.Args[0]
+	}
+	r.calls = append(r.calls, ir.AggregateCall{Func: fc.Name, Arg: arg, Output: synth})
+	return &ir.ColumnRef{Name: synth}
+}
+
+// columnRefKey is the canonical lookup key for a ColumnRef in the
+// GROUP BY set: qualifier+"."+name when qualified, plain name
+// otherwise. Avoids a struct-as-map-key dance.
+func columnRefKey(c *ir.ColumnRef) string {
+	if c.Qualifier != "" {
+		return c.Qualifier + "." + c.Name
+	}
+	return c.Name
 }
 
 // classifyAggregates inspects the top-level expressions of a SELECT

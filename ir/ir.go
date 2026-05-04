@@ -106,14 +106,24 @@ type AggregateCall struct {
 	Output string
 }
 
-// Aggregate computes whole-input aggregation: it drains Input, runs
-// each Calls[i] over the rows, and emits exactly one output row whose
-// columns are the Calls' results in order. GROUP BY is a follow-up;
-// without it Aggregate is the only shape that produces a row even when
-// the input is empty (COUNT yields 0; MIN/MAX/SUM/AVG yield NULL).
+// Aggregate computes input aggregation. With GroupBy empty (the
+// "scalar aggregate" shape), Aggregate drains Input and emits one
+// row whose columns are the Calls' results — and emits a row even
+// when the input is empty (COUNT → 0, MIN/MAX/SUM/AVG → NULL).
+//
+// With GroupBy non-empty, Aggregate hashes input rows by the GroupBy
+// expressions' values and emits one row per distinct group. Output
+// schema is [GroupBy[0], …, GroupBy[N-1], Calls[0], …, Calls[M-1]] —
+// the Project that wraps the Aggregate uses that ordering to rewire
+// the user's SELECT list.
+//
+// GROUP BY expressions are restricted to bare column references in
+// this slice; expression-based grouping (`GROUP BY a + b`) is a
+// follow-up. Storing them as Expr keeps the IR ready for it.
 type Aggregate struct {
-	Input Node
-	Calls []AggregateCall
+	Input   Node
+	Calls   []AggregateCall
+	GroupBy []Expr
 }
 
 func (*Aggregate) node() {}
