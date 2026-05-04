@@ -1650,7 +1650,15 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &ir.UnaryOp{Op: x.Op, Expr: inner, T: x.T}, nil
+		t := x.T
+		if t == nil {
+			// Falls back to the resolved inner's type — matters for
+			// unary minus over expressions whose own type isn't fixed
+			// at parse time (e.g. `-(a + b)` where the BinOp's T is
+			// only filled by arithResultType during resolution).
+			t = inner.Type()
+		}
+		return &ir.UnaryOp{Op: x.Op, Expr: inner, T: t}, nil
 	case *ir.FuncCall:
 		args := make([]ir.Expr, len(x.Args))
 		for i, a := range x.Args {
@@ -2034,7 +2042,8 @@ func evalUnaryOp(u *ir.UnaryOp, in Row, env *Env) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if u.Op == "not" {
+	switch u.Op {
+	case "not":
 		if v == nil {
 			return nil, nil
 		}
@@ -2043,8 +2052,23 @@ func evalUnaryOp(u *ir.UnaryOp, in Row, env *Env) (any, error) {
 			return nil, fmt.Errorf("exec: NOT on non-bool %T", v)
 		}
 		return !b, nil
+	case "-":
+		if v == nil {
+			return nil, nil
+		}
+		switch n := v.(type) {
+		case int32:
+			return -n, nil
+		case int64:
+			return -n, nil
+		case int:
+			return -int64(n), nil
+		default:
+			return nil, fmt.Errorf("exec: unary - on non-integer %T", v)
+		}
+	default:
+		return nil, fmt.Errorf("exec: unsupported unary op %q", u.Op)
 	}
-	return nil, fmt.Errorf("exec: unsupported unary op %q", u.Op)
 }
 
 // compareValues returns -1/0/1 for two values of the same logical type.

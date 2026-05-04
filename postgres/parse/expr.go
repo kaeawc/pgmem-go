@@ -227,6 +227,15 @@ func comparisonOp(k tokenKind) (string, bool) {
 func (p *parser) parsePrimary() (ir.Expr, error) {
 	t := p.peek()
 	switch t.kind {
+	case tMinus:
+		// Unary minus binds tighter than the additive minus parsed in
+		// parseAdditive — `-a + b` is `(-a) + b`, not `-(a + b)`.
+		p.consume()
+		inner, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		return &ir.UnaryOp{Op: "-", Expr: inner, T: inner.Type()}, nil
 	case tLParen:
 		return p.parseParenExpr()
 	case tNumber:
