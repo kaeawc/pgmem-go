@@ -663,6 +663,15 @@ func (p *parser) parseInsert() (ir.Node, error) {
 			return nil, err
 		}
 		stmt.Source = src
+	} else if p.acceptIdent("default") {
+		// `INSERT INTO t DEFAULT VALUES` inserts a single row with
+		// every column either auto-filled or NULL. We don't model
+		// per-column DEFAULT exprs; the row goes in via the existing
+		// auto-column path with NULL for everything else.
+		if !p.accept(kwValues) {
+			return nil, fmt.Errorf("parse: expected VALUES after DEFAULT at %d", p.peek().pos)
+		}
+		stmt.DefaultValues = true
 	} else {
 		if _, err := p.expect(kwValues, "VALUES"); err != nil {
 			return nil, err

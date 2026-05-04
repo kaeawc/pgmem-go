@@ -379,6 +379,11 @@ type Insert struct {
 	// plan must match Columns (or the table's full column list when
 	// Columns is empty). Rows and Source are mutually exclusive.
 	Source Node
+	// DefaultValues is set for `INSERT INTO t DEFAULT VALUES`. The
+	// runtime emits a single row with every column either auto-filled
+	// (SERIAL) or NULL — NOT NULL columns without an auto fill cause
+	// the standard 23502 error.
+	DefaultValues bool
 }
 
 func (*Insert) node() {}

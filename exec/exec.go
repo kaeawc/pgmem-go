@@ -1270,26 +1270,40 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 	if !ok {
 		return nil, fmt.Errorf("exec: storage missing table %q", p.Table)
 	}
-	colMap, err := buildInsertColumnMap(ct, p.Columns)
-	if err != nil {
-		return nil, err
-	}
-	// Resolve each row's expressions against an empty input schema —
-	// VALUES expressions don't see column refs.
-	resolvedRows := make([][]ir.Expr, len(p.Rows))
-	for i, row := range p.Rows {
-		if len(row) != len(colMap) {
-			return nil, fmt.Errorf("exec: insert row %d has %d values, want %d", i, len(row), len(colMap))
+	var (
+		colMap       []int
+		resolvedRows [][]ir.Expr
+	)
+	if p.DefaultValues {
+		// Single all-default row: empty colMap (no user-supplied
+		// values) and one empty row tuple. Auto columns get filled
+		// in by the per-row pipeline; everything else stays NULL,
+		// which the existing NOT NULL check catches if applicable.
+		colMap = nil
+		resolvedRows = [][]ir.Expr{nil}
+	} else {
+		var err error
+		colMap, err = buildInsertColumnMap(ct, p.Columns)
+		if err != nil {
+			return nil, err
 		}
-		out := make([]ir.Expr, len(row))
-		for j, e := range row {
-			r, err := resolveExpr(e, nil, env)
-			if err != nil {
-				return nil, err
+		// Resolve each row's expressions against an empty input
+		// schema — VALUES expressions don't see column refs.
+		resolvedRows = make([][]ir.Expr, len(p.Rows))
+		for i, row := range p.Rows {
+			if len(row) != len(colMap) {
+				return nil, fmt.Errorf("exec: insert row %d has %d values, want %d", i, len(row), len(colMap))
 			}
-			out[j] = r
+			out := make([]ir.Expr, len(row))
+			for j, e := range row {
+				r, err := resolveExpr(e, nil, env)
+				if err != nil {
+					return nil, err
+				}
+				out[j] = r
+			}
+			resolvedRows[i] = out
 		}
-		resolvedRows[i] = out
 	}
 	op := &insertOp{
 		table:      st,
