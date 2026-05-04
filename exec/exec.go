@@ -950,26 +950,48 @@ func buildInsert(p *ir.Insert, env *Env) (Operator, error) {
 		// RETURNING expressions see the post-INSERT row, so their column
 		// refs resolve against the table's full schema (catalog order),
 		// not the INSERT's column list.
-		tableSchema := make([]Column, len(ct.Columns))
-		for k, c := range ct.Columns {
-			tableSchema[k] = Column{Name: c.Name, Type: c.Type}
+		tableSchema := tableSchemaCols(ct)
+		exprs, cols, err := resolveReturning(p.Returning, p.ReturningNames, tableSchema, env)
+		if err != nil {
+			return nil, err
 		}
-		op.returning = make([]ir.Expr, len(p.Returning))
-		op.returningCols = make([]Column, len(p.Returning))
-		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env)
-			if err != nil {
-				return nil, err
-			}
-			op.returning[k] = r
-			name := ""
-			if k < len(p.ReturningNames) {
-				name = p.ReturningNames[k]
-			}
-			op.returningCols[k] = Column{Name: name, Type: r.Type()}
-		}
+		op.returning = exprs
+		op.returningCols = cols
 	}
 	return op, nil
+}
+
+// tableSchemaCols turns the catalog row into the per-column metadata
+// the resolver needs.
+func tableSchemaCols(ct catalog.Table) []Column {
+	out := make([]Column, len(ct.Columns))
+	for i, c := range ct.Columns {
+		out[i] = Column{Name: c.Name, Type: c.Type}
+	}
+	return out
+}
+
+// resolveReturning expands any StarRef in the RETURNING list to one
+// ColumnRef per schema column, then resolves each entry against the
+// table schema. Returns parallel slices ready to drop into an op's
+// returning / returningCols fields.
+func resolveReturning(exprs []ir.Expr, names []string, schema []Column, env *Env) ([]ir.Expr, []Column, error) {
+	expExprs, expNames := expandStarRefs(exprs, names, schema)
+	resolved := make([]ir.Expr, len(expExprs))
+	cols := make([]Column, len(expExprs))
+	for k, e := range expExprs {
+		r, err := resolveExpr(e, schema, env)
+		if err != nil {
+			return nil, nil, err
+		}
+		resolved[k] = r
+		var name string
+		if k < len(expNames) {
+			name = expNames[k]
+		}
+		cols[k] = Column{Name: name, Type: r.Type()}
+	}
+	return resolved, cols, nil
 }
 
 // conflictUpdate is a resolved DO UPDATE SET assignment.
@@ -1720,20 +1742,12 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 		op.where = cond
 	}
 	if len(p.Returning) > 0 {
-		op.returning = make([]ir.Expr, len(p.Returning))
-		op.returningCols = make([]Column, len(p.Returning))
-		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env)
-			if err != nil {
-				return nil, err
-			}
-			op.returning[k] = r
-			name := ""
-			if k < len(p.ReturningNames) {
-				name = p.ReturningNames[k]
-			}
-			op.returningCols[k] = Column{Name: name, Type: r.Type()}
+		exprs, cols, err := resolveReturning(p.Returning, p.ReturningNames, tableSchema, env)
+		if err != nil {
+			return nil, err
 		}
+		op.returning = exprs
+		op.returningCols = cols
 	}
 	return op, nil
 }
@@ -1885,20 +1899,12 @@ func buildUpdate(p *ir.Update, env *Env) (Operator, error) {
 	}
 
 	if len(p.Returning) > 0 {
-		op.returning = make([]ir.Expr, len(p.Returning))
-		op.returningCols = make([]Column, len(p.Returning))
-		for k, e := range p.Returning {
-			r, err := resolveExpr(e, tableSchema, env)
-			if err != nil {
-				return nil, err
-			}
-			op.returning[k] = r
-			name := ""
-			if k < len(p.ReturningNames) {
-				name = p.ReturningNames[k]
-			}
-			op.returningCols[k] = Column{Name: name, Type: r.Type()}
+		exprs, cols, err := resolveReturning(p.Returning, p.ReturningNames, tableSchema, env)
+		if err != nil {
+			return nil, err
 		}
+		op.returning = exprs
+		op.returningCols = cols
 	}
 	return op, nil
 }
