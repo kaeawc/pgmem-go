@@ -1120,7 +1120,8 @@ func isAggregateCall(e ir.Expr) bool {
 		return false
 	}
 	switch fc.Name {
-	case "count", "sum", "min", "max", "avg", "string_agg":
+	case "count", "sum", "min", "max", "avg", "string_agg",
+		"bool_and", "bool_or", "every":
 		return true
 	}
 	return false

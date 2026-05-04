@@ -303,8 +303,57 @@ func newAggregator(name string, args []ir.Expr) (aggAcc, error) {
 			return nil, fmt.Errorf("exec: string_agg takes 2 arguments, got %d", len(args))
 		}
 		return &stringAggAcc{value: args[0], sep: args[1]}, nil
+	case "bool_and", "every":
+		return &boolAgg{arg: arg, all: true}, nil
+	case "bool_or":
+		return &boolAgg{arg: arg, all: false}, nil
 	}
 	return nil, fmt.Errorf("exec: unknown aggregate %q", name)
+}
+
+// boolAgg implements bool_and (all=true) and bool_or (all=false). PG
+// rules: NULL input is skipped; if every input is NULL the result is
+// NULL. bool_and returns true iff every observed value is true;
+// bool_or returns true iff at least one observed value is true.
+type boolAgg struct {
+	arg ir.Expr
+	all bool
+	any bool
+	val bool // running accumulator: starts true for AND, false for OR
+}
+
+func (b *boolAgg) resultType() types.Type { return types.Bool }
+
+func (b *boolAgg) accept(in Row, env *Env) error {
+	v, err := evalExpr(b.arg, in, env)
+	if err != nil {
+		return err
+	}
+	if v == nil {
+		return nil
+	}
+	bv, ok := v.(bool)
+	if !ok {
+		return fmt.Errorf("exec: bool aggregate: expected bool, got %T", v)
+	}
+	if !b.any {
+		b.any = true
+		b.val = bv
+		return nil
+	}
+	if b.all {
+		b.val = b.val && bv
+	} else {
+		b.val = b.val || bv
+	}
+	return nil
+}
+
+func (b *boolAgg) result() (any, error) {
+	if !b.any {
+		return nil, nil
+	}
+	return b.val, nil
 }
 
 type stringAggAcc struct {
