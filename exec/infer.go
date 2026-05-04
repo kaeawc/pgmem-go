@@ -266,6 +266,11 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
 	case *ir.ScalarSubquery:
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
+	case *ir.Cast:
+		// `$1::text` constrains $1 to text. Pass the cast target down
+		// as the expected type — exactly the case sqlc-generated NULL
+		// inputs use to disambiguate untyped parameters.
+		walkExprParams(x.Expr, x.T, sch, scopeTable, hint, maxIdx)
 	case *ir.Literal, nil:
 		// nothing to record.
 	case *ir.ColumnRef:

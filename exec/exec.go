@@ -1703,6 +1703,12 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 			return nil, err
 		}
 		return &ir.InListExpr{Probe: probe, List: list}, nil
+	case *ir.Cast:
+		inner, err := resolveExpr(x.Expr, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		return &ir.Cast{Expr: inner, T: x.T}, nil
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
@@ -1806,8 +1812,172 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 		return evalFuncCall(x, in, env)
 	case *ir.InListExpr:
 		return evalInList(x, in, env)
+	case *ir.Cast:
+		v, err := evalExpr(x.Expr, in, env)
+		if err != nil {
+			return nil, err
+		}
+		return castValue(v, x.T)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
+	}
+}
+
+// castValue implements the small slice of PG's cast lattice we care
+// about: integer ⟷ text, integer widening / narrowing, bool ⟷ text,
+// text → uuid, text → bytea (the `\xHEX` form), and any-type → itself
+// (no-op when already the target type). NULL → NULL across the board.
+//
+// Unsupported casts surface as exec errors so the wire layer reports
+// them rather than silently producing the wrong value.
+func castValue(v any, target types.Type) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch target {
+	case types.Text:
+		return castToText(v)
+	case types.Int4:
+		return castToInt4(v)
+	case types.Int8:
+		return castToInt8(v)
+	case types.Bool:
+		return castToBool(v)
+	case types.UUID:
+		return castToUUID(v)
+	case types.Bytea:
+		return castToBytea(v)
+	case types.Timestamptz:
+		// Already a time.Time? Pass through. From text? Decode via the
+		// type's own DecodeText. Anything else fails.
+		if t, ok := v.(time.Time); ok {
+			return t, nil
+		}
+		if s, ok := v.(string); ok {
+			return types.Timestamptz.DecodeText([]byte(s))
+		}
+		return nil, fmt.Errorf("cast to timestamptz: unsupported source %T", v)
+	case types.JSONB:
+		// Same shape as bytea — JSON bytes pass through.
+		return castToBytea(v)
+	default:
+		return nil, fmt.Errorf("cast to %s: unsupported", target.Name())
+	}
+}
+
+func castToText(v any) (any, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case int32:
+		return strconv.FormatInt(int64(x), 10), nil
+	case int64:
+		return strconv.FormatInt(x, 10), nil
+	case bool:
+		if x {
+			return "true", nil
+		}
+		return "false", nil
+	case [16]byte:
+		out, _ := types.UUID.EncodeText(x)
+		return string(out), nil
+	case []byte:
+		out, _ := types.Bytea.EncodeText(x)
+		return string(out), nil
+	case time.Time:
+		out, _ := types.Timestamptz.EncodeText(x)
+		return string(out), nil
+	default:
+		return nil, fmt.Errorf("cast to text: unsupported source %T", v)
+	}
+}
+
+func castToInt4(v any) (any, error) {
+	switch x := v.(type) {
+	case int32:
+		return x, nil
+	case int64:
+		return int32(x), nil
+	case string:
+		n, err := strconv.ParseInt(x, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("cast to int4: %w", err)
+		}
+		return int32(n), nil
+	case bool:
+		if x {
+			return int32(1), nil
+		}
+		return int32(0), nil
+	default:
+		return nil, fmt.Errorf("cast to int4: unsupported source %T", v)
+	}
+}
+
+func castToInt8(v any) (any, error) {
+	switch x := v.(type) {
+	case int64:
+		return x, nil
+	case int32:
+		return int64(x), nil
+	case string:
+		n, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cast to int8: %w", err)
+		}
+		return n, nil
+	case bool:
+		if x {
+			return int64(1), nil
+		}
+		return int64(0), nil
+	default:
+		return nil, fmt.Errorf("cast to int8: unsupported source %T", v)
+	}
+}
+
+func castToBool(v any) (any, error) {
+	switch x := v.(type) {
+	case bool:
+		return x, nil
+	case string:
+		return types.Bool.DecodeText([]byte(x))
+	case int32:
+		return x != 0, nil
+	case int64:
+		return x != 0, nil
+	default:
+		return nil, fmt.Errorf("cast to bool: unsupported source %T", v)
+	}
+}
+
+func castToUUID(v any) (any, error) {
+	switch x := v.(type) {
+	case [16]byte:
+		return x, nil
+	case string:
+		return types.UUID.DecodeText([]byte(x))
+	case []byte:
+		return types.UUID.DecodeBinary(x)
+	default:
+		return nil, fmt.Errorf("cast to uuid: unsupported source %T", v)
+	}
+}
+
+func castToBytea(v any) (any, error) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		// Accept both the canonical \xHEX form and arbitrary text
+		// (interpret raw UTF-8 bytes). The wire-text form gets
+		// normalized via DecodeText; everything else falls through.
+		if len(x) >= 2 && x[0] == '\\' && (x[1] == 'x' || x[1] == 'X') {
+			return types.Bytea.DecodeText([]byte(x))
+		}
+		return []byte(x), nil
+	default:
+		return nil, fmt.Errorf("cast to bytea: unsupported source %T", v)
 	}
 }
 
