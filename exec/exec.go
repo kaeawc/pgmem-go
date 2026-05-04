@@ -97,6 +97,10 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildCreateTable(p, env), nil
 	case *ir.Truncate:
 		return buildTruncate(p, env)
+	case *ir.CreateView:
+		return buildCreateView(p, env), nil
+	case *ir.DropView:
+		return buildDropView(p, env), nil
 	case *ir.DropTable:
 		return buildDropTable(p, env), nil
 	case *ir.Insert:
@@ -125,6 +129,15 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 // --- Scan ---
 
 func buildScan(p *ir.Scan, env *Env) (Operator, error) {
+	if plan, ok := env.Schema.View(p.Table); ok {
+		// View references inline the registered plan, optionally
+		// re-qualified via the scan's alias.
+		alias := p.Alias
+		if alias == "" {
+			alias = p.Table
+		}
+		return Build(&ir.SubqueryAlias{Inner: plan, Alias: alias}, env)
+	}
 	ct, ok := env.Schema.Table(p.Table)
 	if !ok {
 		return nil, fmt.Errorf("exec: unknown table %q", p.Table)
@@ -1202,6 +1215,24 @@ func buildTruncate(p *ir.Truncate, env *Env) (Operator, error) {
 		}
 		return nil
 	}}, nil
+}
+
+func buildCreateView(p *ir.CreateView, env *Env) Operator {
+	return &ddlOp{tag: "CREATE VIEW", do: func() error {
+		if _, ok := env.Schema.Table(p.Name); ok {
+			return &SQLError{Code: "42P07", Message: fmt.Sprintf("relation %q already exists", p.Name)}
+		}
+		return env.Schema.CreateView(p.Name, p.Plan)
+	}}
+}
+
+func buildDropView(p *ir.DropView, env *Env) Operator {
+	return &ddlOp{tag: "DROP VIEW", do: func() error {
+		if !env.Schema.DropView(p.Name) && !p.IfExists {
+			return &SQLError{Code: "42P01", Message: fmt.Sprintf("view %q does not exist", p.Name)}
+		}
+		return nil
+	}}
 }
 
 func buildDropTable(p *ir.DropTable, env *Env) Operator {

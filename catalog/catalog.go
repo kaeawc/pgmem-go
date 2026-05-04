@@ -7,6 +7,7 @@
 package catalog
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/kaeawc/pgmem-go/ir"
@@ -59,7 +60,8 @@ type Table struct {
 	Checks  []Check
 }
 
-// Schema is the set of named tables known to a server instance.
+// Schema is the set of named tables and views known to a server
+// instance.
 type Schema interface {
 	Table(name string) (Table, bool)
 	CreateTable(t Table) error
@@ -70,15 +72,23 @@ type Schema interface {
 	// insertion order. Used by the FK enforcer to find referencers
 	// when a parent row is being deleted.
 	Tables() []Table
+
+	// View returns the IR plan registered under the given view name.
+	View(name string) (ir.Node, bool)
+	CreateView(name string, plan ir.Node) error
+	DropView(name string) bool
 }
 
 // NewSchema returns an empty in-memory schema.
-func NewSchema() Schema { return &schema{tables: map[string]Table{}} }
+func NewSchema() Schema {
+	return &schema{tables: map[string]Table{}, views: map[string]ir.Node{}}
+}
 
 type schema struct {
 	mu     sync.RWMutex
 	tables map[string]Table
 	order  []string // table names in CreateTable order — Tables() uses this
+	views  map[string]ir.Node
 }
 
 func (s *schema) Table(name string) (Table, bool) {
@@ -122,4 +132,31 @@ func (s *schema) Tables() []Table {
 		out = append(out, s.tables[name])
 	}
 	return out
+}
+
+func (s *schema) View(name string) (ir.Node, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	v, ok := s.views[name]
+	return v, ok
+}
+
+func (s *schema) CreateView(name string, plan ir.Node) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.tables[name]; exists {
+		return fmt.Errorf("catalog: %q already exists as a table", name)
+	}
+	s.views[name] = plan
+	return nil
+}
+
+func (s *schema) DropView(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.views[name]; !ok {
+		return false
+	}
+	delete(s.views, name)
+	return true
 }
