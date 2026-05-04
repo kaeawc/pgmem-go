@@ -100,6 +100,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildDistinct(p, env)
 	case *ir.Union:
 		return buildUnion(p, env)
+	case *ir.SubqueryAlias:
+		return buildSubqueryAlias(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -497,6 +499,29 @@ func (d *distinctOp) Next(ctx context.Context) (Row, error) {
 		return row, nil
 	}
 }
+
+// --- SubqueryAlias ---
+
+func buildSubqueryAlias(p *ir.SubqueryAlias, env *Env) (Operator, error) {
+	in, err := Build(p.Inner, env)
+	if err != nil {
+		return nil, err
+	}
+	cols := append([]Column(nil), in.OutputSchema()...)
+	for i := range cols {
+		cols[i].Qualifier = p.Alias
+	}
+	return &subqueryAliasOp{in: in, cols: cols}, nil
+}
+
+type subqueryAliasOp struct {
+	in   Operator
+	cols []Column
+}
+
+func (s *subqueryAliasOp) OutputSchema() []Column              { return s.cols }
+func (s *subqueryAliasOp) Close() error                        { return s.in.Close() }
+func (s *subqueryAliasOp) Next(c context.Context) (Row, error) { return s.in.Next(c) }
 
 // --- Union ---
 
