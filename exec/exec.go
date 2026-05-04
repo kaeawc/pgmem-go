@@ -1409,6 +1409,26 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 				})
 			}
 		}
+		for _, fk := range p.TableFKs {
+			idx := -1
+			for i, c := range cols {
+				if c.Name == fk.Column {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return &SQLError{Code: "42703", Message: fmt.Sprintf("column %q named in FOREIGN KEY does not exist", fk.Column)}
+			}
+			if cols[idx].References.Table != "" {
+				return &SQLError{Code: "42710", Message: fmt.Sprintf("column %q already has a FOREIGN KEY", fk.Column)}
+			}
+			cols[idx].References = catalog.ColumnRef{
+				Table:    fk.Ref.Table,
+				Column:   fk.Ref.Column,
+				OnDelete: catalog.OnDeleteAction(fk.Ref.OnDelete),
+			}
+		}
 		for _, tc := range p.TableChecks {
 			n := tc.Name
 			if n == "" {

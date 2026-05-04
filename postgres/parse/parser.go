@@ -797,6 +797,7 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 	}
 	var cols []ir.ColumnDef
 	var tableChecks []ir.TableCheck
+	var tableFKs []ir.TableFK
 	for {
 		// Table-level constraints (`PRIMARY KEY (cols)`, `UNIQUE
 		// (cols)`, `FOREIGN KEY (cols) REFERENCES …`) sit alongside
@@ -807,12 +808,15 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 		// value-match path. Composite uniqueness arrives when a real
 		// query needs it.
 		if isTableConstraintStart(p) {
-			check, err := p.parseTableConstraint()
+			check, fk, err := p.parseTableConstraint()
 			if err != nil {
 				return nil, err
 			}
 			if check != nil {
 				tableChecks = append(tableChecks, *check)
+			}
+			if fk != nil {
+				tableFKs = append(tableFKs, *fk)
 			}
 			if p.accept(tComma) {
 				continue
@@ -832,7 +836,7 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 	if _, err := p.expect(tRParen, ")"); err != nil {
 		return nil, err
 	}
-	return &ir.CreateTable{Name: name.val, Columns: cols, TableChecks: tableChecks}, nil
+	return &ir.CreateTable{Name: name.val, Columns: cols, TableChecks: tableChecks, TableFKs: tableFKs}, nil
 }
 
 // isTableConstraintStart reports whether the next token begins a
@@ -843,7 +847,8 @@ func isTableConstraintStart(p *parser) bool {
 	case kwPrimary, kwUnique, kwCheck:
 		return true
 	case tIdent:
-		return strings.EqualFold(p.peek().val, "constraint")
+		v := p.peek().val
+		return strings.EqualFold(v, "constraint") || strings.EqualFold(v, "foreign")
 	}
 	return false
 }
@@ -854,31 +859,68 @@ func isTableConstraintStart(p *parser) bool {
 // accepted but discarded: the per-column flags already cover their
 // runtime effect, and tests don't yet depend on composite
 // uniqueness.
-func (p *parser) parseTableConstraint() (*ir.TableCheck, error) {
+func (p *parser) parseTableConstraint() (*ir.TableCheck, *ir.TableFK, error) {
 	name := ""
 	if p.acceptIdent("constraint") {
 		ntok, err := p.expect(tIdent, "constraint name")
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		name = ntok.val
 	}
 	switch {
 	case p.accept(kwPrimary):
 		if !p.accept(kwKey) {
-			return nil, fmt.Errorf("parse: expected KEY after PRIMARY at %d", p.peek().pos)
+			return nil, nil, fmt.Errorf("parse: expected KEY after PRIMARY at %d", p.peek().pos)
 		}
-		return nil, p.consumeColumnList()
+		return nil, nil, p.consumeColumnList()
 	case p.accept(kwUnique):
-		return nil, p.consumeColumnList()
+		return nil, nil, p.consumeColumnList()
 	case p.accept(kwCheck):
 		expr, err := p.parseParenExpr()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return &ir.TableCheck{Name: name, Expr: expr}, nil
+		return &ir.TableCheck{Name: name, Expr: expr}, nil, nil
+	case p.acceptIdent("foreign"):
+		fk, err := p.parseTableForeignKey(name)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nil, fk, nil
 	}
-	return nil, fmt.Errorf("parse: unexpected token %q in CREATE TABLE", p.peek().val)
+	return nil, nil, fmt.Errorf("parse: unexpected token %q in CREATE TABLE", p.peek().val)
+}
+
+// parseTableForeignKey consumes the rest of `FOREIGN KEY (col)
+// REFERENCES parent(col) [ON DELETE action]`. Multi-column FK lists
+// are rejected — pgmem-go's catalog only models per-column FK
+// references today.
+func (p *parser) parseTableForeignKey(name string) (*ir.TableFK, error) {
+	if !p.accept(kwKey) {
+		return nil, fmt.Errorf("parse: expected KEY after FOREIGN at %d", p.peek().pos)
+	}
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return nil, err
+	}
+	col, err := p.expect(tIdent, "FK column name")
+	if err != nil {
+		return nil, err
+	}
+	if p.peek().kind == tComma {
+		return nil, fmt.Errorf("parse: multi-column FOREIGN KEY not yet supported (pos %d)", p.peek().pos)
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(kwReferences, "REFERENCES"); err != nil {
+		return nil, err
+	}
+	ref, err := p.parseReferencesClause()
+	if err != nil {
+		return nil, err
+	}
+	return &ir.TableFK{Name: name, Column: col.val, Ref: ref}, nil
 }
 
 // consumeColumnList consumes a parenthesised comma-separated list of
