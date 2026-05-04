@@ -270,6 +270,70 @@ func byteaBytes(v any) ([]byte, error) {
 	}
 }
 
+// JSONB is PG jsonb (OID 3802). Internally we hold the canonical JSON
+// bytes; the binary wire format is a single 0x01 version byte followed
+// by the JSON, the text format is the raw JSON. This is enough for
+// pgx-style clients to round-trip JSON values without a parser.
+//
+// We do not normalize (no key sorting, no whitespace stripping) — v1
+// keeps whatever the client sent. Two equivalent-but-differently-
+// formatted documents won't compare equal yet; matches PG only for
+// already-canonical input.
+var JSONB Type = &jsonbType{}
+
+type jsonbType struct{}
+
+func (*jsonbType) Name() string { return "jsonb" }
+func (*jsonbType) OID() uint32  { return 3802 }
+func (*jsonbType) Size() int16  { return -1 }
+
+func (*jsonbType) EncodeText(v any) ([]byte, error) {
+	b, err := jsonbBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("jsonb EncodeText: %w", err)
+	}
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out, nil
+}
+
+func (*jsonbType) EncodeBinary(v any) ([]byte, error) {
+	b, err := jsonbBytes(v)
+	if err != nil {
+		return nil, fmt.Errorf("jsonb EncodeBinary: %w", err)
+	}
+	out := make([]byte, len(b)+1)
+	out[0] = 1 // jsonb binary version
+	copy(out[1:], b)
+	return out, nil
+}
+
+func (*jsonbType) DecodeText(b []byte) (any, error) {
+	out := make([]byte, len(b))
+	copy(out, b)
+	return out, nil
+}
+
+func (*jsonbType) DecodeBinary(b []byte) (any, error) {
+	if len(b) < 1 || b[0] != 1 {
+		return nil, fmt.Errorf("jsonb DecodeBinary: unsupported version byte (got %x)", b)
+	}
+	out := make([]byte, len(b)-1)
+	copy(out, b[1:])
+	return out, nil
+}
+
+func jsonbBytes(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case []byte:
+		return x, nil
+	case string:
+		return []byte(x), nil
+	default:
+		return nil, fmt.Errorf("unsupported %T", v)
+	}
+}
+
 // UUID is PG uuid (16 raw bytes). Internally we hold values as
 // [16]byte so they're comparable (UNIQUE / map keys).
 var UUID Type = &uuidType{}
@@ -467,6 +531,8 @@ func ByOID(oid uint32) (Type, bool) {
 		return Timestamptz, true
 	case 2950:
 		return UUID, true
+	case 3802:
+		return JSONB, true
 	default:
 		return nil, false
 	}
@@ -490,6 +556,8 @@ func ByName(name string) (Type, bool) {
 		return UUID, true
 	case "timestamptz":
 		return Timestamptz, true
+	case "jsonb":
+		return JSONB, true
 	default:
 		return nil, false
 	}
