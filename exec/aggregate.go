@@ -95,10 +95,47 @@ func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs [][]ir.Expr) ([]ag
 		if err != nil {
 			return nil, err
 		}
+		if call.Distinct && len(resolvedArgs[i]) > 0 {
+			acc = &distinctAggWrap{
+				inner: acc,
+				args:  resolvedArgs[i],
+				seen:  map[string]struct{}{},
+			}
+		}
 		out[i] = acc
 	}
 	return out, nil
 }
+
+// distinctAggWrap dedupes incoming rows by the argument tuple before
+// forwarding them to the inner accumulator. Duplicates among the
+// already-seen tuples are dropped silently.
+type distinctAggWrap struct {
+	inner aggAcc
+	args  []ir.Expr
+	seen  map[string]struct{}
+}
+
+func (d *distinctAggWrap) resultType() types.Type { return d.inner.resultType() }
+
+func (d *distinctAggWrap) accept(in Row, env *Env) error {
+	parts := make([]string, len(d.args))
+	for i, a := range d.args {
+		v, err := evalExpr(a, in, env)
+		if err != nil {
+			return err
+		}
+		parts[i] = uniqueKey(v)
+	}
+	key := strings.Join(parts, "\x00")
+	if _, dup := d.seen[key]; dup {
+		return nil
+	}
+	d.seen[key] = struct{}{}
+	return d.inner.accept(in, env)
+}
+
+func (d *distinctAggWrap) result() (any, error) { return d.inner.result() }
 
 // aggAcc abstracts an accumulator: feed rows in, get the result row.
 // Each call gets its own instance.

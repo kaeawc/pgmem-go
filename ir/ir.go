@@ -153,9 +153,10 @@ func (*Distinct) node() {}
 //	         aggregates like string_agg(expr, sep).
 //	Output — the result column name in the Aggregate's output schema.
 type AggregateCall struct {
-	Func   string
-	Args   []Expr
-	Output string
+	Func     string
+	Args     []Expr
+	Output   string
+	Distinct bool // true for `agg(DISTINCT expr)` — dedupe before accumulating
 }
 
 // Aggregate computes input aggregation. With GroupBy empty (the
@@ -435,10 +436,11 @@ func (c *Cast) Type() types.Type { return c.T }
 // turn a FuncCall into an AggregateCall. For non-aggregate builtins
 // Star is always false and the executor treats Star as an arity error.
 type FuncCall struct {
-	Name string
-	Args []Expr
-	T    types.Type
-	Star bool
+	Name     string
+	Args     []Expr
+	T        types.Type
+	Star     bool
+	Distinct bool // true for `agg(DISTINCT expr)`; ignored on non-aggregate calls
 }
 
 func (*FuncCall) expr()              {}
