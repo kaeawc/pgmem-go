@@ -332,10 +332,20 @@ func (p *parser) parseParenExpr() (ir.Expr, error) {
 }
 
 // parseFuncCall consumes `(arg [, arg ...])`. Empty arg list is fine.
+// `(*)` is recognized for the aggregate count(*) shape — it produces a
+// FuncCall with no args and a star marker the parser caller can spot
+// via FuncCallIsStar.
+//
 // The function name has already been consumed by the caller.
 func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
 	if _, err := p.expect(tLParen, "("); err != nil {
 		return nil, err
+	}
+	if p.accept(tStar) {
+		if _, err := p.expect(tRParen, ")"); err != nil {
+			return nil, err
+		}
+		return &ir.FuncCall{Name: name, Args: nil, Star: true}, nil
 	}
 	var args []ir.Expr
 	if p.peek().kind != tRParen {

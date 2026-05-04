@@ -531,16 +531,70 @@ func (p *parser) parseSelect() (ir.Node, error) {
 		input = &ir.Sort{Input: input, Keys: keys}
 	}
 
-	plan := ir.Node(&ir.Project{Input: input, Exprs: exprs, OutputNames: names})
-
+	plan, err := buildSelectTopOf(input, exprs, names)
+	if err != nil {
+		return nil, err
+	}
 	if hasLimitOrOffset(p) {
 		plan, err = p.parseLimitOffset(plan)
 		if err != nil {
 			return nil, err
 		}
 	}
-
 	return plan, nil
+}
+
+// buildSelectTopOf wraps the (already-built) FROM/WHERE/ORDER stack in
+// either a Project (regular row-shaped SELECT) or an Aggregate
+// (whole-input aggregation; no GROUP BY yet). When some select items
+// are aggregates and others aren't, error out — that's a GROUP BY
+// situation we don't model yet.
+func buildSelectTopOf(input ir.Node, exprs []ir.Expr, names []string) (ir.Node, error) {
+	hasAgg, allAgg := classifyAggregates(exprs)
+	if hasAgg && !allAgg {
+		return nil, fmt.Errorf("parse: mixing aggregates with non-aggregate columns requires GROUP BY (not supported yet)")
+	}
+	if !hasAgg {
+		return &ir.Project{Input: input, Exprs: exprs, OutputNames: names}, nil
+	}
+	calls := make([]ir.AggregateCall, len(exprs))
+	for i, e := range exprs {
+		fc := e.(*ir.FuncCall)
+		var arg ir.Expr
+		if !fc.Star && len(fc.Args) > 0 {
+			arg = fc.Args[0]
+		}
+		calls[i] = ir.AggregateCall{Func: fc.Name, Arg: arg, Output: names[i]}
+	}
+	return &ir.Aggregate{Input: input, Calls: calls}, nil
+}
+
+// classifyAggregates inspects the top-level expressions of a SELECT
+// list and reports whether *any* are aggregate calls and whether
+// *every* one is. We only handle the all-or-nothing case until GROUP
+// BY lands.
+func classifyAggregates(exprs []ir.Expr) (hasAgg, allAgg bool) {
+	allAgg = true
+	for _, e := range exprs {
+		if isAggregateCall(e) {
+			hasAgg = true
+		} else {
+			allAgg = false
+		}
+	}
+	return
+}
+
+func isAggregateCall(e ir.Expr) bool {
+	fc, ok := e.(*ir.FuncCall)
+	if !ok {
+		return false
+	}
+	switch fc.Name {
+	case "count", "sum", "min", "max", "avg":
+		return true
+	}
+	return false
 }
 
 func (p *parser) parseSelectList() ([]ir.Expr, []string, error) {

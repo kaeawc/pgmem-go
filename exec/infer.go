@@ -57,6 +57,14 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 		walkParamsSort(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Limit:
 		walkParamsLimit(p, sch, scopeTable, hint, maxIdx)
+	case *ir.Aggregate:
+		next := scopeFor(p.Input, scopeTable)
+		walkParams(p.Input, sch, next, hint, maxIdx)
+		for _, c := range p.Calls {
+			if c.Arg != nil {
+				walkExprParams(c.Arg, nil, sch, next, hint, maxIdx)
+			}
+		}
 	case *ir.Insert:
 		walkParamsInsert(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Delete:
