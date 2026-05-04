@@ -199,6 +199,80 @@ var builtins = map[string]builtinFunc{
 			return string(s[start:]), nil
 		},
 	},
+	"abs": {
+		// abs(int) — preserves the operand's integer width.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("abs: takes 1 argument, got %d", len(args))
+			}
+			t := args[0].Type()
+			if t == nil {
+				t = types.Int4
+			}
+			return t, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			switch v := args[0].(type) {
+			case int32:
+				if v < 0 {
+					return -v, nil
+				}
+				return v, nil
+			case int64:
+				if v < 0 {
+					return -v, nil
+				}
+				return v, nil
+			default:
+				return nil, fmt.Errorf("abs: want integer, got %T", args[0])
+			}
+		},
+	},
+	"mod": {
+		// mod(a, b) — integer remainder. Sign follows the dividend, like
+		// PG. Division by zero is SQLSTATE 22012.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("mod: takes 2 arguments, got %d", len(args))
+			}
+			t := args[0].Type()
+			if args[1].Type() == types.Int8 {
+				t = types.Int8
+			}
+			if t == nil {
+				t = types.Int4
+			}
+			return t, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			a, err := toInt64(args[0])
+			if err != nil {
+				return nil, fmt.Errorf("mod: %w", err)
+			}
+			b, err := toInt64(args[1])
+			if err != nil {
+				return nil, fmt.Errorf("mod: %w", err)
+			}
+			if b == 0 {
+				return nil, &SQLError{Code: "22012", Message: "division by zero"}
+			}
+			return a % b, nil
+		},
+	},
+	"greatest": {
+		ResultType: variadicSameType("greatest"),
+		Eval:       variadicReduce(func(cmp int) bool { return cmp > 0 }),
+	},
+	"least": {
+		ResultType: variadicSameType("least"),
+		Eval:       variadicReduce(func(cmp int) bool { return cmp < 0 }),
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -228,6 +302,50 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
 		},
 	},
+}
+
+// variadicSameType is the ResultType for greatest/least: the result
+// type matches the operands. We pick the first non-nil-typed argument
+// (mirroring PG's "first known type wins" rule for these polymorphic
+// builtins).
+func variadicSameType(name string) func(args []ir.Expr) (types.Type, error) {
+	return func(args []ir.Expr) (types.Type, error) {
+		if len(args) == 0 {
+			return nil, fmt.Errorf("%s: takes at least 1 argument", name)
+		}
+		for _, a := range args {
+			if a.Type() != nil {
+				return a.Type(), nil
+			}
+		}
+		return types.Int4, nil
+	}
+}
+
+// variadicReduce folds args left-to-right with prefer(cmp(current,
+// candidate)) selecting the running winner. NULLs are skipped; if all
+// args are NULL the result is NULL — matching real PG.
+func variadicReduce(prefer func(cmp int) bool) func(env *Env, args []any) (any, error) {
+	return func(_ *Env, args []any) (any, error) {
+		var winner any
+		for _, a := range args {
+			if a == nil {
+				continue
+			}
+			if winner == nil {
+				winner = a
+				continue
+			}
+			cmp, err := compareValues(a, winner)
+			if err != nil {
+				return nil, err
+			}
+			if prefer(cmp) {
+				winner = a
+			}
+		}
+		return winner, nil
+	}
 }
 
 // textArg is the soft cast every string-shaped builtin uses on its
