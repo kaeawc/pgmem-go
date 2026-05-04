@@ -61,8 +61,8 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 		next := scopeFor(p.Input, scopeTable)
 		walkParams(p.Input, sch, next, hint, maxIdx)
 		for _, c := range p.Calls {
-			if c.Arg != nil {
-				walkExprParams(c.Arg, nil, sch, next, hint, maxIdx)
+			for _, a := range c.Args {
+				walkExprParams(a, nil, sch, next, hint, maxIdx)
 			}
 		}
 	case *ir.Distinct:
