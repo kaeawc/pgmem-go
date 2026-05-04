@@ -80,6 +80,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildLimit(p, env)
 	case *ir.CreateTable:
 		return buildCreateTable(p, env), nil
+	case *ir.DropTable:
+		return buildDropTable(p, env), nil
 	case *ir.Insert:
 		return buildInsert(p, env)
 	case *ir.Delete:
@@ -590,6 +592,17 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 			return err
 		}
 		env.Engine.CreateTable(p.Name, len(cols))
+		return nil
+	}}
+}
+
+func buildDropTable(p *ir.DropTable, env *Env) Operator {
+	return &ddlOp{tag: "DROP TABLE", do: func() error {
+		ok := env.Schema.DropTable(p.Name)
+		if !ok && !p.IfExists {
+			return &SQLError{Code: "42P01", Message: fmt.Sprintf("table %q does not exist", p.Name)}
+		}
+		env.Engine.DropTable(p.Name)
 		return nil
 	}}
 }
