@@ -2,6 +2,7 @@ package parse
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/types"
@@ -30,6 +31,22 @@ func (p *parser) accept(k tokenKind) bool {
 		return true
 	}
 	return false
+}
+
+// acceptIdent consumes the next token if it is an identifier whose
+// value matches name (case-insensitive). Used for context-keywords
+// like NULLS / FIRST / LAST that PG keeps non-reserved so they can
+// still be used as column names.
+func (p *parser) acceptIdent(name string) bool {
+	t := p.peek()
+	if t.kind != tIdent {
+		return false
+	}
+	if !strings.EqualFold(t.val, name) {
+		return false
+	}
+	p.pos++
+	return true
 }
 
 func (p *parser) expect(k tokenKind, ctx string) (token, error) {
@@ -883,7 +900,18 @@ func (p *parser) parseSortKeys() ([]ir.SortKey, error) {
 		} else if p.accept(kwAsc) {
 			desc = false
 		}
-		out = append(out, ir.SortKey{Expr: e, Desc: desc})
+		nulls := ir.NullsDefault
+		if p.acceptIdent("nulls") {
+			switch {
+			case p.acceptIdent("first"):
+				nulls = ir.NullsFirst
+			case p.acceptIdent("last"):
+				nulls = ir.NullsLast
+			default:
+				return nil, fmt.Errorf("parse: expected FIRST or LAST after NULLS at %d", p.peek().pos)
+			}
+		}
+		out = append(out, ir.SortKey{Expr: e, Desc: desc, Nulls: nulls})
 		if p.accept(tComma) {
 			continue
 		}

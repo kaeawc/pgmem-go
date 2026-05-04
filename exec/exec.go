@@ -573,7 +573,7 @@ func buildSort(p *ir.Sort, env *Env) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
-		keys[i] = ir.SortKey{Expr: resolved, Desc: k.Desc}
+		keys[i] = ir.SortKey{Expr: resolved, Desc: k.Desc, Nulls: k.Nulls}
 	}
 	rows, err := drain(in)
 	if err != nil {
@@ -583,6 +583,27 @@ func buildSort(p *ir.Sort, env *Env) (Operator, error) {
 		return nil, err
 	}
 	return &materializedOp{cols: in.OutputSchema(), rows: rows}, nil
+}
+
+// nullSortLess decides whether the i-th row should sort before the
+// j-th row when one operand of the current sort key is NULL. aIsNull
+// is true iff the i-th row's key value is NULL (the j-th is non-NULL,
+// since the all-NULL case is handled by the caller).
+//
+// PG default: ASC sorts NULLs LAST, DESC sorts NULLs FIRST. Explicit
+// NULLS FIRST/LAST overrides the default for the key.
+func nullSortLess(aIsNull bool, k ir.SortKey) bool {
+	nullsFirst := k.Desc
+	switch k.Nulls {
+	case ir.NullsFirst:
+		nullsFirst = true
+	case ir.NullsLast:
+		nullsFirst = false
+	}
+	if aIsNull {
+		return nullsFirst
+	}
+	return !nullsFirst
 }
 
 func sortRows(rows []Row, keys []ir.SortKey, env *Env) error {
@@ -601,6 +622,12 @@ func sortRows(rows []Row, keys []ir.SortKey, env *Env) error {
 			if err != nil {
 				sortErr = err
 				return false
+			}
+			if a == nil || b == nil {
+				if a == nil && b == nil {
+					continue
+				}
+				return nullSortLess(a == nil, k)
 			}
 			cmp, err := compareValues(a, b)
 			if err != nil {
