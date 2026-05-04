@@ -251,6 +251,21 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 		for _, a := range x.Args {
 			walkExprParams(a, nil, sch, scopeTable, hint, maxIdx)
 		}
+	case *ir.InListExpr:
+		// `probe IN (a, b, ...)`: probe and each list element propagate
+		// types to one another. We don't know which side carries the
+		// concrete type at parse time, so descend with no expected hint
+		// and rely on the BinOp-style propagation in nested cases.
+		walkExprParams(x.Probe, nil, sch, scopeTable, hint, maxIdx)
+		probeType := exprStaticType(x.Probe, sch, scopeTable)
+		for _, e := range x.List {
+			walkExprParams(e, probeType, sch, scopeTable, hint, maxIdx)
+		}
+	case *ir.InSubqueryExpr:
+		walkExprParams(x.Probe, nil, sch, scopeTable, hint, maxIdx)
+		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
+	case *ir.ScalarSubquery:
+		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
 	case *ir.Literal, nil:
 		// nothing to record.
 	case *ir.ColumnRef:

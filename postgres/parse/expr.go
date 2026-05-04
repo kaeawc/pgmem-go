@@ -69,16 +69,71 @@ func (p *parser) parseComparison() (ir.Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	op, ok := comparisonOp(p.peek().kind)
-	if !ok {
-		return left, nil
+	if op, ok := comparisonOp(p.peek().kind); ok {
+		p.consume()
+		right, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		return &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool}, nil
 	}
-	p.consume()
-	right, err := p.parsePrimary()
-	if err != nil {
+	if p.peek().kind == kwIn {
+		return p.parseInClause(left, false)
+	}
+	if p.peek().kind == kwNot && p.lookahead(1).kind == kwIn {
+		p.consume() // NOT
+		return p.parseInClause(left, true)
+	}
+	return left, nil
+}
+
+// lookahead peeks N tokens ahead without consuming. Used to confirm
+// the NOT IN bigram before committing.
+func (p *parser) lookahead(n int) token {
+	if p.pos+n >= len(p.toks) {
+		return p.toks[len(p.toks)-1]
+	}
+	return p.toks[p.pos+n]
+}
+
+// parseInClause consumes IN ( <list-or-subquery> ). negate wraps the
+// result in NOT for `expr NOT IN (...)`.
+func (p *parser) parseInClause(probe ir.Expr, negate bool) (ir.Expr, error) {
+	if !p.accept(kwIn) {
+		return nil, fmt.Errorf("parse: expected IN at %d", p.peek().pos)
+	}
+	if _, err := p.expect(tLParen, "("); err != nil {
 		return nil, err
 	}
-	return &ir.BinOp{Op: op, Left: left, Right: right, T: types.Bool}, nil
+	var node ir.Expr
+	if p.peek().kind == kwSelect {
+		plan, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		node = &ir.InSubqueryExpr{Probe: probe, Plan: plan}
+	} else {
+		var list []ir.Expr
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			list = append(list, e)
+			if p.accept(tComma) {
+				continue
+			}
+			break
+		}
+		node = &ir.InListExpr{Probe: probe, List: list}
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	if negate {
+		return &ir.UnaryOp{Op: "not", Expr: node, T: types.Bool}, nil
+	}
+	return node, nil
 }
 
 func comparisonOp(k tokenKind) (string, bool) {
@@ -151,6 +206,19 @@ func (p *parser) parsePrimary() (ir.Expr, error) {
 
 func (p *parser) parseParenExpr() (ir.Expr, error) {
 	p.consume() // (
+	// `(SELECT ...)` is a scalar subquery primary; we commit only if
+	// we actually see SELECT after the paren so plain parenthesized
+	// expressions still work.
+	if p.peek().kind == kwSelect {
+		plan, err := p.parseSelect()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(tRParen, ")"); err != nil {
+			return nil, err
+		}
+		return &ir.ScalarSubquery{Plan: plan}, nil
+	}
 	e, err := p.parseExpr()
 	if err != nil {
 		return nil, err
