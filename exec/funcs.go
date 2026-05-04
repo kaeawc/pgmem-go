@@ -377,6 +377,33 @@ var builtins = map[string]builtinFunc{
 		ResultType: variadicSameType("least"),
 		Eval:       variadicReduce(func(cmp int) bool { return cmp < 0 }),
 	},
+	"date_trunc": {
+		// date_trunc(field, ts) returns the timestamp truncated to the
+		// named precision. Fields: year, month, day, hour, minute,
+		// second, week. Real PG also accepts millennium / century /
+		// decade / quarter / millisecond / microsecond — those arrive
+		// when a real query needs them.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("date_trunc: takes 2 arguments, got %d", len(args))
+			}
+			return types.Timestamptz, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil || args[1] == nil {
+				return nil, nil
+			}
+			field, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("date_trunc: field must be text, got %T", args[0])
+			}
+			ts, ok := args[1].(time.Time)
+			if !ok {
+				return nil, fmt.Errorf("date_trunc: source must be timestamp, got %T", args[1])
+			}
+			return dateTrunc(field, ts)
+		},
+	},
 	"date_part": {
 		// date_part(field, ts) — real PG returns double precision; our
 		// supported fields are whole numbers, so int8 is the closest
@@ -432,6 +459,34 @@ var builtins = map[string]builtinFunc{
 			return int32(len([]rune(haystack[:byteIdx])) + 1), nil
 		},
 	},
+}
+
+// dateTrunc returns ts truncated to the named precision. Behaviour
+// matches real PG for the supported fields.
+func dateTrunc(field string, ts time.Time) (any, error) {
+	t := ts.UTC()
+	switch strings.ToLower(field) {
+	case "year":
+		return time.Date(t.Year(), 1, 1, 0, 0, 0, 0, time.UTC), nil
+	case "month":
+		return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, time.UTC), nil
+	case "day":
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC), nil
+	case "hour":
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC), nil
+	case "minute":
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC), nil
+	case "second":
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC), nil
+	case "week":
+		// Truncate to Monday — matches PG. Go's Weekday: Sunday=0
+		// through Saturday=6; we convert to ISO Monday-based offset.
+		offset := (int(t.Weekday()) + 6) % 7
+		monday := t.AddDate(0, 0, -offset)
+		return time.Date(monday.Year(), monday.Month(), monday.Day(), 0, 0, 0, 0, time.UTC), nil
+	default:
+		return nil, fmt.Errorf("date_trunc: unsupported field %q", field)
+	}
 }
 
 // datePart returns the value of `field` extracted from `ts`. Field
