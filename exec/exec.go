@@ -570,6 +570,9 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		var checks []catalog.Check
 		for i, c := range p.Columns {
 			cols[i] = catalog.Column{Name: c.Name, Type: c.Type, NotNull: c.NotNull, Unique: c.Unique, Auto: c.Auto}
+			if c.References != nil {
+				cols[i].References = catalog.ColumnRef{Table: c.References.Table, Column: c.References.Column}
+			}
 			if c.Check != nil {
 				checks = append(checks, catalog.Check{
 					Name: p.Name + "_" + c.Name + "_check",
@@ -791,6 +794,9 @@ func (i *insertOp) runOnce() error {
 	if err := checkChecks(i.ct, built, i.env); err != nil {
 		return err
 	}
+	if err := checkForeignKeys(i.ct, built, i.env); err != nil {
+		return err
+	}
 	for _, row := range built {
 		i.table.Insert(row)
 		i.inserted++
@@ -855,6 +861,120 @@ func checkNotNull(ct catalog.Table, row storage.Row) error {
 		}
 		if idx >= len(row) || row[idx] == nil {
 			return NotNullViolation(ct.Name, col.Name)
+		}
+	}
+	return nil
+}
+
+// checkForeignKeys validates each row's FK columns against their
+// parent tables. NULL values are skipped — SQL leaves NULL FKs alone
+// (it's the standard "match simple" behaviour). The parent lookup
+// reads from the same txn so an in-tx INSERT into the parent is
+// visible to a follow-up INSERT into the child.
+func checkForeignKeys(ct catalog.Table, rows []storage.Row, env *Env) error {
+	if env == nil {
+		return nil
+	}
+	for colIdx, col := range ct.Columns {
+		if col.References.Table == "" {
+			continue
+		}
+		parentTable, ok := env.Schema.Table(col.References.Table)
+		if !ok {
+			return fmt.Errorf("exec: FK %s.%s references unknown table %q", ct.Name, col.Name, col.References.Table)
+		}
+		parentColIdx := -1
+		for i, pc := range parentTable.Columns {
+			if pc.Name == col.References.Column {
+				parentColIdx = i
+				break
+			}
+		}
+		if parentColIdx < 0 {
+			return fmt.Errorf("exec: FK %s.%s references unknown column %s.%s",
+				ct.Name, col.Name, col.References.Table, col.References.Column)
+		}
+		parentRows, _ := env.Txn.Table(col.References.Table)
+		var existing []storage.Row
+		if parentRows != nil {
+			existing = parentRows.Rows()
+		}
+		for _, row := range rows {
+			if colIdx >= len(row) || row[colIdx] == nil {
+				continue
+			}
+			if !rowExistsWithValue(existing, parentColIdx, row[colIdx]) {
+				return FKViolationOnInsert(ct.Name, col.Name, col.References.Table)
+			}
+		}
+	}
+	return nil
+}
+
+// rowExistsWithValue is a linear scan — fine at M3 row counts.
+// Replace with the btree we already promise on UNIQUE columns when
+// performance starts to matter.
+func rowExistsWithValue(rows []storage.Row, colIdx int, want any) bool {
+	for _, r := range rows {
+		if colIdx >= len(r) {
+			continue
+		}
+		if r[colIdx] == nil {
+			continue
+		}
+		cmp, err := compareValues(r[colIdx], want)
+		if err == nil && cmp == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// checkReferencingTables enforces "ON DELETE RESTRICT" — refusing to
+// delete a parent row if any other table references it. Walks every
+// table in the schema, finds columns whose References point at ct, and
+// scans for rows pointing at any of the deleted rows. RESTRICT is the
+// default and the only mode this slice supports; CASCADE / SET NULL
+// land in a follow-up.
+func checkReferencingTables(parent catalog.Table, deleted []storage.Row, env *Env) error {
+	if env == nil || len(deleted) == 0 {
+		return nil
+	}
+	parentColIdx := map[string]int{}
+	for i, c := range parent.Columns {
+		parentColIdx[c.Name] = i
+	}
+	for _, child := range env.Schema.Tables() {
+		if child.Name == parent.Name {
+			continue
+		}
+		for childColIdx, childCol := range child.Columns {
+			if childCol.References.Table != parent.Name {
+				continue
+			}
+			pIdx, ok := parentColIdx[childCol.References.Column]
+			if !ok {
+				continue
+			}
+			childTbl, _ := env.Txn.Table(child.Name)
+			if childTbl == nil {
+				continue
+			}
+			childRows := childTbl.Rows()
+			for _, deletedRow := range deleted {
+				if pIdx >= len(deletedRow) || deletedRow[pIdx] == nil {
+					continue
+				}
+				for _, cr := range childRows {
+					if childColIdx >= len(cr) || cr[childColIdx] == nil {
+						continue
+					}
+					cmp, err := compareValues(cr[childColIdx], deletedRow[pIdx])
+					if err == nil && cmp == 0 {
+						return FKViolationOnDelete(parent.Name, child.Name)
+					}
+				}
+			}
 		}
 	}
 	return nil
@@ -941,7 +1061,7 @@ func buildDelete(p *ir.Delete, env *Env) (Operator, error) {
 	for i, c := range ct.Columns {
 		tableSchema[i] = Column{Name: c.Name, Type: c.Type}
 	}
-	op := &deleteOp{table: st, ct: ct, params: env.Params, tableSchema: tableSchema}
+	op := &deleteOp{table: st, ct: ct, env: env, params: env.Params, tableSchema: tableSchema}
 	if p.Where != nil {
 		cond, err := resolveExpr(p.Where, tableSchema, env)
 		if err != nil {
@@ -973,6 +1093,7 @@ type deleteOp struct {
 	ct          catalog.Table
 	tableSchema []Column
 	where       ir.Expr // nil → delete all
+	env         *Env
 	params      []Param
 
 	done    bool
@@ -1024,6 +1145,13 @@ func (d *deleteOp) runOnce() error {
 			} else {
 				kept = append(kept, row)
 			}
+		}
+		// FK RESTRICT: if any child table still references rows we're
+		// about to delete, abort and leave the parent table unchanged.
+		if err := checkReferencingTables(d.ct, deleted, d.env); err != nil {
+			evalErr = err
+			deleted = nil
+			return rows
 		}
 		return kept
 	})
@@ -1203,6 +1331,10 @@ func (u *updateOp) runOnce() error {
 			return rows
 		}
 		if err := checkChecks(u.ct, updatedRows, u.env); err != nil {
+			evalErr = err
+			return rows
+		}
+		if err := checkForeignKeys(u.ct, updatedRows, u.env); err != nil {
 			evalErr = err
 			return rows
 		}

@@ -52,3 +52,26 @@ func CheckViolation(table, constraint string) *SQLError {
 		Message: fmt.Sprintf("new row for relation %q violates check constraint %q", table, constraint),
 	}
 }
+
+// FKViolationOnInsert reports SQLSTATE 23503 for the INSERT/UPDATE
+// case (a child row references a parent that doesn't exist). The
+// constraint name follows PG's implicit naming for column-level FKs;
+// the message includes the parent-table name the way PG does so test
+// assertions can match the standard wording.
+func FKViolationOnInsert(childTable, childColumn, parentTable string) *SQLError {
+	return &SQLError{
+		Code: "23503",
+		Message: fmt.Sprintf("insert or update on table %q violates foreign key constraint %q on table %q",
+			childTable, childTable+"_"+childColumn+"_fkey", parentTable),
+	}
+}
+
+// FKViolationOnDelete reports SQLSTATE 23503 for the DELETE case (the
+// parent row still has child references). Without an ON DELETE action
+// PG rejects with this exact message shape.
+func FKViolationOnDelete(parentTable, childTable string) *SQLError {
+	return &SQLError{
+		Code:    "23503",
+		Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint on table %q", parentTable, childTable),
+	}
+}
