@@ -891,11 +891,11 @@ func buildScalarOrPlainSelect(input ir.Node, exprs []ir.Expr, names []string) (i
 	calls := make([]ir.AggregateCall, len(exprs))
 	for i, e := range exprs {
 		fc := e.(*ir.FuncCall)
-		var arg ir.Expr
-		if !fc.Star && len(fc.Args) > 0 {
-			arg = fc.Args[0]
+		var args []ir.Expr
+		if !fc.Star {
+			args = fc.Args
 		}
-		calls[i] = ir.AggregateCall{Func: fc.Name, Arg: arg, Output: names[i]}
+		calls[i] = ir.AggregateCall{Func: fc.Name, Args: args, Output: names[i]}
 	}
 	return &ir.Aggregate{Input: input, Calls: calls}, nil
 }
@@ -991,11 +991,11 @@ func (r *aggRewriter) rewriteAnyExpr(e ir.Expr) ir.Expr {
 
 func (r *aggRewriter) replaceAggregate(fc *ir.FuncCall) ir.Expr {
 	synth := fmt.Sprintf("__agg_%d", len(r.calls))
-	var arg ir.Expr
-	if !fc.Star && len(fc.Args) > 0 {
-		arg = fc.Args[0]
+	var args []ir.Expr
+	if !fc.Star {
+		args = fc.Args
 	}
-	r.calls = append(r.calls, ir.AggregateCall{Func: fc.Name, Arg: arg, Output: synth})
+	r.calls = append(r.calls, ir.AggregateCall{Func: fc.Name, Args: args, Output: synth})
 	return &ir.ColumnRef{Name: synth}
 }
 
@@ -1031,7 +1031,7 @@ func isAggregateCall(e ir.Expr) bool {
 		return false
 	}
 	switch fc.Name {
-	case "count", "sum", "min", "max", "avg":
+	case "count", "sum", "min", "max", "avg", "string_agg":
 		return true
 	}
 	return false

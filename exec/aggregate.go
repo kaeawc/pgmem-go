@@ -47,14 +47,16 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 		groupCols[i] = Column{Qualifier: c.Qualifier, Name: c.Name, Type: resolved.Type()}
 	}
 
-	resolvedArgs := make([]ir.Expr, len(p.Calls))
+	resolvedArgs := make([][]ir.Expr, len(p.Calls))
 	for i, call := range p.Calls {
-		if call.Arg != nil {
-			resolvedArgs[i], err = resolveExpr(call.Arg, inSchema, env)
+		resolvedArgs[i] = make([]ir.Expr, len(call.Args))
+		for j, a := range call.Args {
+			r, err := resolveExpr(a, inSchema, env)
 			if err != nil {
 				in.Close()
 				return nil, err
 			}
+			resolvedArgs[i][j] = r
 		}
 	}
 	// Probe accumulator types via a throwaway accumulator set — the
@@ -84,9 +86,9 @@ func buildAggregate(p *ir.Aggregate, env *Env) (Operator, error) {
 	}, nil
 }
 
-// newAccumulatorSet builds one accumulator per call. resolvedArgs is
-// parallel to calls; nil entries correspond to COUNT(*).
-func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs []ir.Expr) ([]aggAcc, error) {
+// newAccumulatorSet builds one accumulator per call. resolvedArgs[i]
+// is the resolved argument list for calls[i] — empty for COUNT(*).
+func newAccumulatorSet(calls []ir.AggregateCall, resolvedArgs [][]ir.Expr) ([]aggAcc, error) {
 	out := make([]aggAcc, len(calls))
 	for i, call := range calls {
 		acc, err := newAggregator(call.Func, resolvedArgs[i])
@@ -109,8 +111,8 @@ type aggAcc interface {
 type aggregateOp struct {
 	in        Operator
 	calls     []ir.AggregateCall
-	callArgs  []ir.Expr // parallel to calls; nil for COUNT(*)
-	groupKeys []ir.Expr // resolved against input schema; empty for scalar agg
+	callArgs  [][]ir.Expr // parallel to calls; empty for COUNT(*)
+	groupKeys []ir.Expr   // resolved against input schema; empty for scalar agg
 	cols      []Column
 	env       *Env
 
@@ -243,7 +245,11 @@ func groupKeyString(vals []any) string {
 	return strings.Join(parts, "\x00")
 }
 
-func newAggregator(name string, arg ir.Expr) (aggAcc, error) {
+func newAggregator(name string, args []ir.Expr) (aggAcc, error) {
+	var arg ir.Expr
+	if len(args) > 0 {
+		arg = args[0]
+	}
 	switch name {
 	case "count":
 		return &countAgg{arg: arg}, nil
@@ -255,8 +261,68 @@ func newAggregator(name string, arg ir.Expr) (aggAcc, error) {
 		return &minMaxAgg{arg: arg, isMax: true}, nil
 	case "avg":
 		return &avgAgg{arg: arg}, nil
+	case "string_agg":
+		if len(args) != 2 {
+			return nil, fmt.Errorf("exec: string_agg takes 2 arguments, got %d", len(args))
+		}
+		return &stringAggAcc{value: args[0], sep: args[1]}, nil
 	}
 	return nil, fmt.Errorf("exec: unknown aggregate %q", name)
+}
+
+type stringAggAcc struct {
+	value ir.Expr
+	sep   ir.Expr
+	parts []string
+	seps  []string
+	any   bool
+}
+
+func (s *stringAggAcc) resultType() types.Type { return types.Text }
+
+func (s *stringAggAcc) accept(in Row, env *Env) error {
+	v, err := evalExpr(s.value, in, env)
+	if err != nil {
+		return err
+	}
+	if v == nil {
+		return nil
+	}
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Errorf("exec: string_agg value must be text, got %T", v)
+	}
+	sepVal, err := evalExpr(s.sep, in, env)
+	if err != nil {
+		return err
+	}
+	sep, ok := sepVal.(string)
+	if !ok {
+		// NULL separator collapses to "" — same as PG when the column
+		// providing the separator yields NULL.
+		sep = ""
+	}
+	s.parts = append(s.parts, str)
+	s.seps = append(s.seps, sep)
+	s.any = true
+	return nil
+}
+
+func (s *stringAggAcc) result() (any, error) {
+	if !s.any {
+		return nil, nil
+	}
+	var b strings.Builder
+	for i, p := range s.parts {
+		if i > 0 {
+			// Use the separator captured *with the second value*; PG uses
+			// the separator from any matching row (it's typically a
+			// constant), but takes the per-row value when it varies.
+			b.WriteString(s.seps[i])
+		}
+		b.WriteString(p)
+	}
+	return b.String(), nil
 }
 
 // --- count ---

@@ -147,12 +147,14 @@ func (*Distinct) node() {}
 
 // AggregateCall is one entry in an Aggregate node's Calls slice.
 //
-//	Func — lower-case name (count, sum, min, max, avg).
-//	Arg  — the argument expression, or nil for COUNT(*).
+//	Func   — lower-case name (count, sum, min, max, avg, string_agg).
+//	Args   — the argument expressions. Empty for COUNT(*); single
+//	         entry for unary aggregates; two entries for two-arg
+//	         aggregates like string_agg(expr, sep).
 //	Output — the result column name in the Aggregate's output schema.
 type AggregateCall struct {
 	Func   string
-	Arg    Expr
+	Args   []Expr
 	Output string
 }
 
