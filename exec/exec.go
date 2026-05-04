@@ -101,6 +101,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildCreateView(p, env), nil
 	case *ir.DropView:
 		return buildDropView(p, env), nil
+	case *ir.AlterTable:
+		return buildAlterTable(p, env), nil
 	case *ir.CreateIndex:
 		return &ddlOp{tag: "CREATE INDEX", do: func() error { return nil }}, nil
 	case *ir.DropIndex:
@@ -1201,6 +1203,124 @@ func buildCreateTable(p *ir.CreateTable, env *Env) Operator {
 		env.Engine.CreateTable(p.Name, len(cols))
 		return nil
 	}}
+}
+
+// buildAlterTable mutates the catalog and reshapes storage rows for
+// ADD/DROP/RENAME COLUMN. Rows are rewritten in place: ADD appends
+// a NULL slot, DROP removes the corresponding slot, RENAME leaves
+// row data untouched (only the catalog column name changes).
+func buildAlterTable(p *ir.AlterTable, env *Env) Operator {
+	return &ddlOp{tag: "ALTER TABLE", do: func() error {
+		tbl, ok := env.Schema.Table(p.Table)
+		if !ok {
+			return &SQLError{Code: "42P01", Message: fmt.Sprintf("table %q does not exist", p.Table)}
+		}
+		switch p.Action {
+		case ir.AlterTableAddColumn:
+			return alterTableAdd(env, tbl, p.AddCol)
+		case ir.AlterTableDropColumn:
+			return alterTableDrop(env, tbl, p.DropName, p.IfExistsCol)
+		case ir.AlterTableRenameColumn:
+			return alterTableRename(env, tbl, p.RenameOld, p.RenameNew)
+		default:
+			return fmt.Errorf("exec: unknown ALTER TABLE action %d", p.Action)
+		}
+	}}
+}
+
+func alterTableAdd(env *Env, tbl catalog.Table, def ir.ColumnDef) error {
+	for _, c := range tbl.Columns {
+		if c.Name == def.Name {
+			return &SQLError{Code: "42701", Message: fmt.Sprintf("column %q of relation %q already exists", def.Name, tbl.Name)}
+		}
+	}
+	st, ok := env.Txn.Table(tbl.Name)
+	if !ok {
+		return fmt.Errorf("exec: storage missing table %q", tbl.Name)
+	}
+	rows := st.Rows()
+	if def.NotNull && len(rows) > 0 {
+		return &SQLError{Code: "23502", Message: fmt.Sprintf("column %q contains null values", def.Name)}
+	}
+	newCol := catalog.Column{Name: def.Name, Type: def.Type, NotNull: def.NotNull, Unique: def.Unique, Auto: def.Auto}
+	if def.References != nil {
+		newCol.References = catalog.ColumnRef{
+			Table:    def.References.Table,
+			Column:   def.References.Column,
+			OnDelete: catalog.OnDeleteAction(def.References.OnDelete),
+		}
+	}
+	tbl.Columns = append(tbl.Columns, newCol)
+	if def.Check != nil {
+		tbl.Checks = append(tbl.Checks, catalog.Check{
+			Name: tbl.Name + "_" + def.Name + "_check",
+			Expr: def.Check,
+		})
+	}
+	if err := env.Schema.CreateTable(tbl); err != nil {
+		return err
+	}
+	st.Mutate(func(rs []storage.Row) []storage.Row {
+		for i := range rs {
+			rs[i] = append(rs[i], nil)
+		}
+		return rs
+	})
+	return nil
+}
+
+func alterTableDrop(env *Env, tbl catalog.Table, name string, ifExists bool) error {
+	idx := -1
+	for i, c := range tbl.Columns {
+		if c.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		if ifExists {
+			return nil
+		}
+		return &SQLError{Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+	}
+	st, ok := env.Txn.Table(tbl.Name)
+	if !ok {
+		return fmt.Errorf("exec: storage missing table %q", tbl.Name)
+	}
+	tbl.Columns = append(tbl.Columns[:idx:idx], tbl.Columns[idx+1:]...)
+	if err := env.Schema.CreateTable(tbl); err != nil {
+		return err
+	}
+	st.Mutate(func(rs []storage.Row) []storage.Row {
+		for i := range rs {
+			r := rs[i]
+			if idx >= len(r) {
+				continue
+			}
+			rs[i] = append(r[:idx:idx], r[idx+1:]...)
+		}
+		return rs
+	})
+	return nil
+}
+
+func alterTableRename(env *Env, tbl catalog.Table, oldName, newName string) error {
+	idx := -1
+	for i, c := range tbl.Columns {
+		if c.Name == oldName {
+			idx = i
+		}
+		if c.Name == newName {
+			return &SQLError{Code: "42701", Message: fmt.Sprintf("column %q of relation %q already exists", newName, tbl.Name)}
+		}
+	}
+	if idx < 0 {
+		return &SQLError{Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", oldName, tbl.Name)}
+	}
+	cols := append([]catalog.Column(nil), tbl.Columns...)
+	cols[idx].Name = newName
+	tbl.Columns = cols
+	return env.Schema.CreateTable(tbl)
 }
 
 func buildTruncate(p *ir.Truncate, env *Env) (Operator, error) {

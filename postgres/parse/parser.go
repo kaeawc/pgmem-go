@@ -89,6 +89,9 @@ func (p *parser) parseStmt() (ir.Node, error) {
 	case kwTruncate:
 		return p.parseTruncate()
 	default:
+		if tok.kind == tIdent && strings.EqualFold(tok.val, "alter") {
+			return p.parseAlterTable()
+		}
 		return nil, fmt.Errorf("parse: unsupported leading token %q", tok.val)
 	}
 }
@@ -413,6 +416,100 @@ func (p *parser) parseDropTable() (ir.Node, error) {
 		return nil, err
 	}
 	return &ir.DropTable{Name: name.val, IfExists: ifExists}, nil
+}
+
+// parseAlterTable consumes `ALTER TABLE [IF EXISTS] name <action>`
+// where <action> is one of:
+//
+//	ADD [COLUMN] [IF NOT EXISTS] col type [constraints]
+//	DROP [COLUMN] [IF EXISTS] col [CASCADE|RESTRICT]
+//	RENAME [COLUMN] old TO new
+//
+// Multi-action ALTERs (comma-separated) are not supported.
+func (p *parser) parseAlterTable() (ir.Node, error) {
+	p.consume() // ALTER (ident)
+	if _, err := p.expect(kwTable, "TABLE"); err != nil {
+		return nil, err
+	}
+	if p.accept(kwIf) {
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		// We don't model "alter if exists" specially — if the table
+		// is missing the exec layer surfaces a clear error.
+	}
+	tbl, err := p.expect(tIdent, "table name")
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case p.acceptIdent("add"):
+		return p.parseAlterTableAdd(tbl.val)
+	case p.accept(kwDrop):
+		return p.parseAlterTableDrop(tbl.val)
+	case p.acceptIdent("rename"):
+		return p.parseAlterTableRename(tbl.val)
+	default:
+		return nil, fmt.Errorf("parse: expected ADD/DROP/RENAME after ALTER TABLE %s at %d", tbl.val, p.peek().pos)
+	}
+}
+
+func (p *parser) parseAlterTableAdd(table string) (ir.Node, error) {
+	p.acceptIdent("column") // optional
+	// IF NOT EXISTS: accepted for parser compatibility, no extra
+	// behaviour — adding the same column twice will fail at the
+	// catalog layer regardless.
+	if p.accept(kwIf) {
+		if !p.accept(kwNot) {
+			return nil, fmt.Errorf("parse: expected NOT after IF at %d", p.peek().pos)
+		}
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+	}
+	col, err := p.parseColumnDef()
+	if err != nil {
+		return nil, err
+	}
+	return &ir.AlterTable{Table: table, Action: ir.AlterTableAddColumn, AddCol: col}, nil
+}
+
+func (p *parser) parseAlterTableDrop(table string) (ir.Node, error) {
+	p.acceptIdent("column") // optional
+	ifExists := false
+	if p.accept(kwIf) {
+		if _, err := p.expect(kwExists, "EXISTS"); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	name, err := p.expect(tIdent, "column name")
+	if err != nil {
+		return nil, err
+	}
+	// Optional CASCADE/RESTRICT — we don't model dependent objects,
+	// so both are accepted and ignored. CASCADE is a real keyword;
+	// RESTRICT lives only as a context-ident in our lexer.
+	if !p.accept(kwCascade) {
+		p.acceptIdent("restrict")
+	}
+	return &ir.AlterTable{Table: table, Action: ir.AlterTableDropColumn, DropName: name.val, IfExistsCol: ifExists}, nil
+}
+
+func (p *parser) parseAlterTableRename(table string) (ir.Node, error) {
+	p.acceptIdent("column") // optional
+	old, err := p.expect(tIdent, "column name")
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptIdent("to") {
+		return nil, fmt.Errorf("parse: expected TO after RENAME column at %d", p.peek().pos)
+	}
+	newName, err := p.expect(tIdent, "new column name")
+	if err != nil {
+		return nil, err
+	}
+	return &ir.AlterTable{Table: table, Action: ir.AlterTableRenameColumn, RenameOld: old.val, RenameNew: newName.val}, nil
 }
 
 // --- CREATE TABLE ---
