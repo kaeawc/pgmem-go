@@ -7,11 +7,16 @@
 // only; Commit replaces the engine's canonical rows under the table
 // write lock.
 //
+// Concurrent-tx conflict detection is per-table: each canonical table
+// carries a version counter that's bumped on every committed write,
+// and Commit refuses to apply a dirty snapshot whose recorded version
+// no longer matches canonical. That's coarser than real PG's per-row
+// SI (two txns writing different rows of the same table both abort one
+// of themselves here), but it's correctness-preserving — no lost
+// writes — and matches the docs callers should consult before
+// designing concurrent test scenarios.
+//
 // What we deliberately don't do (yet):
-//   - Concurrent-tx conflict detection. Two simultaneous transactions
-//     that touch the same table will both commit — last writer wins.
-//     Real PG SI rejects the second commit with a serialization error;
-//     a follow-up piece adds that.
 //   - Per-row version chains. Snapshots are whole-table copies; fine
 //     at the M3 row counts test suites use.
 package storage
@@ -60,6 +65,18 @@ type Txn interface {
 type SavepointError struct{ Name string }
 
 func (e *SavepointError) Error() string { return "savepoint " + e.Name + " does not exist" }
+
+// SerializationError is returned by Txn.Commit when a concurrent
+// transaction wrote to one of the tables this txn snapshotted (and
+// itself wrote to). The wire layer maps it to SQLSTATE 40001
+// ("serialization_failure") to match PG. Per-table granularity is
+// conservative — we err on the side of refusing the commit even if
+// the conflicting writes touched non-overlapping rows.
+type SerializationError struct{ Table string }
+
+func (e *SerializationError) Error() string {
+	return "could not serialize access due to concurrent update on table " + e.Table
+}
 
 // Table is an iterable, mutable collection of rows.
 type Table interface {
@@ -126,6 +143,7 @@ type table struct {
 	name     string
 	ncols    int
 	rows     []Row
+	version  uint64     // bumped on every committed mutation (Insert/Mutate/replaceLocked)
 	autoMu   sync.Mutex // guards the per-column SERIAL counters
 	autoNext map[int]int64
 }
@@ -136,6 +154,7 @@ func (t *table) Insert(r Row) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.rows = append(t.rows, append(Row(nil), r...))
+	t.version++
 }
 
 func (t *table) Rows() []Row { return copyRows(t.lockedRows()) }
@@ -150,12 +169,15 @@ func (t *table) Mutate(mutator func([]Row) []Row) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.rows = mutator(copyRows(t.rows))
+	t.version++
 }
 
 // replaceLocked is used by Commit to overwrite canonical state from a
-// txn snapshot. The caller holds t.mu.
+// txn snapshot. The caller holds t.mu and bumps version explicitly via
+// Commit so the conflict check has a chance to fire first.
 func (t *table) replaceLocked(rows []Row) {
 	t.rows = rows
+	t.version++
 }
 
 // NextAuto advances and returns the SERIAL counter for colIdx. First
@@ -187,7 +209,17 @@ type txn struct {
 // undone, including newly-touched tables).
 type savepointFrame struct {
 	name   string
-	tables map[string][]Row
+	tables map[string]savepointEntry
+}
+
+// savepointEntry is one table's contribution to a savepoint frame: the
+// rows at savepoint time plus the snapshot version recorded when the
+// txn first touched the table. Preserving the version means commit-
+// time conflict detection still reflects the original observation
+// point even after a ROLLBACK TO SAVEPOINT.
+type savepointEntry struct {
+	rows        []Row
+	snapVersion uint64
 }
 
 func (t *txn) Table(name string) (Table, bool) {
@@ -205,7 +237,14 @@ func (t *txn) Table(name string) (Table, bool) {
 	if !ok {
 		return nil, false
 	}
-	wrap := &txnTable{name: name, rows: copyRows(canonical.lockedRows()), canonical: canonical}
+	canonical.mu.RLock()
+	wrap := &txnTable{
+		name:        name,
+		rows:        copyRows(canonical.rows),
+		canonical:   canonical,
+		snapVersion: canonical.version,
+	}
+	canonical.mu.RUnlock()
 	t.snapshots[name] = wrap
 	return wrap, true
 }
@@ -214,6 +253,14 @@ func (t *txn) Table(name string) (Table, bool) {
 // only read (dirty == false) are skipped. We acquire each canonical
 // table's write lock in deterministic name order to avoid the trivial
 // deadlock of two txns committing two tables in opposite orders.
+//
+// Conflict detection: under the canonical table's write lock we check
+// that the table's version hasn't moved since this txn snapshotted it.
+// If it has, another transaction committed a write to the same table
+// in the interim — we abort with a SerializationError so the caller
+// can retry. Only dirty (this-tx-wrote) tables participate; pure-read
+// snapshots are not a conflict (we still apply snapshot isolation
+// semantics for reads).
 func (t *txn) Commit() error {
 	t.mu.Lock()
 	if t.closed {
@@ -229,6 +276,19 @@ func (t *txn) Commit() error {
 	}
 	t.mu.Unlock()
 	sortByName(dirty)
+	// Two passes: lock-and-check, then lock-and-apply. We take all
+	// locks together so an intervening writer can't sneak between the
+	// check and the apply.
+	type held struct {
+		canonical *table
+		snap      *txnTable
+	}
+	var locked []held
+	defer func() {
+		for _, h := range locked {
+			h.canonical.mu.Unlock()
+		}
+	}()
 	for _, snap := range dirty {
 		t.e.mu.RLock()
 		canonical := t.e.tables[snap.name]
@@ -237,8 +297,15 @@ func (t *txn) Commit() error {
 			continue // table was dropped between snapshot and commit
 		}
 		canonical.mu.Lock()
-		canonical.replaceLocked(copyRows(snap.rows))
-		canonical.mu.Unlock()
+		if canonical.version != snap.snapVersion {
+			// Release every lock and bail out.
+			canonical.mu.Unlock()
+			return &SerializationError{Table: snap.name}
+		}
+		locked = append(locked, held{canonical: canonical, snap: snap})
+	}
+	for _, h := range locked {
+		h.canonical.replaceLocked(copyRows(h.snap.rows))
 	}
 	return nil
 }
@@ -267,10 +334,10 @@ func (t *txn) Savepoint(name string) error {
 	if t.closed {
 		return nil
 	}
-	frame := savepointFrame{name: name, tables: make(map[string][]Row, len(t.snapshots))}
+	frame := savepointFrame{name: name, tables: make(map[string]savepointEntry, len(t.snapshots))}
 	for tbl, snap := range t.snapshots {
 		snap.mu.Lock()
-		frame.tables[tbl] = copyRows(snap.rows)
+		frame.tables[tbl] = savepointEntry{rows: copyRows(snap.rows), snapVersion: snap.snapVersion}
 		snap.mu.Unlock()
 	}
 	t.savepoints = append(t.savepoints, frame)
@@ -295,13 +362,21 @@ func (t *txn) RollbackToSavepoint(name string) error {
 	frame := t.savepoints[idx]
 	// Restore: replace snapshots with deep copies from the frame.
 	// We re-link each restored snapshot to its canonical so subsequent
-	// NextAuto calls keep advancing from the engine's counter.
+	// NextAuto calls keep advancing from the engine's counter, and we
+	// preserve snapVersion so commit-time conflict detection reflects
+	// the original observation point.
 	t.snapshots = make(map[string]*txnTable, len(frame.tables))
-	for tbl, rows := range frame.tables {
+	for tbl, entry := range frame.tables {
 		t.e.mu.RLock()
 		canonical := t.e.tables[tbl]
 		t.e.mu.RUnlock()
-		t.snapshots[tbl] = &txnTable{name: tbl, rows: copyRows(rows), dirty: true, canonical: canonical}
+		t.snapshots[tbl] = &txnTable{
+			name:        tbl,
+			rows:        copyRows(entry.rows),
+			dirty:       true,
+			canonical:   canonical,
+			snapVersion: entry.snapVersion,
+		}
 	}
 	// Drop savepoints created after the target.
 	t.savepoints = t.savepoints[:idx+1]
@@ -339,11 +414,12 @@ func findSavepoint(stack []savepointFrame, name string) int {
 // --- txn-scoped table wrapper ---
 
 type txnTable struct {
-	mu        sync.Mutex // guards rows / dirty (a txn is single-conn but Mutate may capture)
-	name      string
-	rows      []Row
-	dirty     bool
-	canonical *table // for NextAuto pass-through
+	mu          sync.Mutex // guards rows / dirty (a txn is single-conn but Mutate may capture)
+	name        string
+	rows        []Row
+	dirty       bool
+	canonical   *table // for NextAuto pass-through and conflict detection
+	snapVersion uint64 // canonical.version at the moment we snapshotted
 }
 
 func (tt *txnTable) Name() string { return tt.name }
