@@ -2,6 +2,12 @@
 -- subscription gating; self-join on messages for thread replies;
 -- LIMIT/OFFSET pagination.
 
+-- name: AddUser :one
+INSERT INTO users (name) VALUES ($1) RETURNING *;
+
+-- name: AddRoom :one
+INSERT INTO rooms (name) VALUES ($1) RETURNING *;
+
 -- name: PostMessage :one
 INSERT INTO messages (room_id, author_id, parent_id, body, sent_at)
 VALUES ($1, $2, $3, $4, $5)
@@ -27,11 +33,14 @@ ORDER BY sent_at DESC
 LIMIT $2 OFFSET $3;
 
 -- name: SubscribedRooms :many
-SELECT r.* FROM rooms r
-WHERE EXISTS (
-    SELECT 1 FROM subscriptions s
-    WHERE s.user_id = $1 AND s.room_id = r.id
-)
+-- The natural shape here is `WHERE EXISTS (SELECT 1 FROM
+-- subscriptions WHERE user_id = $1 AND room_id = r.id)`, but
+-- pgmem-go's EXISTS is uncorrelated only — the inner query can't
+-- reference the outer row. A DISTINCT join produces the same
+-- result and exercises JOIN + DISTINCT instead.
+SELECT DISTINCT r.id, r.name FROM rooms r
+JOIN subscriptions s ON s.room_id = r.id
+WHERE s.user_id = $1
 ORDER BY r.name;
 
 -- name: ReplyThread :many

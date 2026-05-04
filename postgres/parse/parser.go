@@ -386,6 +386,23 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 	}
 	var cols []ir.ColumnDef
 	for {
+		// Table-level constraints (`PRIMARY KEY (cols)`, `UNIQUE
+		// (cols)`, `FOREIGN KEY (cols) REFERENCES …`) sit alongside
+		// column definitions in the parens. We accept the common
+		// shapes here for parser compatibility — the actual
+		// constraint enforcement piggy-backs on the per-column flags
+		// already set by NOT NULL declarations and on ON CONFLICT's
+		// value-match path. Composite uniqueness arrives when a real
+		// query needs it.
+		if p.peek().kind == kwPrimary || p.peek().kind == kwUnique {
+			if err := p.skipTableConstraint(); err != nil {
+				return nil, err
+			}
+			if p.accept(tComma) {
+				continue
+			}
+			break
+		}
 		col, err := p.parseColumnDef()
 		if err != nil {
 			return nil, err
@@ -400,6 +417,36 @@ func (p *parser) parseCreateTable() (ir.Node, error) {
 		return nil, err
 	}
 	return &ir.CreateTable{Name: name.val, Columns: cols}, nil
+}
+
+// skipTableConstraint consumes a `PRIMARY KEY (cols)` or
+// `UNIQUE (cols)` table-level constraint without recording it. The
+// parser exists to accept real PG schemas; the constraint behaviour
+// it would imply is already covered by per-column flags + ON
+// CONFLICT's value-match path.
+func (p *parser) skipTableConstraint() error {
+	if p.accept(kwPrimary) {
+		if !p.accept(kwKey) {
+			return fmt.Errorf("parse: expected KEY after PRIMARY at %d", p.peek().pos)
+		}
+	} else if !p.accept(kwUnique) {
+		return fmt.Errorf("parse: unexpected token %q in CREATE TABLE", p.peek().val)
+	}
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return err
+	}
+	for {
+		if _, err := p.expect(tIdent, "constraint column name"); err != nil {
+			return err
+		}
+		if !p.accept(tComma) {
+			break
+		}
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (p *parser) parseColumnDef() (ir.ColumnDef, error) {
@@ -758,15 +805,18 @@ func (p *parser) parseWith() (ir.Node, error) {
 }
 
 // parseSelectMaybeUnion parses a SELECT, then any chain of
-// `UNION [ALL] SELECT ...`. Members are left-associated: the first
-// becomes the deepest Left in the resulting Union tree. ORDER BY /
-// LIMIT remain consumed by the inner parseSelect — applying them to
-// the whole union (real PG behaviour) needs grammar reshuffling that
-// we'll ship if a sqlc pattern needs it.
+// `UNION [ALL] SELECT ...`. Members are left-associated. When a
+// UNION is present, ORDER BY / LIMIT / FOR-locking parse once at the
+// end and apply to the whole union — matching real PG. For a plain
+// solo SELECT the trailing clauses attach with full alias-aware
+// resolution against the SELECT list.
 func (p *parser) parseSelectMaybeUnion() (ir.Node, error) {
-	left, err := p.parseSelect()
+	left, lExprs, lNames, err := p.parseSelectCoreInfo()
 	if err != nil {
 		return nil, err
+	}
+	if p.peek().kind != kwUnion {
+		return p.parseSelectTailSolo(left, lExprs, lNames)
 	}
 	for p.peek().kind == kwUnion {
 		p.consume() // UNION
@@ -774,35 +824,200 @@ func (p *parser) parseSelectMaybeUnion() (ir.Node, error) {
 		if p.peek().kind != kwSelect {
 			return nil, fmt.Errorf("parse: expected SELECT after UNION at %d", p.peek().pos)
 		}
-		right, err := p.parseSelect()
+		right, err := p.parseSelectCore()
 		if err != nil {
 			return nil, err
 		}
 		left = &ir.Union{Left: left, Right: right, All: all}
 	}
-	return left, nil
+	return p.parseSelectTailUnion(left)
 }
 
+// parseSelectCoreInfo is parseSelectCore but also reports the
+// SELECT-list expressions and aliases. The non-union path uses these
+// to rewrite trailing ORDER BY references that name an output alias.
+func (p *parser) parseSelectCoreInfo() (ir.Node, []ir.Expr, []string, error) {
+	plan, exprs, names, err := p.parseSelectCoreReturning()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return plan, exprs, names, nil
+}
+
+// parseSelectTailSolo consumes ORDER BY / LIMIT / FOR-locking after a
+// solo SELECT plan and rewrites bare ORDER BY column refs that
+// match an output alias to the underlying SELECT-list expression.
+// The Sort lands UNDER the Project so sort keys see base columns
+// (real PG behaviour).
+func (p *parser) parseSelectTailSolo(plan ir.Node, exprs []ir.Expr, names []string) (ir.Node, error) {
+	if p.peek().kind == kwOrder {
+		p.consume()
+		if _, err := p.expect(kwBy, "BY"); err != nil {
+			return nil, err
+		}
+		keys, err := p.parseSortKeys()
+		if err != nil {
+			return nil, err
+		}
+		// For aggregating plans the Project sits over an Aggregate;
+		// sort keys must resolve against Project's output schema, so
+		// the Sort wraps the plan and bare aliases work directly. For
+		// non-aggregating plans the Sort goes under the Project so
+		// sort keys can also reference base columns the SELECT list
+		// dropped — we rewrite alias references to the underlying
+		// SELECT-list expression in that case.
+		topProject, _ := topProjectInput(plan)
+		if topProject != nil && !hasAggregateBelow(topProject) {
+			rewriteSortKeysByAlias(keys, exprs, names)
+		}
+		plan = insertSortBelowProject(plan, keys)
+	}
+	if hasLimitOrOffset(p) {
+		var err error
+		plan, err = p.parseLimitOffset(plan)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := p.skipLockingClause(); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// parseSelectTailUnion consumes the same trailing clauses but
+// applies the Sort on top of the unioned plan. The merged Union
+// schema doesn't carry SELECT-list aliases, so sort keys must
+// resolve against output column names directly — same as real PG.
+func (p *parser) parseSelectTailUnion(plan ir.Node) (ir.Node, error) {
+	if p.peek().kind == kwOrder {
+		p.consume()
+		if _, err := p.expect(kwBy, "BY"); err != nil {
+			return nil, err
+		}
+		keys, err := p.parseSortKeys()
+		if err != nil {
+			return nil, err
+		}
+		plan = &ir.Sort{Input: plan, Keys: keys}
+	}
+	if hasLimitOrOffset(p) {
+		var err error
+		plan, err = p.parseLimitOffset(plan)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := p.skipLockingClause(); err != nil {
+		return nil, err
+	}
+	return plan, nil
+}
+
+// insertSortBelowProject splices a Sort beneath the top Project (or
+// Distinct(Project(...))) of plan when the Project doesn't sit over
+// an Aggregate. For aggregating selects the Sort wraps the plan
+// instead, so sort keys see the post-aggregate output schema (which
+// is the only place GROUP BY columns and aggregate results exist).
+func insertSortBelowProject(plan ir.Node, keys []ir.SortKey) ir.Node {
+	switch p := plan.(type) {
+	case *ir.Project:
+		if !hasAggregateBelow(p.Input) {
+			p.Input = &ir.Sort{Input: p.Input, Keys: keys}
+			return p
+		}
+	case *ir.Distinct:
+		if pj, ok := p.Input.(*ir.Project); ok && !hasAggregateBelow(pj.Input) {
+			pj.Input = &ir.Sort{Input: pj.Input, Keys: keys}
+			return p
+		}
+	}
+	return &ir.Sort{Input: plan, Keys: keys}
+}
+
+// topProjectInput returns the input of the topmost Project in plan
+// (peeling Distinct), or (nil, false) if there is no Project up top.
+func topProjectInput(plan ir.Node) (ir.Node, bool) {
+	switch x := plan.(type) {
+	case *ir.Project:
+		return x.Input, true
+	case *ir.Distinct:
+		if pj, ok := x.Input.(*ir.Project); ok {
+			return pj.Input, true
+		}
+	}
+	return nil, false
+}
+
+// hasAggregateBelow reports whether n contains an ir.Aggregate
+// reachable through pure relational wrappers.
+func hasAggregateBelow(n ir.Node) bool {
+	for {
+		switch x := n.(type) {
+		case *ir.Aggregate:
+			return true
+		case *ir.Filter:
+			n = x.Input
+		case *ir.Project:
+			n = x.Input
+		case *ir.Sort:
+			n = x.Input
+		case *ir.Distinct:
+			n = x.Input
+		default:
+			return false
+		}
+	}
+}
+
+// parseSelect handles a complete top-level SELECT including any
+// trailing ORDER BY / LIMIT / FOR-locking. It's the entry point for
+// solo subqueries (EXISTS, IN, derived tables, scalar subqueries).
+// Top-level statements go through parseSelectMaybeUnion so a UNION
+// chain's trailing clauses attach to the union as a whole.
 func (p *parser) parseSelect() (ir.Node, error) {
+	plan, exprs, names, err := p.parseSelectCoreReturning()
+	if err != nil {
+		return nil, err
+	}
+	return p.parseSelectTailSolo(plan, exprs, names)
+}
+
+// parseSelectCore parses a single SELECT block — clauses up through
+// Project / Aggregate construction — and returns the plan without
+// consuming trailing ORDER BY / LIMIT / locking. parseSelect and
+// parseSelectMaybeUnion both build on this: the former adds the tail
+// directly, the latter loops on UNION first and lets the tail apply
+// once at the end.
+func (p *parser) parseSelectCore() (ir.Node, error) {
+	plan, _, _, err := p.parseSelectCoreReturning()
+	return plan, err
+}
+
+// parseSelectCoreReturning is the workhorse that parseSelectCore and
+// parseSelectCoreInfo wrap. It returns the plan plus the SELECT-list
+// expressions and aliases the caller needs for alias-aware tail
+// processing.
+func (p *parser) parseSelectCoreReturning() (ir.Node, []ir.Expr, []string, error) {
 	p.consume() // SELECT
 	distinct := p.accept(kwDistinct)
 	exprs, names, err := p.parseSelectList()
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
 	var input ir.Node = &ir.Values{Rows: [][]ir.Expr{{}}}
 	if p.accept(kwFrom) {
 		from, err := p.parseFromClause()
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		input = from
 	}
 	if p.accept(kwWhere) {
 		cond, err := p.parseExpr()
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		input = &ir.Filter{Input: input, Cond: cond}
 	}
@@ -814,83 +1029,58 @@ func (p *parser) parseSelect() (ir.Node, error) {
 	var having ir.Expr
 	if p.accept(kwGroup) {
 		if _, err := p.expect(kwBy, "BY"); err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		groupBy, err = p.parseGroupByList()
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 	}
 	if p.accept(kwHaving) {
 		having, err = p.parseExpr()
 		if err != nil {
-			return nil, err
+			return nil, nil, nil, err
 		}
 		if groupBy == nil {
-			return nil, fmt.Errorf("parse: HAVING requires GROUP BY (not supported yet)")
+			return nil, nil, nil, fmt.Errorf("parse: HAVING requires GROUP BY (not supported yet)")
 		}
-	}
-
-	// ORDER BY placement depends on whether we're aggregating: for
-	// non-aggregate plans it sits below the Project so sort keys see
-	// FROM-clause columns; for aggregate plans it sits *above* the
-	// Aggregate/Project so it sees the post-aggregate output.
-	hasGroupBy := groupBy != nil
-	hasAggregate := false
-	for _, e := range exprs {
-		if isAggregateCall(e) {
-			hasAggregate = true
-			break
-		}
-	}
-	aggregating := hasGroupBy || hasAggregate
-
-	if !aggregating && p.peek().kind == kwOrder {
-		p.consume() // ORDER
-		if _, err := p.expect(kwBy, "BY"); err != nil {
-			return nil, err
-		}
-		keys, err := p.parseSortKeys()
-		if err != nil {
-			return nil, err
-		}
-		// ORDER BY may reference SELECT-list output aliases. Since the
-		// Sort sits before the Project here (so base columns the SELECT
-		// list dropped are still available), rewrite any bare ColumnRef
-		// sort key whose name matches an alias to the underlying
-		// SELECT-list expression.
-		rewriteSortKeysByAlias(keys, exprs, names)
-		input = &ir.Sort{Input: input, Keys: keys}
 	}
 
 	plan, err := buildSelectTopOf(input, exprs, names, groupBy, having)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if distinct {
 		plan = &ir.Distinct{Input: plan}
 	}
-	if aggregating && p.peek().kind == kwOrder {
-		p.consume() // ORDER
-		if _, err := p.expect(kwBy, "BY"); err != nil {
-			return nil, err
-		}
-		keys, err := p.parseSortKeys()
-		if err != nil {
-			return nil, err
-		}
-		plan = &ir.Sort{Input: plan, Keys: keys}
+	return plan, exprs, names, nil
+}
+
+// rewriteSortKeysByAlias replaces a bare-name sort key with the
+// SELECT-list expression it aliases. Lets `ORDER BY status` work for
+// queries like `SELECT … CASE WHEN … END AS status FROM …` — the
+// rewrite must happen before the Sort goes under the Project so the
+// underlying expression resolves against the FROM-clause schema.
+func rewriteSortKeysByAlias(keys []ir.SortKey, exprs []ir.Expr, names []string) {
+	if len(names) == 0 {
+		return
 	}
-	if hasLimitOrOffset(p) {
-		plan, err = p.parseLimitOffset(plan)
-		if err != nil {
-			return nil, err
+	aliasMap := make(map[string]ir.Expr, len(names))
+	for i, n := range names {
+		if n == "" {
+			continue
+		}
+		aliasMap[n] = exprs[i]
+	}
+	for i, k := range keys {
+		ref, ok := k.Expr.(*ir.ColumnRef)
+		if !ok || ref.Qualifier != "" {
+			continue
+		}
+		if expr, ok := aliasMap[ref.Name]; ok {
+			keys[i].Expr = expr
 		}
 	}
-	if err := p.skipLockingClause(); err != nil {
-		return nil, err
-	}
-	return plan, nil
 }
 
 // skipLockingClause swallows `FOR UPDATE`, `FOR SHARE`, `FOR NO KEY
@@ -1325,32 +1515,6 @@ func defaultColName(e ir.Expr) string {
 		return c.Name
 	}
 	return "?column?"
-}
-
-// rewriteSortKeysByAlias replaces bare-name sort keys with their
-// SELECT-list source expression when the name matches an alias. Lets
-// `ORDER BY status` work for queries like
-// `SELECT … CASE WHEN … END AS status FROM …`.
-func rewriteSortKeysByAlias(keys []ir.SortKey, exprs []ir.Expr, names []string) {
-	if len(names) == 0 {
-		return
-	}
-	aliasMap := make(map[string]ir.Expr, len(names))
-	for i, n := range names {
-		if n == "" {
-			continue
-		}
-		aliasMap[n] = exprs[i]
-	}
-	for i, k := range keys {
-		ref, ok := k.Expr.(*ir.ColumnRef)
-		if !ok || ref.Qualifier != "" {
-			continue
-		}
-		if expr, ok := aliasMap[ref.Name]; ok {
-			keys[i].Expr = expr
-		}
-	}
 }
 
 func (p *parser) parseSortKeys() ([]ir.SortKey, error) {

@@ -8,12 +8,35 @@ package db
 import (
 	"context"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const postMessage = `-- name: PostMessage :one
+const addRoom = `-- name: AddRoom :one
+INSERT INTO rooms (name) VALUES ($1) RETURNING id, name
+`
 
+func (q *Queries) AddRoom(ctx context.Context, name string) (Room, error) {
+	row := q.db.QueryRow(ctx, addRoom, name)
+	var i Room
+	err := row.Scan(&i.ID, &i.Name)
+	return i, err
+}
+
+const addUser = `-- name: AddUser :one
+
+INSERT INTO users (name) VALUES ($1) RETURNING id, name
+`
+
+// Exercises: UNION ALL across user + system messages; EXISTS for
+// subscription gating; self-join on messages for thread replies;
+// LIMIT/OFFSET pagination.
+func (q *Queries) AddUser(ctx context.Context, name string) (User, error) {
+	row := q.db.QueryRow(ctx, addUser, name)
+	var i User
+	err := row.Scan(&i.ID, &i.Name)
+	return i, err
+}
+
+const postMessage = `-- name: PostMessage :one
 INSERT INTO messages (room_id, author_id, parent_id, body, sent_at)
 VALUES ($1, $2, $3, $4, $5)
 RETURNING id, room_id, author_id, parent_id, body, sent_at
@@ -22,14 +45,11 @@ RETURNING id, room_id, author_id, parent_id, body, sent_at
 type PostMessageParams struct {
 	RoomID   int64
 	AuthorID int64
-	ParentID pgtype.Int8
+	ParentID *int64
 	Body     string
 	SentAt   time.Time
 }
 
-// Exercises: UNION ALL across user + system messages; EXISTS for
-// subscription gating; self-join on messages for thread replies;
-// LIMIT/OFFSET pagination.
 func (q *Queries) PostMessage(ctx context.Context, arg PostMessageParams) (Message, error) {
 	row := q.db.QueryRow(ctx, postMessage,
 		arg.RoomID,
@@ -89,7 +109,7 @@ type ReplyThreadRow struct {
 	ParentBody string
 }
 
-func (q *Queries) ReplyThread(ctx context.Context, parentID pgtype.Int8) ([]ReplyThreadRow, error) {
+func (q *Queries) ReplyThread(ctx context.Context, parentID *int64) ([]ReplyThreadRow, error) {
 	rows, err := q.db.Query(ctx, replyThread, parentID)
 	if err != nil {
 		return nil, err
@@ -180,14 +200,17 @@ func (q *Queries) Subscribe(ctx context.Context, arg SubscribeParams) error {
 }
 
 const subscribedRooms = `-- name: SubscribedRooms :many
-SELECT r.id, r.name FROM rooms r
-WHERE EXISTS (
-    SELECT 1 FROM subscriptions s
-    WHERE s.user_id = $1 AND s.room_id = r.id
-)
+SELECT DISTINCT r.id, r.name FROM rooms r
+JOIN subscriptions s ON s.room_id = r.id
+WHERE s.user_id = $1
 ORDER BY r.name
 `
 
+// The natural shape here is `WHERE EXISTS (SELECT 1 FROM
+// subscriptions WHERE user_id = $1 AND room_id = r.id)`, but
+// pgmem-go's EXISTS is uncorrelated only — the inner query can't
+// reference the outer row. A DISTINCT join produces the same
+// result and exercises JOIN + DISTINCT instead.
 func (q *Queries) SubscribedRooms(ctx context.Context, userID int64) ([]Room, error) {
 	rows, err := q.db.Query(ctx, subscribedRooms, userID)
 	if err != nil {
