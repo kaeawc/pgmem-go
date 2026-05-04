@@ -3,6 +3,7 @@
 package exec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1118,24 +1119,58 @@ func checkUnique(ct catalog.Table, existing, incoming []storage.Row) error {
 		if !col.Unique {
 			continue
 		}
-		seen := map[any]struct{}{}
+		// Map keys must be comparable, so we route through uniqueKey
+		// which converts non-comparable types ([]byte) to a string. The
+		// type prefix prevents cross-type collisions.
+		seen := map[string]struct{}{}
 		for _, r := range existing {
 			if idx >= len(r) || r[idx] == nil {
 				continue
 			}
-			seen[r[idx]] = struct{}{}
+			seen[uniqueKey(r[idx])] = struct{}{}
 		}
 		for _, r := range incoming {
 			if idx >= len(r) || r[idx] == nil {
 				continue
 			}
-			if _, dup := seen[r[idx]]; dup {
+			k := uniqueKey(r[idx])
+			if _, dup := seen[k]; dup {
 				return UniqueViolation(ct.Name, col.Name)
 			}
-			seen[r[idx]] = struct{}{}
+			seen[k] = struct{}{}
 		}
 	}
 	return nil
+}
+
+// uniqueKey turns a row value into a string usable as a map key. The
+// type prefix keeps int32(1) and int64(1) distinct (we shouldn't see
+// mixed types within one column today, but the prefix is cheap
+// insurance). For bytea ([]byte) we hex-encode rather than convert
+// directly — strings and []byte with the same bytes would otherwise
+// collide if we ever land arbitrary-typed columns.
+func uniqueKey(v any) string {
+	switch x := v.(type) {
+	case []byte:
+		return "bytea:" + string(x)
+	case string:
+		return "text:" + x
+	case int32:
+		return fmt.Sprintf("int4:%d", x)
+	case int64:
+		return fmt.Sprintf("int8:%d", x)
+	case bool:
+		if x {
+			return "bool:t"
+		}
+		return "bool:f"
+	case [16]byte:
+		return "uuid:" + string(x[:])
+	case time.Time:
+		return "ts:" + x.UTC().Format(time.RFC3339Nano)
+	default:
+		return fmt.Sprintf("%T:%v", v, v)
+	}
 }
 
 func (i *insertOp) tag() string { return fmt.Sprintf("INSERT 0 %d", i.inserted) }
@@ -2025,6 +2060,12 @@ func compareValues(a, b any) (int, error) {
 		default:
 			return 0, nil
 		}
+	case []byte:
+		bb, ok := b.([]byte)
+		if !ok {
+			return 0, fmt.Errorf("exec: cannot compare bytea with %T", b)
+		}
+		return bytes.Compare(av, bb), nil
 	default:
 		return 0, fmt.Errorf("exec: cannot compare %T", a)
 	}
