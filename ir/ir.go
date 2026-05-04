@@ -185,8 +185,14 @@ func (*Union) node() {}
 // Distinct keeps only one row per unique tuple of Input's columns.
 // Equivalent to wrapping a SELECT DISTINCT in a hash-set deduplicator.
 // Output schema matches Input.
+//
+// On, when non-empty, restricts uniqueness to the values of the
+// listed expressions instead of all output columns — that's the
+// `SELECT DISTINCT ON (cols) …` form. The first row per distinct
+// (cols) tuple is kept; ORDER BY decides which row that is.
 type Distinct struct {
 	Input Node
+	On    []Expr
 }
 
 func (*Distinct) node() {}

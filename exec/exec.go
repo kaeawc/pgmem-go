@@ -548,12 +548,27 @@ func buildDistinct(p *ir.Distinct, env *Env) (Operator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &distinctOp{in: in, seen: map[string]struct{}{}}, nil
+	op := &distinctOp{in: in, seen: map[string]struct{}{}}
+	if len(p.On) > 0 {
+		op.onKeys = make([]ir.Expr, len(p.On))
+		for i, e := range p.On {
+			r, err := resolveExpr(e, in.OutputSchema(), env)
+			if err != nil {
+				in.Close()
+				return nil, err
+			}
+			op.onKeys[i] = r
+		}
+		op.env = env
+	}
+	return op, nil
 }
 
 type distinctOp struct {
-	in   Operator
-	seen map[string]struct{}
+	in     Operator
+	seen   map[string]struct{}
+	onKeys []ir.Expr // when set, dedupe by these keys instead of full row
+	env    *Env
 }
 
 func (d *distinctOp) OutputSchema() []Column { return d.in.OutputSchema() }
@@ -565,13 +580,31 @@ func (d *distinctOp) Next(ctx context.Context) (Row, error) {
 		if err != nil {
 			return nil, err
 		}
-		key := groupKeyString([]any(row))
+		key, err := d.keyFor(row)
+		if err != nil {
+			return nil, err
+		}
 		if _, dup := d.seen[key]; dup {
 			continue
 		}
 		d.seen[key] = struct{}{}
 		return row, nil
 	}
+}
+
+func (d *distinctOp) keyFor(row Row) (string, error) {
+	if len(d.onKeys) == 0 {
+		return groupKeyString([]any(row)), nil
+	}
+	parts := make([]string, len(d.onKeys))
+	for i, e := range d.onKeys {
+		v, err := evalExpr(e, row, d.env)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = uniqueKey(v)
+	}
+	return strings.Join(parts, "\x00"), nil
 }
 
 // --- Window ---

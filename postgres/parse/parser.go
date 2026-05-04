@@ -1039,6 +1039,25 @@ func (p *parser) parseSelectCore() (ir.Node, error) {
 func (p *parser) parseSelectCoreReturning() (ir.Node, []ir.Expr, []string, error) {
 	p.consume() // SELECT
 	distinct := p.accept(kwDistinct)
+	var distinctOn []ir.Expr
+	if distinct && p.accept(kwOn) {
+		if _, err := p.expect(tLParen, "("); err != nil {
+			return nil, nil, nil, err
+		}
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			distinctOn = append(distinctOn, e)
+			if !p.accept(tComma) {
+				break
+			}
+		}
+		if _, err := p.expect(tRParen, ")"); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	exprs, names, err := p.parseSelectList()
 	if err != nil {
 		return nil, nil, nil, err
@@ -1100,7 +1119,7 @@ func (p *parser) parseSelectCoreReturning() (ir.Node, []ir.Expr, []string, error
 		return nil, nil, nil, err
 	}
 	if distinct {
-		plan = &ir.Distinct{Input: plan}
+		plan = &ir.Distinct{Input: plan, On: distinctOn}
 	}
 	return plan, exprs, names, nil
 }
