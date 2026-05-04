@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1863,6 +1864,8 @@ func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
 	switch b.Op {
 	case "+", "-", "*", "/", "%":
 		return evalArith(b.Op, l, r, b.T)
+	case "||":
+		return evalConcat(l, r)
 	}
 	cmp, err := compareValues(l, r)
 	if err != nil {
@@ -1886,15 +1889,48 @@ func evalBinOp(b *ir.BinOp, in Row, params []Param) (any, error) {
 	}
 }
 
-// arithResultType picks the output type of an integer arithmetic op
-// based on its operands. If either side is int8 (BIGINT), the result
-// widens to int8; otherwise int4. Unknown operand types fall back to
-// int4 — they'll fail in evalArith if they're not actually integers.
+// arithResultType picks the output type of a binary additive/
+// multiplicative op based on its operands.
+//   - || is text concatenation; result type is text.
+//   - either side int8 (BIGINT) → int8.
+//   - otherwise → int4.
+//
+// Unknown operand types fall back to int4; if they aren't really
+// integers evalArith rejects them at evaluation time.
 func arithResultType(l, r types.Type) types.Type {
+	if l == types.Text || r == types.Text {
+		return types.Text
+	}
 	if l == types.Int8 || r == types.Int8 {
 		return types.Int8
 	}
 	return types.Int4
+}
+
+// evalConcat is `text || text`. Either side NULL was filtered upstream.
+// We accept any value that has a SQL-printable Go shape via fmt.Sprint
+// so `'count: ' || n` (text || int) works the way PG implicitly casts
+// arguments to text in this position.
+func evalConcat(l, r any) (any, error) {
+	return concatString(l) + concatString(r), nil
+}
+
+func concatString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // evalArith does integer arithmetic in int64-space, then narrows to

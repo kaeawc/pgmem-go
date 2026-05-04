@@ -28,6 +28,7 @@ const (
 	tMinus
 	tSlash
 	tPercent
+	tConcat // ||
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -168,6 +169,12 @@ func lex(src string) ([]token, error) {
 				return nil, fmt.Errorf("lex: stray '!' at %d", i)
 			}
 			out = append(out, token{tNeq, "!=", i})
+			i += 2
+		case c == '|':
+			if i+1 >= len(src) || src[i+1] != '|' {
+				return nil, fmt.Errorf("lex: stray '|' at %d (expected ||)", i)
+			}
+			out = append(out, token{tConcat, "||", i})
 			i += 2
 		default:
 			tok, n, err := lexDefault(src, i)
