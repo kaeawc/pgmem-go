@@ -213,7 +213,7 @@ func (c *conn) classify(sql string) (*prepared, error) {
 
 func defaultTag(plan ir.Node) string {
 	switch plan.(type) {
-	case *ir.Project, *ir.Scan, *ir.Values, *ir.Filter, *ir.Sort, *ir.Limit, *ir.Aggregate, *ir.Distinct, *ir.Union, *ir.SubqueryAlias:
+	case *ir.Project, *ir.Scan, *ir.Values, *ir.Filter, *ir.Sort, *ir.Limit, *ir.Aggregate, *ir.Distinct, *ir.Union, *ir.SubqueryAlias, *ir.Window:
 		return "SELECT"
 	case *ir.CreateTable:
 		return "CREATE TABLE"

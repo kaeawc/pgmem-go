@@ -657,7 +657,54 @@ func (p *parser) parseFuncCall(name string) (ir.Expr, error) {
 	if _, err := p.expect(tRParen, ")"); err != nil {
 		return nil, err
 	}
-	return &ir.FuncCall{Name: name, Args: args, Distinct: distinct}, nil
+	fc := &ir.FuncCall{Name: name, Args: args, Distinct: distinct}
+	if p.acceptIdent("over") {
+		spec, err := p.parseWindowSpec()
+		if err != nil {
+			return nil, err
+		}
+		fc.Window = &spec
+	}
+	return fc, nil
+}
+
+// parseWindowSpec consumes `( [PARTITION BY expr, …] [ORDER BY key,
+// …] )`. The OVER keyword has been consumed by the caller. Frame
+// clauses (ROWS BETWEEN …) aren't modelled yet.
+func (p *parser) parseWindowSpec() (ir.WindowSpec, error) {
+	var spec ir.WindowSpec
+	if _, err := p.expect(tLParen, "("); err != nil {
+		return spec, err
+	}
+	if p.acceptIdent("partition") {
+		if !p.accept(kwBy) {
+			return spec, fmt.Errorf("parse: expected BY after PARTITION at %d", p.peek().pos)
+		}
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return spec, err
+			}
+			spec.PartitionBy = append(spec.PartitionBy, e)
+			if !p.accept(tComma) {
+				break
+			}
+		}
+	}
+	if p.accept(kwOrder) {
+		if _, err := p.expect(kwBy, "BY"); err != nil {
+			return spec, err
+		}
+		keys, err := p.parseSortKeys()
+		if err != nil {
+			return spec, err
+		}
+		spec.OrderBy = keys
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return spec, err
+	}
+	return spec, nil
 }
 
 // parseNumberLiteral picks int4 if the value fits, otherwise int8.

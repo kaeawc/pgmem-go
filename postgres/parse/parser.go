@@ -1046,6 +1046,17 @@ func (p *parser) parseSelectCoreReturning() (ir.Node, []ir.Expr, []string, error
 		}
 	}
 
+	// Window functions are processed before the Project: their inputs
+	// are FROM-clause columns, but the Project can reference their
+	// synthetic outputs as columns. extractWindowCalls walks the
+	// SELECT list and rewrites windowed FuncCalls into ColumnRefs
+	// pointing at the synthetic outputs of a wrapping Window node.
+	winCalls, rewritten := extractWindowCalls(exprs)
+	if len(winCalls) > 0 {
+		input = &ir.Window{Input: input, Calls: winCalls}
+		exprs = rewritten
+	}
+
 	plan, err := buildSelectTopOf(input, exprs, names, groupBy, having)
 	if err != nil {
 		return nil, nil, nil, err
@@ -1054,6 +1065,56 @@ func (p *parser) parseSelectCoreReturning() (ir.Node, []ir.Expr, []string, error
 		plan = &ir.Distinct{Input: plan}
 	}
 	return plan, exprs, names, nil
+}
+
+// extractWindowCalls walks the SELECT-list expressions, lifts every
+// window FuncCall into a WindowCall slice, and substitutes a
+// ColumnRef pointing at the synthetic output. A windowed call buried
+// inside an arithmetic / cast expression works the same way.
+func extractWindowCalls(exprs []ir.Expr) ([]ir.WindowCall, []ir.Expr) {
+	var calls []ir.WindowCall
+	rewritten := make([]ir.Expr, len(exprs))
+	for i, e := range exprs {
+		rewritten[i] = rewriteWindowExpr(e, &calls)
+	}
+	return calls, rewritten
+}
+
+// rewriteWindowExpr returns a copy of e with every windowed FuncCall
+// replaced by a ColumnRef. Newly-extracted calls land in *calls.
+func rewriteWindowExpr(e ir.Expr, calls *[]ir.WindowCall) ir.Expr {
+	switch v := e.(type) {
+	case *ir.FuncCall:
+		if v.Window != nil {
+			synth := fmt.Sprintf("__win_%d", len(*calls))
+			*calls = append(*calls, ir.WindowCall{
+				Func:   v.Name,
+				Args:   v.Args,
+				Spec:   *v.Window,
+				Output: synth,
+			})
+			return &ir.ColumnRef{Name: synth}
+		}
+		args := make([]ir.Expr, len(v.Args))
+		for i, a := range v.Args {
+			args[i] = rewriteWindowExpr(a, calls)
+		}
+		cp := *v
+		cp.Args = args
+		return &cp
+	case *ir.BinOp:
+		return &ir.BinOp{
+			Op: v.Op, T: v.T,
+			Left:  rewriteWindowExpr(v.Left, calls),
+			Right: rewriteWindowExpr(v.Right, calls),
+		}
+	case *ir.UnaryOp:
+		return &ir.UnaryOp{Op: v.Op, T: v.T, Expr: rewriteWindowExpr(v.Expr, calls)}
+	case *ir.Cast:
+		return &ir.Cast{T: v.T, Expr: rewriteWindowExpr(v.Expr, calls)}
+	default:
+		return e
+	}
 }
 
 // rewriteSortKeysByAlias replaces a bare-name sort key with the

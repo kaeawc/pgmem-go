@@ -105,6 +105,8 @@ func Build(plan ir.Node, env *Env) (Operator, error) {
 		return buildUnion(p, env)
 	case *ir.SubqueryAlias:
 		return buildSubqueryAlias(p, env)
+	case *ir.Window:
+		return buildWindow(p, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported plan node %T", plan)
 	}
@@ -504,6 +506,233 @@ func (d *distinctOp) Next(ctx context.Context) (Row, error) {
 		d.seen[key] = struct{}{}
 		return row, nil
 	}
+}
+
+// --- Window ---
+
+// buildWindow compiles an ir.Window node. Each WindowCall resolves
+// its partition + order keys against the input schema; the operator
+// drains the input, sorts rows by (partition, order), and emits each
+// row augmented with one extra column per window call.
+func buildWindow(p *ir.Window, env *Env) (Operator, error) {
+	in, err := Build(p.Input, env)
+	if err != nil {
+		return nil, err
+	}
+	inSchema := in.OutputSchema()
+	resolved := make([]resolvedWindowCall, len(p.Calls))
+	cols := append([]Column(nil), inSchema...)
+	for i, c := range p.Calls {
+		var err error
+		resolved[i].fn = c.Func
+		resolved[i].partKeys = make([]ir.Expr, len(c.Spec.PartitionBy))
+		for j, e := range c.Spec.PartitionBy {
+			resolved[i].partKeys[j], err = resolveExpr(e, inSchema, env)
+			if err != nil {
+				in.Close()
+				return nil, err
+			}
+		}
+		resolved[i].orderKeys = make([]ir.SortKey, len(c.Spec.OrderBy))
+		for j, k := range c.Spec.OrderBy {
+			r, err := resolveExpr(k.Expr, inSchema, env)
+			if err != nil {
+				in.Close()
+				return nil, err
+			}
+			resolved[i].orderKeys[j] = ir.SortKey{Expr: r, Desc: k.Desc, Nulls: k.Nulls}
+		}
+		cols = append(cols, Column{Name: c.Output, Type: types.Int8})
+	}
+	return &windowOp{in: in, calls: resolved, cols: cols, env: env}, nil
+}
+
+type resolvedWindowCall struct {
+	fn        string
+	partKeys  []ir.Expr
+	orderKeys []ir.SortKey
+}
+
+type windowOp struct {
+	in    Operator
+	calls []resolvedWindowCall
+	cols  []Column
+	env   *Env
+
+	ran     bool
+	pending []Row
+	pos     int
+}
+
+func (w *windowOp) OutputSchema() []Column { return w.cols }
+func (w *windowOp) Close() error           { return w.in.Close() }
+
+func (w *windowOp) Next(ctx context.Context) (Row, error) {
+	if !w.ran {
+		if err := w.run(ctx); err != nil {
+			return nil, err
+		}
+	}
+	if w.pos >= len(w.pending) {
+		return nil, io.EOF
+	}
+	r := w.pending[w.pos]
+	w.pos++
+	return r, nil
+}
+
+// run materialises every input row, computes each window function's
+// per-partition assignment, and stores the augmented rows in pending
+// in their original input order. Because windows can use independent
+// PARTITION BY / ORDER BY specs, each call is computed by sorting a
+// row-index slice rather than rearranging the underlying data.
+func (w *windowOp) run(ctx context.Context) error {
+	w.ran = true
+	rows, err := drain(w.in)
+	if err != nil {
+		return err
+	}
+	// Augment each input row with len(w.calls) extra slots and then
+	// fill them per call.
+	out := make([]Row, len(rows))
+	extraStart := len(w.cols) - len(w.calls)
+	for i, r := range rows {
+		nr := make(Row, len(w.cols))
+		copy(nr, r)
+		out[i] = nr
+		_ = extraStart
+	}
+	for ci, c := range w.calls {
+		col := extraStart + ci
+		assignments, err := computeWindowCall(c, rows, w.env)
+		if err != nil {
+			return err
+		}
+		for i, v := range assignments {
+			out[i][col] = v
+		}
+	}
+	w.pending = out
+	_ = ctx
+	return nil
+}
+
+// computeWindowCall returns a value per input row index for the
+// given window call. row_number / rank / dense_rank ride the same
+// sort-then-assign loop; their per-row counter rule differs.
+func computeWindowCall(c resolvedWindowCall, rows []Row, env *Env) ([]any, error) {
+	n := len(rows)
+	out := make([]any, n)
+	// Sort row indices by (partition keys, order keys).
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	keys := make([]ir.SortKey, 0, len(c.partKeys)+len(c.orderKeys))
+	for _, k := range c.partKeys {
+		keys = append(keys, ir.SortKey{Expr: k})
+	}
+	keys = append(keys, c.orderKeys...)
+	var sortErr error
+	sort.SliceStable(idx, func(i, j int) bool {
+		if sortErr != nil {
+			return false
+		}
+		for _, k := range keys {
+			a, err := evalExpr(k.Expr, rows[idx[i]], env)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			b, err := evalExpr(k.Expr, rows[idx[j]], env)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			if a == nil || b == nil {
+				if a == nil && b == nil {
+					continue
+				}
+				return nullSortLess(a == nil, k)
+			}
+			cmp, err := compareValues(a, b)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			if cmp == 0 {
+				continue
+			}
+			if k.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	if sortErr != nil {
+		return nil, sortErr
+	}
+	// Walk in sorted order and assign per-call counter values.
+	var partKey string
+	var rowNum, rank, denseRank int64
+	prevOrder := ""
+	for pos, ri := range idx {
+		curPart, err := keyValuesString(c.partKeys, rows[ri], env)
+		if err != nil {
+			return nil, err
+		}
+		if pos == 0 || curPart != partKey {
+			partKey = curPart
+			rowNum, rank, denseRank = 0, 0, 0
+			prevOrder = ""
+		}
+		rowNum++
+		curOrder, err := orderKeysString(c.orderKeys, rows[ri], env)
+		if err != nil {
+			return nil, err
+		}
+		if pos == 0 || curOrder != prevOrder {
+			rank = rowNum
+			denseRank++
+			prevOrder = curOrder
+		}
+		switch c.fn {
+		case "row_number":
+			out[ri] = rowNum
+		case "rank":
+			out[ri] = rank
+		case "dense_rank":
+			out[ri] = denseRank
+		default:
+			return nil, fmt.Errorf("exec: unsupported window function %q", c.fn)
+		}
+	}
+	return out, nil
+}
+
+func keyValuesString(keys []ir.Expr, in Row, env *Env) (string, error) {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		v, err := evalExpr(k, in, env)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = uniqueKey(v)
+	}
+	return strings.Join(parts, "\x00"), nil
+}
+
+func orderKeysString(keys []ir.SortKey, in Row, env *Env) (string, error) {
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		v, err := evalExpr(k.Expr, in, env)
+		if err != nil {
+			return "", err
+		}
+		parts[i] = uniqueKey(v)
+	}
+	return strings.Join(parts, "\x00"), nil
 }
 
 // --- SubqueryAlias ---
