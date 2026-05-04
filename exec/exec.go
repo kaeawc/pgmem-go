@@ -2440,35 +2440,17 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	case *ir.ScalarSubquery:
 		return evalScalarSubquery(x, env)
 	case *ir.InListExpr:
-		probe, err := resolveExpr(x.Probe, schema, env)
-		if err != nil {
-			return nil, err
-		}
-		list := make([]ir.Expr, len(x.List))
-		for i, e := range x.List {
-			r, err := resolveExpr(e, schema, env)
-			if err != nil {
-				return nil, err
-			}
-			list[i] = r
-		}
-		return &ir.InListExpr{Probe: probe, List: list}, nil
+		return resolveInList(x, schema, env)
 	case *ir.InSubqueryExpr:
-		probe, err := resolveExpr(x.Probe, schema, env)
-		if err != nil {
-			return nil, err
-		}
-		list, err := evalInSubquery(x, env)
-		if err != nil {
-			return nil, err
-		}
-		return &ir.InListExpr{Probe: probe, List: list}, nil
+		return resolveInSubquery(x, schema, env)
 	case *ir.Cast:
 		return resolveCast(x, schema, env)
 	case *ir.Case:
 		return resolveCase(x, schema, env)
 	case *ir.ExistsExpr:
 		return evalExists(x, env)
+	case *ir.AnyExpr:
+		return resolveAny(x, schema, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
@@ -2497,6 +2479,46 @@ func evalExists(x *ir.ExistsExpr, env *Env) (ir.Expr, error) {
 	}
 	_ = row
 	return &ir.Literal{Value: true, T: types.Bool}, nil
+}
+
+func resolveInList(x *ir.InListExpr, schema []Column, env *Env) (ir.Expr, error) {
+	probe, err := resolveExpr(x.Probe, schema, env)
+	if err != nil {
+		return nil, err
+	}
+	list := make([]ir.Expr, len(x.List))
+	for i, e := range x.List {
+		r, err := resolveExpr(e, schema, env)
+		if err != nil {
+			return nil, err
+		}
+		list[i] = r
+	}
+	return &ir.InListExpr{Probe: probe, List: list}, nil
+}
+
+func resolveInSubquery(x *ir.InSubqueryExpr, schema []Column, env *Env) (ir.Expr, error) {
+	probe, err := resolveExpr(x.Probe, schema, env)
+	if err != nil {
+		return nil, err
+	}
+	list, err := evalInSubquery(x, env)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.InListExpr{Probe: probe, List: list}, nil
+}
+
+func resolveAny(a *ir.AnyExpr, schema []Column, env *Env) (ir.Expr, error) {
+	probe, err := resolveExpr(a.Probe, schema, env)
+	if err != nil {
+		return nil, err
+	}
+	arr, err := resolveExpr(a.Array, schema, env)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.AnyExpr{Probe: probe, Op: a.Op, Array: arr}, nil
 }
 
 func resolveCast(c *ir.Cast, schema []Column, env *Env) (ir.Expr, error) {
@@ -2656,9 +2678,71 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 		return castValue(v, x.T)
 	case *ir.Case:
 		return evalCase(x, in, env)
+	case *ir.AnyExpr:
+		return evalAny(x, in, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalAny implements `probe op ANY (array)`. Currently only `=` is
+// supported. Returns NULL if either operand is NULL or if the array
+// is NULL; matches an element with NULL → ignored (PG: NULL element
+// is "unknown").
+func evalAny(a *ir.AnyExpr, in Row, env *Env) (any, error) {
+	if a.Op != "=" {
+		return nil, fmt.Errorf("exec: ANY only supports `=` for now, got %q", a.Op)
+	}
+	probe, err := evalExpr(a.Probe, in, env)
+	if err != nil {
+		return nil, err
+	}
+	arr, err := evalExpr(a.Array, in, env)
+	if err != nil {
+		return nil, err
+	}
+	if probe == nil || arr == nil {
+		return nil, nil
+	}
+	matched := false
+	switch v := arr.(type) {
+	case []int64:
+		for _, n := range v {
+			cmp, err := compareValues(probe, n)
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				matched = true
+				break
+			}
+		}
+	case []int32:
+		for _, n := range v {
+			cmp, err := compareValues(probe, n)
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				matched = true
+				break
+			}
+		}
+	case []string:
+		for _, s := range v {
+			cmp, err := compareValues(probe, s)
+			if err != nil {
+				return nil, err
+			}
+			if cmp == 0 {
+				matched = true
+				break
+			}
+		}
+	default:
+		return nil, fmt.Errorf("exec: ANY: unsupported array type %T", arr)
+	}
+	return matched, nil
 }
 
 // evalCase walks the WHEN branches in order and returns the first
@@ -2748,6 +2832,11 @@ func castValue(v any, target types.Type) (any, error) {
 	case types.JSONB:
 		// Same shape as bytea — JSON bytes pass through.
 		return castToBytea(v)
+	case types.Int4Array, types.Int8Array, types.TextArray:
+		// Arrays pass through as their already-decoded slice form
+		// (the wire codec decodes parameters into the right Go slice
+		// type before the cast runs).
+		return v, nil
 	default:
 		return nil, fmt.Errorf("cast to %s: unsupported", target.Name())
 	}

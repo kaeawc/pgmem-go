@@ -399,6 +399,14 @@ func walkExprParams(e ir.Expr, expected types.Type, sch catalog.Schema, scopeTab
 	case *ir.InSubqueryExpr:
 		walkExprParams(x.Probe, nil, sch, scopeTable, hint, maxIdx)
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
+	case *ir.AnyExpr:
+		// Probe and array constrain each other only loosely (the
+		// element type is what matters), but the typical sqlc shape
+		// is `col = ANY ($1::col_type[])`, so we descend without an
+		// expected hint and let the explicit cast nail down the
+		// parameter type.
+		walkExprParams(x.Probe, nil, sch, scopeTable, hint, maxIdx)
+		walkExprParams(x.Array, nil, sch, scopeTable, hint, maxIdx)
 	case *ir.ScalarSubquery:
 		walkParams(x.Plan, sch, scopeTable, hint, maxIdx)
 	case *ir.ExistsExpr:

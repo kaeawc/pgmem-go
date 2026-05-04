@@ -39,6 +39,8 @@ const (
 	tContains  // @>
 	tContained // <@
 	tQuestion  // ?
+	tLBracket  // [
+	tRBracket  // ]
 	tEq
 	tNeq // both != and <>
 	tLt
@@ -192,6 +194,8 @@ var singleByteTokens = map[byte]tokenKind{
 	'%': tPercent,
 	'=': tEq,
 	'?': tQuestion,
+	'[': tLBracket,
+	']': tRBracket,
 }
 
 func lex(src string) ([]token, error) {
