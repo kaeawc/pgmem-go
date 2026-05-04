@@ -550,6 +550,14 @@ type Expr interface {
 	Type() types.Type
 }
 
+// DefaultMarker stands for the literal `DEFAULT` keyword used as a
+// VALUES tuple element. It tells the executor to use the target
+// column's DEFAULT expression instead of the user-supplied value.
+type DefaultMarker struct{}
+
+func (*DefaultMarker) expr()            {}
+func (*DefaultMarker) Type() types.Type { return nil }
+
 // Literal is a constant value of a known type.
 type Literal struct {
 	Value any

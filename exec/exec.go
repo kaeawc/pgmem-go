@@ -1861,6 +1861,13 @@ func buildConflictUpdates(ct catalog.Table, oc *ir.OnConflict, env *Env) ([]conf
 	return out, nil
 }
 
+// defaultSentinel is the runtime placeholder produced by an
+// ir.DefaultMarker expression. The INSERT runOnce loop replaces
+// each occurrence with the column's resolved DEFAULT (or NULL).
+type defaultSentinelT struct{}
+
+var defaultSentinel any = defaultSentinelT{}
+
 // resolveConflictColumns maps each ON CONFLICT target column name to
 // its index in the catalog. Errors if any name is unknown.
 func resolveConflictColumns(ct catalog.Table, cols []string) ([]int, error) {
@@ -1999,8 +2006,7 @@ func (i *insertOp) runOnce() error {
 	// transaction layer that would otherwise undo half-applied writes
 	// is in place but the *operator* still owes all-or-nothing on
 	// constraint failures within a single statement.
-	autoCols := autoColumnIndexes(i.ct, i.colMap)
-	defaultCols, err := resolveDefaultColumns(i.ct, i.colMap, i.env)
+	defaultCols, err := resolveAllDefaultColumns(i.ct, i.env)
 	if err != nil {
 		return err
 	}
@@ -2008,14 +2014,43 @@ func (i *insertOp) runOnce() error {
 	if err != nil {
 		return err
 	}
+	mentioned := make([]bool, len(i.ct.Columns))
+	for _, idx := range i.colMap {
+		mentioned[idx] = true
+	}
 	built := make([]storage.Row, len(rawRows))
 	for r, vals := range rawRows {
 		row := make(storage.Row, len(i.ct.Columns))
-		for j, v := range vals {
-			row[i.colMap[j]] = v
+		// Per-row auto/default masks. A column gets auto-filled or
+		// default-filled when it's unmentioned, or when the user
+		// supplied DEFAULT for it via the marker sentinel.
+		needAuto := make([]bool, len(i.ct.Columns))
+		needDefault := make([]bool, len(i.ct.Columns))
+		for idx, c := range i.ct.Columns {
+			if !mentioned[idx] {
+				if c.Auto {
+					needAuto[idx] = true
+				}
+				if c.Default != nil {
+					needDefault[idx] = true
+				}
+			}
 		}
-		fillAutoColumns(row, i.ct, autoCols, i.table)
-		if err := fillDefaultColumns(row, defaultCols, i.env); err != nil {
+		for j, v := range vals {
+			idx := i.colMap[j]
+			if v == defaultSentinel {
+				if i.ct.Columns[idx].Auto {
+					needAuto[idx] = true
+				}
+				if i.ct.Columns[idx].Default != nil {
+					needDefault[idx] = true
+				}
+				continue
+			}
+			row[idx] = v
+		}
+		fillAutoMask(row, i.ct, needAuto, i.table)
+		if err := applyDefaults(row, defaultCols, needDefault, i.env); err != nil {
 			return err
 		}
 		if err := checkNotNull(i.ct, row); err != nil {
@@ -2192,24 +2227,6 @@ func rowsEqual(a, b storage.Row) bool {
 	return true
 }
 
-// autoColumnIndexes returns the catalog column indexes that carry the
-// Auto flag *and* aren't named in the INSERT's column list — i.e. the
-// columns the engine must fill itself. colMap is the INSERT-position →
-// catalog-index mapping.
-func autoColumnIndexes(ct catalog.Table, colMap []int) []int {
-	mentioned := make(map[int]bool, len(colMap))
-	for _, idx := range colMap {
-		mentioned[idx] = true
-	}
-	var out []int
-	for idx, c := range ct.Columns {
-		if c.Auto && !mentioned[idx] {
-			out = append(out, idx)
-		}
-	}
-	return out
-}
-
 // defaultColumn pairs a catalog column index with its resolved
 // DEFAULT expression. Used by insertOp to fill columns the INSERT
 // didn't mention (and that aren't Auto).
@@ -2218,18 +2235,14 @@ type defaultColumn struct {
 	expr ir.Expr
 }
 
-// resolveDefaultColumns returns one entry per catalog column that has
-// a DEFAULT and was not in colMap (and is not Auto, since Auto wins).
-// The expression is resolved once against an empty schema — DEFAULTs
-// can't reference other columns of the same row in pgmem-go today.
-func resolveDefaultColumns(ct catalog.Table, colMap []int, env *Env) ([]defaultColumn, error) {
-	mentioned := make(map[int]bool, len(colMap))
-	for _, idx := range colMap {
-		mentioned[idx] = true
-	}
+// resolveAllDefaultColumns returns one entry per catalog column that
+// carries a DEFAULT, regardless of whether the INSERT mentioned it.
+// The runOnce loop combines this list with a per-row mask deciding
+// which slots actually need filling.
+func resolveAllDefaultColumns(ct catalog.Table, env *Env) ([]defaultColumn, error) {
 	var out []defaultColumn
 	for idx, c := range ct.Columns {
-		if c.Default == nil || mentioned[idx] || c.Auto {
+		if c.Default == nil {
 			continue
 		}
 		expr, err := resolveExpr(c.Default, nil, env)
@@ -2241,11 +2254,15 @@ func resolveDefaultColumns(ct catalog.Table, colMap []int, env *Env) ([]defaultC
 	return out, nil
 }
 
-// fillDefaultColumns evaluates each resolved default and writes the
-// result into the row's slot. Skipped if the slot already holds a
-// non-nil value (Auto column path may have populated it).
-func fillDefaultColumns(row storage.Row, defaults []defaultColumn, env *Env) error {
+// applyDefaults evaluates each resolved default and writes the result
+// into row slots flagged by needsFill. Auto columns supersede
+// DEFAULT, so we skip slots that already hold a non-nil value (the
+// Auto-fill path runs first).
+func applyDefaults(row storage.Row, defaults []defaultColumn, needsFill []bool, env *Env) error {
 	for _, d := range defaults {
+		if d.idx >= len(needsFill) || !needsFill[d.idx] {
+			continue
+		}
 		if d.idx < len(row) && row[d.idx] != nil {
 			continue
 		}
@@ -2258,14 +2275,16 @@ func fillDefaultColumns(row storage.Row, defaults []defaultColumn, env *Env) err
 	return nil
 }
 
-// fillAutoColumns writes the next sequence value into every Auto column
-// slot the INSERT didn't supply. SERIAL → int32 to match the column
-// type; BIGSERIAL → int64. The counter advances on the canonical table
-// so two transactions never see the same value.
-func fillAutoColumns(row storage.Row, ct catalog.Table, autoCols []int, tbl storage.Table) {
-	for _, idx := range autoCols {
+// fillAutoMask writes the next sequence value into every Auto column
+// flagged in mask. Equivalent to fillAutoColumns but driven by a
+// pre-computed per-row mask so DEFAULT-on-auto can opt in.
+func fillAutoMask(row storage.Row, ct catalog.Table, mask []bool, tbl storage.Table) {
+	for idx, c := range ct.Columns {
+		if !c.Auto || idx >= len(mask) || !mask[idx] {
+			continue
+		}
 		next := tbl.NextAuto(idx)
-		if ct.Columns[idx].Type == types.Int4 {
+		if c.Type == types.Int4 {
 			row[idx] = int32(next)
 		} else {
 			row[idx] = next
@@ -3112,8 +3131,8 @@ func refDisplayName(ref *ir.ColumnRef) string {
 // In that case, a ParamRef or subquery in e errors loudly.
 func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 	switch x := e.(type) {
-	case *ir.Literal:
-		return x, nil
+	case *ir.Literal, *ir.DefaultMarker:
+		return e, nil
 	case *ir.ColumnRef:
 		// Already-resolved Outer refs pass through unchanged — they
 		// were tagged when the surrounding subquery was resolved
@@ -3542,6 +3561,14 @@ func evalExpr(e ir.Expr, in Row, env *Env) (any, error) {
 	switch x := e.(type) {
 	case *ir.Literal:
 		return x.Value, nil
+	case *ir.DefaultMarker:
+		// Yields a private sentinel that the INSERT path swaps out
+		// for the column's resolved DEFAULT (or NULL when no default
+		// is registered). Nothing else should consume this value;
+		// any other operator will surface the resulting type error
+		// at the point of use.
+		_ = x
+		return defaultSentinel, nil
 	case *ir.ColumnRef:
 		if x.Outer {
 			if env == nil || x.Index < 0 || x.Index >= len(env.OuterRow) {

@@ -1261,11 +1261,19 @@ func (p *parser) parseValuesTuple() ([]ir.Expr, error) {
 	}
 	var out []ir.Expr
 	for {
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
+		// `DEFAULT` is allowed in place of an expression and tells the
+		// executor to use the target column's DEFAULT clause for this
+		// slot. We recognise it here so it doesn't get parsed as a
+		// regular identifier expression.
+		if p.acceptIdent("default") {
+			out = append(out, &ir.DefaultMarker{})
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, e)
 		}
-		out = append(out, e)
 		if p.accept(tComma) {
 			continue
 		}
