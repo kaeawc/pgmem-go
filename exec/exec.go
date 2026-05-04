@@ -1783,16 +1783,47 @@ func resolveExpr(e ir.Expr, schema []Column, env *Env) (ir.Expr, error) {
 		}
 		return &ir.InListExpr{Probe: probe, List: list}, nil
 	case *ir.Cast:
-		inner, err := resolveExpr(x.Expr, schema, env)
-		if err != nil {
-			return nil, err
-		}
-		return &ir.Cast{Expr: inner, T: x.T}, nil
+		return resolveCast(x, schema, env)
 	case *ir.Case:
 		return resolveCase(x, schema, env)
+	case *ir.ExistsExpr:
+		return evalExists(x, env)
 	default:
 		return nil, fmt.Errorf("exec: unsupported expr %T", e)
 	}
+}
+
+// evalExists eagerly runs the inner plan and replaces the EXISTS
+// expression with a literal bool — true iff the plan produced at
+// least one row. Treating it like ScalarSubquery keeps the per-row
+// evaluator simple; the trade-off is that EXISTS is uncorrelated.
+// Correlated EXISTS would need a per-row execution.
+func evalExists(x *ir.ExistsExpr, env *Env) (ir.Expr, error) {
+	if env == nil {
+		return nil, fmt.Errorf("exec: EXISTS requires execution environment")
+	}
+	op, err := Build(x.Plan, env)
+	if err != nil {
+		return nil, fmt.Errorf("EXISTS: %w", err)
+	}
+	defer op.Close()
+	row, err := op.Next(context.Background())
+	if errors.Is(err, io.EOF) {
+		return &ir.Literal{Value: false, T: types.Bool}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("EXISTS: %w", err)
+	}
+	_ = row
+	return &ir.Literal{Value: true, T: types.Bool}, nil
+}
+
+func resolveCast(c *ir.Cast, schema []Column, env *Env) (ir.Expr, error) {
+	inner, err := resolveExpr(c.Expr, schema, env)
+	if err != nil {
+		return nil, err
+	}
+	return &ir.Cast{Expr: inner, T: c.T}, nil
 }
 
 // resolveCase recurses into the operand, every WHEN/THEN, and the
