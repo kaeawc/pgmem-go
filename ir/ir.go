@@ -282,6 +282,18 @@ type UnaryOp struct {
 func (*UnaryOp) expr()              {}
 func (u *UnaryOp) Type() types.Type { return u.T }
 
+// Cast is `expr::type` — runtime conversion to a named type. The exec
+// layer's converter table covers a small subset of PG's implicit-cast
+// lattice (DESIGN.md §5: "implement only the casts sqlc-generated
+// code emits"). Unsupported casts surface as exec errors.
+type Cast struct {
+	Expr Expr
+	T    types.Type
+}
+
+func (*Cast) expr()              {}
+func (c *Cast) Type() types.Type { return c.T }
+
 // FuncCall is a builtin function invocation (now(), gen_random_uuid(),
 // coalesce(), …). Name is lower-cased by the parser. Type is filled in
 // at exec.Build time from the function registry — the parser doesn't

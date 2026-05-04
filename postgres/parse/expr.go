@@ -225,6 +225,30 @@ func comparisonOp(k tokenKind) (string, bool) {
 }
 
 func (p *parser) parsePrimary() (ir.Expr, error) {
+	base, err := p.parsePrimaryHead()
+	if err != nil {
+		return nil, err
+	}
+	// Postfix `::type` casts. They chain — `x::int::text` is fine.
+	for p.peek().kind == tCast {
+		p.consume()
+		typeName, err := p.expect(tIdent, "cast target type")
+		if err != nil {
+			return nil, err
+		}
+		t, ok := types.ByName(typeName.val)
+		if !ok {
+			return nil, fmt.Errorf("parse: unknown cast target type %q", typeName.val)
+		}
+		base = &ir.Cast{Expr: base, T: t}
+	}
+	return base, nil
+}
+
+// parsePrimaryHead parses a primary expression *without* the postfix
+// cast handling. Lifted out so the cast loop can wrap whatever the
+// head produces.
+func (p *parser) parsePrimaryHead() (ir.Expr, error) {
 	t := p.peek()
 	switch t.kind {
 	case tMinus:
