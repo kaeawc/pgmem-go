@@ -2705,6 +2705,8 @@ func evalBinOp(b *ir.BinOp, in Row, env *Env) (any, error) {
 		return evalJSONContains(l, r)
 	case "<@":
 		return evalJSONContains(r, l)
+	case "?":
+		return evalJSONKeyExists(l, r)
 	case "~":
 		return evalRegex(l, r, false, false)
 	case "~*":
@@ -2894,6 +2896,39 @@ func jsonArrowSelect(doc any, idx any) (any, bool) {
 		return d[i], true
 	}
 	return nil, false
+}
+
+// evalJSONKeyExists implements jsonb's `?` key-exists operator: true
+// iff the right (text) appears as a top-level key (objects), as an
+// element (arrays), or as the value itself (scalar string).
+func evalJSONKeyExists(l, r any) (any, error) {
+	rawL, ok := l.([]byte)
+	if !ok {
+		return nil, fmt.Errorf("exec: jsonb ?: left must be jsonb, got %T", l)
+	}
+	key, ok := r.(string)
+	if !ok {
+		return nil, fmt.Errorf("exec: jsonb ?: right must be text, got %T", r)
+	}
+	var doc any
+	if err := json.Unmarshal(rawL, &doc); err != nil {
+		return nil, fmt.Errorf("exec: jsonb ?: invalid jsonb: %w", err)
+	}
+	switch d := doc.(type) {
+	case map[string]any:
+		_, present := d[key]
+		return present, nil
+	case []any:
+		for _, e := range d {
+			if s, ok := e.(string); ok && s == key {
+				return true, nil
+			}
+		}
+		return false, nil
+	case string:
+		return d == key, nil
+	}
+	return false, nil
 }
 
 // evalJSONContains implements jsonb's `@>` containment: returns true
