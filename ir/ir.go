@@ -254,6 +254,8 @@ const (
 	AlterTableAddColumn AlterTableAction = iota
 	AlterTableDropColumn
 	AlterTableRenameColumn
+	AlterTableSetNotNull
+	AlterTableDropNotNull
 )
 
 // AlterTable mutates a table's schema in place. AddCol carries the
@@ -268,6 +270,9 @@ type AlterTable struct {
 	IfExistsCol bool
 	RenameOld   string
 	RenameNew   string
+	// AlterCol is the target column name for ALTER COLUMN actions
+	// (AlterTableSetNotNull, AlterTableDropNotNull).
+	AlterCol string
 }
 
 func (*AlterTable) node() {}
