@@ -65,7 +65,7 @@ func Start(t testing.TB, opts ...Option) (Server, error) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		_ = wire.Serve(ctx, l, wire.Deps{Schema: sch, Engine: eng})
+		_ = wire.Serve(ctx, l, wire.Deps{Schema: sch, Engine: eng, Now: s.nowFunc})
 	}()
 
 	t.Cleanup(s.Stop)
@@ -93,6 +93,9 @@ type server struct {
 	schema catalog.Schema
 	engine storage.Engine
 
+	clockMu sync.RWMutex
+	clock   time.Time // zero value means "use real wall clock"
+
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 }
@@ -112,8 +115,25 @@ func (s *server) Stop() {
 	})
 }
 
-func (s *server) SetNow(_ time.Time) {
-	// Wired in M2 with the clock injection; no-op for M0/M1.
+// SetNow pins the time the now() builtin returns. Pass the zero
+// time.Time to revert to wall-clock behaviour. Subsequent now() calls
+// see the new value immediately; in-flight queries are not affected.
+func (s *server) SetNow(t time.Time) {
+	s.clockMu.Lock()
+	defer s.clockMu.Unlock()
+	s.clock = t
+}
+
+// nowFunc is the closure passed to wire.Deps. It returns the pinned
+// clock if one is set, else nil — env.Now == nil means "use the real
+// wall clock" inside the now() builtin.
+func (s *server) nowFunc() time.Time {
+	s.clockMu.RLock()
+	defer s.clockMu.RUnlock()
+	if s.clock.IsZero() {
+		return time.Now()
+	}
+	return s.clock
 }
 
 func (s *server) Seed(table string, rows ...[]any) error {
