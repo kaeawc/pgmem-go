@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/kaeawc/pgmem-go/catalog"
 	"github.com/kaeawc/pgmem-go/ir"
@@ -1785,6 +1786,19 @@ func compareValues(a, b any) (int, error) {
 			}
 		}
 		return 0, nil
+	case time.Time:
+		bt, ok := b.(time.Time)
+		if !ok {
+			return 0, fmt.Errorf("exec: cannot compare timestamptz with %T", b)
+		}
+		switch {
+		case av.Before(bt):
+			return -1, nil
+		case av.After(bt):
+			return 1, nil
+		default:
+			return 0, nil
+		}
 	default:
 		return 0, fmt.Errorf("exec: cannot compare %T", a)
 	}

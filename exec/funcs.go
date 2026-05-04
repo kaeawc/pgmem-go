@@ -3,6 +3,7 @@ package exec
 import (
 	"crypto/rand"
 	"fmt"
+	"time"
 
 	"github.com/kaeawc/pgmem-go/ir"
 	"github.com/kaeawc/pgmem-go/types"
@@ -33,6 +34,15 @@ var builtins = map[string]builtinFunc{
 			b[8] = (b[8] & 0x3F) | 0x80
 			return b, nil
 		},
+	},
+	"now": {
+		ResultType: noArgs(types.Timestamptz),
+		// Real PG's now() returns the transaction start time (constant
+		// within a tx). We return the wall clock at evaluation time —
+		// good enough for sqlc test assertions on "is created_at
+		// roughly now". The clock-injection hook on Server (DESIGN.md
+		// §5) will replace time.Now once it lands.
+		Eval: func(_ []any) (any, error) { return time.Now().UTC(), nil },
 	},
 }
 
