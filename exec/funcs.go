@@ -1024,7 +1024,7 @@ var builtins = map[string]builtinFunc{
 			if n <= 0 {
 				return nil, &SQLError{Code: "22023", Message: "null character not permitted"}
 			}
-			return string(rune(n)), nil
+			return string([]rune{n}), nil
 		},
 	},
 	"ascii": {
@@ -1045,7 +1045,7 @@ var builtins = map[string]builtinFunc{
 				return int32(0), nil
 			}
 			r, _ := decodeFirstRune(s)
-			return int32(r), nil
+			return r, nil
 		},
 	},
 	"to_hex": {
