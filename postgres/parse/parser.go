@@ -1229,6 +1229,12 @@ func (p *parser) parseLimitOffset(plan ir.Node) (ir.Node, error) {
 	for hasLimitOrOffset(p) {
 		switch p.consume().kind {
 		case kwLimit:
+			// `LIMIT ALL` is the SQL-standard way to say "no limit".
+			// Leave count as nil; the operator treats nil as unlimited.
+			if p.accept(kwAll) {
+				count = nil
+				break
+			}
 			e, err := p.parsePrimary()
 			if err != nil {
 				return nil, err
@@ -1240,6 +1246,11 @@ func (p *parser) parseLimitOffset(plan ir.Node) (ir.Node, error) {
 				return nil, err
 			}
 			offset = e
+			// PG accepts an optional ROW or ROWS noise word after the
+			// offset value: `OFFSET 5 ROWS`. Drop it on the floor.
+			if p.acceptIdent("row") || p.acceptIdent("rows") {
+				_ = struct{}{}
+			}
 		}
 	}
 	return &ir.Limit{Input: plan, Count: count, Offset: offset}, nil
