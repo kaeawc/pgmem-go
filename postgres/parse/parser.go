@@ -449,8 +449,10 @@ func (p *parser) parseAlterTable() (ir.Node, error) {
 		return p.parseAlterTableDrop(tbl.val)
 	case p.acceptIdent("rename"):
 		return p.parseAlterTableRename(tbl.val)
+	case p.acceptIdent("alter"):
+		return p.parseAlterTableAlterColumn(tbl.val)
 	default:
-		return nil, fmt.Errorf("parse: expected ADD/DROP/RENAME after ALTER TABLE %s at %d", tbl.val, p.peek().pos)
+		return nil, fmt.Errorf("parse: expected ADD/DROP/RENAME/ALTER after ALTER TABLE %s at %d", tbl.val, p.peek().pos)
 	}
 }
 
@@ -510,6 +512,38 @@ func (p *parser) parseAlterTableRename(table string) (ir.Node, error) {
 		return nil, err
 	}
 	return &ir.AlterTable{Table: table, Action: ir.AlterTableRenameColumn, RenameOld: old.val, RenameNew: newName.val}, nil
+}
+
+// parseAlterTableAlterColumn consumes the per-column action that
+// follows `ALTER TABLE name ALTER [COLUMN] col`. Today we recognise
+// SET NOT NULL and DROP NOT NULL — the other ALTER COLUMN forms
+// (SET DEFAULT, DROP DEFAULT, TYPE …) are not yet supported.
+func (p *parser) parseAlterTableAlterColumn(table string) (ir.Node, error) {
+	p.acceptIdent("column") // optional
+	col, err := p.expect(tIdent, "column name")
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case p.accept(kwSet):
+		if !p.accept(kwNot) {
+			return nil, fmt.Errorf("parse: expected NOT after ALTER COLUMN %s SET at %d", col.val, p.peek().pos)
+		}
+		if _, err := p.expect(kwNull, "NULL"); err != nil {
+			return nil, err
+		}
+		return &ir.AlterTable{Table: table, Action: ir.AlterTableSetNotNull, AlterCol: col.val}, nil
+	case p.accept(kwDrop):
+		if !p.accept(kwNot) {
+			return nil, fmt.Errorf("parse: expected NOT after ALTER COLUMN %s DROP at %d", col.val, p.peek().pos)
+		}
+		if _, err := p.expect(kwNull, "NULL"); err != nil {
+			return nil, err
+		}
+		return &ir.AlterTable{Table: table, Action: ir.AlterTableDropNotNull, AlterCol: col.val}, nil
+	default:
+		return nil, fmt.Errorf("parse: expected SET/DROP NOT NULL after ALTER COLUMN %s at %d", col.val, p.peek().pos)
+	}
 }
 
 // --- CREATE TABLE ---

@@ -1222,6 +1222,10 @@ func buildAlterTable(p *ir.AlterTable, env *Env) Operator {
 			return alterTableDrop(env, tbl, p.DropName, p.IfExistsCol)
 		case ir.AlterTableRenameColumn:
 			return alterTableRename(env, tbl, p.RenameOld, p.RenameNew)
+		case ir.AlterTableSetNotNull:
+			return alterTableSetNotNull(env, tbl, p.AlterCol, true)
+		case ir.AlterTableDropNotNull:
+			return alterTableSetNotNull(env, tbl, p.AlterCol, false)
 		default:
 			return fmt.Errorf("exec: unknown ALTER TABLE action %d", p.Action)
 		}
@@ -1302,6 +1306,34 @@ func alterTableDrop(env *Env, tbl catalog.Table, name string, ifExists bool) err
 		return rs
 	})
 	return nil
+}
+
+func alterTableSetNotNull(env *Env, tbl catalog.Table, name string, notNull bool) error {
+	idx := -1
+	for i, c := range tbl.Columns {
+		if c.Name == name {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return &SQLError{Code: "42703", Message: fmt.Sprintf("column %q of relation %q does not exist", name, tbl.Name)}
+	}
+	if notNull {
+		st, ok := env.Txn.Table(tbl.Name)
+		if !ok {
+			return fmt.Errorf("exec: storage missing table %q", tbl.Name)
+		}
+		for _, r := range st.Rows() {
+			if idx < len(r) && r[idx] == nil {
+				return &SQLError{Code: "23502", Message: fmt.Sprintf("column %q contains null values", name)}
+			}
+		}
+	}
+	cols := append([]catalog.Column(nil), tbl.Columns...)
+	cols[idx].NotNull = notNull
+	tbl.Columns = cols
+	return env.Schema.CreateTable(tbl)
 }
 
 func alterTableRename(env *Env, tbl catalog.Table, oldName, newName string) error {
