@@ -12,6 +12,19 @@ type Node interface{ node() }
 
 // --- Read-side plan nodes ---
 
+// SubqueryAlias wraps an inline SELECT used in a FROM clause:
+//
+//	FROM (SELECT ...) sub
+//
+// It just re-tags each output column with `Alias` as the qualifier so
+// `sub.col` resolves; rows pass through untouched.
+type SubqueryAlias struct {
+	Inner Node
+	Alias string
+}
+
+func (*SubqueryAlias) node() {}
+
 // Scan reads every row of the named table. Alias, when set, replaces
 // the Table value as the qualifier for column references in the scan's
 // output schema — i.e. `users u` makes `u.id` the canonical reference.

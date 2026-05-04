@@ -152,6 +152,9 @@ func (p *parser) parseJoinSuffix(left ir.Node) (ir.Node, error) {
 }
 
 func (p *parser) parseTableRef() (ir.Node, error) {
+	if p.peek().kind == tLParen && p.peekNext().kind == kwSelect {
+		return p.parseDerivedTable()
+	}
 	t, err := p.expect(tIdent, "table name")
 	if err != nil {
 		return nil, err
@@ -164,6 +167,24 @@ func (p *parser) parseTableRef() (ir.Node, error) {
 		return plan, nil
 	}
 	return &ir.Scan{Table: t.val, Alias: alias}, nil
+}
+
+// parseDerivedTable consumes `( SELECT ... ) [AS] alias`. Real PG
+// requires the alias on a FROM-subquery; we follow that.
+func (p *parser) parseDerivedTable() (ir.Node, error) {
+	p.consume() // (
+	plan, err := p.parseSelectMaybeUnion()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(tRParen, ")"); err != nil {
+		return nil, err
+	}
+	alias := p.parseOptionalAlias()
+	if alias == "" {
+		return nil, fmt.Errorf("parse: subquery in FROM must have an alias at %d", p.peek().pos)
+	}
+	return &ir.SubqueryAlias{Inner: plan, Alias: alias}, nil
 }
 
 // parseOptionalAlias accepts `[AS] alias` if the next token can serve

@@ -70,6 +70,8 @@ func walkParams(n ir.Node, sch catalog.Schema, scopeTable string, hint map[int]t
 	case *ir.Union:
 		walkParams(p.Left, sch, scopeTable, hint, maxIdx)
 		walkParams(p.Right, sch, scopeTable, hint, maxIdx)
+	case *ir.SubqueryAlias:
+		walkParams(p.Inner, sch, scopeTable, hint, maxIdx)
 	case *ir.Insert:
 		walkParamsInsert(p, sch, scopeTable, hint, maxIdx)
 	case *ir.Delete:
