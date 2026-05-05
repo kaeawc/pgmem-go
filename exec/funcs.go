@@ -1132,6 +1132,129 @@ var builtins = map[string]builtinFunc{
 			return sum[:], nil
 		},
 	},
+	"make_date": {
+		// make_date(year, month, day) → timestamptz at UTC midnight.
+		// Real PG returns date; we emit a zero-time timestamptz for
+		// consistency with the rest of pgmem-go's date handling.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 3 {
+				return nil, fmt.Errorf("make_date: takes 3 arguments, got %d", len(args))
+			}
+			return types.Timestamptz, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			y, m, d, err := tripletInt(args, "make_date")
+			if err != nil {
+				return nil, err
+			}
+			return time.Date(y, time.Month(m), d, 0, 0, 0, 0, time.UTC), nil
+		},
+	},
+	"make_time": {
+		// make_time(hour, min, sec) → timestamptz pinned to the Unix
+		// epoch's date plus the time component. Real PG returns a
+		// `time` value; we mirror current_time's approximation.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 3 {
+				return nil, fmt.Errorf("make_time: takes 3 arguments, got %d", len(args))
+			}
+			return types.Timestamptz, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			h, m, s, err := tripletInt(args, "make_time")
+			if err != nil {
+				return nil, err
+			}
+			return time.Date(1970, 1, 1, h, m, s, 0, time.UTC), nil
+		},
+	},
+	"make_timestamp": {
+		// make_timestamp(year, month, day, hour, min, sec) → timestamptz
+		// at UTC. The 6-arg form mirrors PG's make_timestamp; the 7-arg
+		// (timezone-aware) variant isn't supported.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 6 {
+				return nil, fmt.Errorf("make_timestamp: takes 6 arguments, got %d", len(args))
+			}
+			return types.Timestamptz, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			parts := make([]int, 6)
+			for i, a := range args {
+				n, err := intArgValue(a, "make_timestamp")
+				if err != nil {
+					return nil, err
+				}
+				parts[i] = n
+			}
+			return time.Date(parts[0], time.Month(parts[1]), parts[2], parts[3], parts[4], parts[5], 0, time.UTC), nil
+		},
+	},
+	"to_timestamp": {
+		// to_timestamp(unix_seconds) → timestamptz. PG also accepts
+		// (text, format) — we leave that for a future piece.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("to_timestamp: takes 1 argument (unix seconds form only), got %d", len(args))
+			}
+			return types.Timestamptz, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			switch n := args[0].(type) {
+			case int32:
+				return time.Unix(int64(n), 0).UTC(), nil
+			case int64:
+				return time.Unix(n, 0).UTC(), nil
+			case float64:
+				sec := int64(n)
+				nsec := int64((n - float64(sec)) * 1e9)
+				return time.Unix(sec, nsec).UTC(), nil
+			}
+			return nil, fmt.Errorf("to_timestamp: arg must be numeric, got %T", args[0])
+		},
+	},
+	"age": {
+		// age(t1, t2) → interval. Returns t1 - t2 as a time.Duration.
+		// The single-arg form age(t) uses current_date as t2 — we
+		// follow that with a UTC midnight cut, so age('2020-01-01')
+		// returns the gap from today to that date.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 1 || len(args) > 2 {
+				return nil, fmt.Errorf("age: takes 1 or 2 arguments, got %d", len(args))
+			}
+			return types.Interval, nil
+		},
+		Eval: func(env *Env, args []any) (any, error) {
+			t1, ok1 := args[0].(time.Time)
+			if args[0] == nil {
+				return nil, nil
+			}
+			if !ok1 {
+				return nil, fmt.Errorf("age: first arg must be timestamp, got %T", args[0])
+			}
+			var t2 time.Time
+			if len(args) == 2 {
+				if args[1] == nil {
+					return nil, nil
+				}
+				v, ok := args[1].(time.Time)
+				if !ok {
+					return nil, fmt.Errorf("age: second arg must be timestamp, got %T", args[1])
+				}
+				t2 = v
+			} else {
+				now := time.Now().UTC()
+				if env != nil && env.Now != nil {
+					now = env.Now().UTC()
+				}
+				t2 = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+			}
+			return t1.Sub(t2), nil
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -1396,6 +1519,38 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// intArgValue coerces a numeric arg to int. int32/int64 pass; other
+// numeric types are not accepted.
+func intArgValue(v any, fn string) (int, error) {
+	switch n := v.(type) {
+	case int32:
+		return int(n), nil
+	case int64:
+		return int(n), nil
+	case nil:
+		return 0, fmt.Errorf("%s: argument must not be NULL", fn)
+	}
+	return 0, fmt.Errorf("%s: argument must be integer, got %T", fn, v)
+}
+
+// tripletInt unpacks three integer args into (a, b, c). Used by
+// make_date / make_time which both take a fixed three-int signature.
+func tripletInt(args []any, fn string) (int, int, int, error) {
+	a, err := intArgValue(args[0], fn)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	b, err := intArgValue(args[1], fn)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	c, err := intArgValue(args[2], fn)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return a, b, c, nil
 }
 
 // formatTemplate implements PG's `format(template, args...)` for
