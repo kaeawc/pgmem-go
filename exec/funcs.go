@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	mrand "math/rand"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1255,6 +1257,156 @@ var builtins = map[string]builtinFunc{
 			return t1.Sub(t2), nil
 		},
 	},
+	"floor": {
+		// floor(numeric|float8) — rounds toward negative infinity.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("floor: takes 1 argument, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return unaryFloat("floor", args[0], math.Floor)
+		},
+	},
+	"ceil": {
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("ceil: takes 1 argument, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return unaryFloat("ceil", args[0], math.Ceil)
+		},
+	},
+	"ceiling": {
+		// ceiling is a PG synonym for ceil.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("ceiling: takes 1 argument, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return unaryFloat("ceiling", args[0], math.Ceil)
+		},
+	},
+	"round": {
+		// round(x [, scale]) — half-away-from-zero rounding. The
+		// scale argument (PG numeric form) shifts before/after the
+		// round; with float input we approximate via 10^scale.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 1 || len(args) > 2 {
+				return nil, fmt.Errorf("round: takes 1 or 2 arguments, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			f, err := floatArg("round", args[0])
+			if err != nil {
+				return nil, err
+			}
+			if len(args) == 1 {
+				return math.Round(f), nil
+			}
+			scale, err := intArgValue(args[1], "round")
+			if err != nil {
+				return nil, err
+			}
+			mult := math.Pow(10, float64(scale))
+			return math.Round(f*mult) / mult, nil
+		},
+	},
+	"power": {
+		// power(base, exp) — both float8.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("power: takes 2 arguments, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return binaryFloat("power", args[0], args[1], math.Pow)
+		},
+	},
+	"sqrt": {
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("sqrt: takes 1 argument, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return unaryFloat("sqrt", args[0], math.Sqrt)
+		},
+	},
+	"sign": {
+		// sign(x) — returns -1, 0, or 1.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("sign: takes 1 argument, got %d", len(args))
+			}
+			return types.Float8, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			f, err := floatArg("sign", args[0])
+			if err != nil {
+				return nil, err
+			}
+			switch {
+			case f > 0:
+				return float64(1), nil
+			case f < 0:
+				return float64(-1), nil
+			}
+			return float64(0), nil
+		},
+	},
+	"random": {
+		// random() — float8 in [0, 1). Real PG uses a transaction-
+		// scoped seed; we use math/rand seeded once at process start.
+		// For tests that need determinism, pin the seed externally.
+		ResultType: func(_ []ir.Expr) (types.Type, error) { return types.Float8, nil },
+		Eval: func(_ *Env, _ []any) (any, error) {
+			//nolint:gosec // non-crypto random — PG's random() is the same
+			return mrand.Float64(), nil
+		},
+	},
+	"pi": {
+		ResultType: func(_ []ir.Expr) (types.Type, error) { return types.Float8, nil },
+		Eval:       func(_ *Env, _ []any) (any, error) { return math.Pi, nil },
+	},
+	"lpad": {
+		// lpad(s, length [, fill]) — left-pad / left-truncate to
+		// `length` runes. fill defaults to a single space.
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("lpad: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return padString("lpad", args, true)
+		},
+	},
+	"rpad": {
+		ResultType: func(args []ir.Expr) (types.Type, error) {
+			if len(args) < 2 || len(args) > 3 {
+				return nil, fmt.Errorf("rpad: takes 2 or 3 arguments, got %d", len(args))
+			}
+			return types.Text, nil
+		},
+		Eval: func(_ *Env, args []any) (any, error) {
+			return padString("rpad", args, false)
+		},
+	},
 	"strpos": {
 		// strpos(haystack, needle) — 1-indexed position of needle in
 		// haystack, or 0 when not found. Function-form alias for
@@ -1519,6 +1671,92 @@ func textArg(v any) string {
 		return s
 	}
 	return fmt.Sprint(v)
+}
+
+// floatArg coerces an arg to float64. int4/int8/float8 pass; nil
+// returns 0 + an error so the caller can short-circuit.
+func floatArg(fn string, v any) (float64, error) {
+	switch n := v.(type) {
+	case float64:
+		return n, nil
+	case float32:
+		return float64(n), nil
+	case int32:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	}
+	return 0, fmt.Errorf("%s: arg must be numeric, got %T", fn, v)
+}
+
+// unaryFloat lifts a float64→float64 math op into a builtin Eval.
+// NULL passes through.
+func unaryFloat(fn string, v any, op func(float64) float64) (any, error) {
+	if v == nil {
+		return nil, nil
+	}
+	f, err := floatArg(fn, v)
+	if err != nil {
+		return nil, err
+	}
+	return op(f), nil
+}
+
+// binaryFloat lifts a (float64, float64)→float64 math op.
+func binaryFloat(fn string, a, b any, op func(float64, float64) float64) (any, error) {
+	if a == nil || b == nil {
+		return nil, nil
+	}
+	x, err := floatArg(fn, a)
+	if err != nil {
+		return nil, err
+	}
+	y, err := floatArg(fn, b)
+	if err != nil {
+		return nil, err
+	}
+	return op(x, y), nil
+}
+
+// padString implements lpad and rpad. With left=true it left-pads;
+// false right-pads. Length above the input truncates instead of
+// padding (matching PG). Empty fill returns the input unchanged.
+func padString(fn string, args []any, left bool) (any, error) {
+	if args[0] == nil || args[1] == nil {
+		return nil, nil
+	}
+	s := textArg(args[0])
+	length, err := intArgValue(args[1], fn)
+	if err != nil {
+		return nil, err
+	}
+	fill := " "
+	if len(args) == 3 {
+		if args[2] == nil {
+			return nil, nil
+		}
+		fill = textArg(args[2])
+	}
+	rs := []rune(s)
+	if length <= 0 {
+		return "", nil
+	}
+	if length <= len(rs) {
+		return string(rs[:length]), nil
+	}
+	if fill == "" {
+		return s, nil
+	}
+	pad := make([]rune, 0, length-len(rs))
+	fillR := []rune(fill)
+	for len(pad) < length-len(rs) {
+		pad = append(pad, fillR...)
+	}
+	pad = pad[:length-len(rs)]
+	if left {
+		return string(pad) + s, nil
+	}
+	return s + string(pad), nil
 }
 
 // intArgValue coerces a numeric arg to int. int32/int64 pass; other
