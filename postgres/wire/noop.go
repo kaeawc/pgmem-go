@@ -11,11 +11,32 @@ func isClientNoop(sql string) bool {
 }
 
 // noopTag returns the CommandComplete tag for a recognized no-op, or
-// "" if the statement is not in the no-op set.
+// "" if the statement is not in the no-op set. The set covers
+// statements pgx-style clients and migration tools (goose, atlas,
+// flyway) emit but pgmem-go has no semantic counterpart for.
 func noopTag(sql string) string {
 	upper := strings.ToUpper(strings.TrimSpace(strings.TrimRight(strings.TrimSpace(sql), ";")))
-	if strings.HasPrefix(upper, "SET ") {
+	switch {
+	case strings.HasPrefix(upper, "SET "):
 		return "SET"
+	case strings.HasPrefix(upper, "RESET "):
+		return "RESET"
+	case upper == "DISCARD ALL" || strings.HasPrefix(upper, "DISCARD "):
+		return "DISCARD"
+	case strings.HasPrefix(upper, "COMMENT ON "):
+		return "COMMENT"
+	case strings.HasPrefix(upper, "CREATE EXTENSION "):
+		return "CREATE EXTENSION"
+	case strings.HasPrefix(upper, "DROP EXTENSION "):
+		return "DROP EXTENSION"
+	case strings.HasPrefix(upper, "CREATE SCHEMA "):
+		return "CREATE SCHEMA"
+	case strings.HasPrefix(upper, "DROP SCHEMA "):
+		return "DROP SCHEMA"
+	case strings.HasPrefix(upper, "ANALYZE") || strings.HasPrefix(upper, "ANALYSE"):
+		return "ANALYZE"
+	case strings.HasPrefix(upper, "VACUUM"):
+		return "VACUUM"
 	}
 	return ""
 }
