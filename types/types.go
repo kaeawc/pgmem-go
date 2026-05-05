@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -1036,17 +1037,173 @@ type intervalType struct{}
 func (*intervalType) Name() string { return "interval" }
 func (*intervalType) OID() uint32  { return 1186 }
 func (*intervalType) Size() int16  { return 16 }
-func (*intervalType) EncodeText(_ any) ([]byte, error) {
-	return nil, fmt.Errorf("interval EncodeText: not supported")
+
+// EncodeText emits a duration as `HH:MM:SS.US` (or with a leading
+// `N days` when the value is at least 24 h). PG accepts many text
+// formats for interval input; this one is the canonical short form
+// pg_dump emits and that pgx parses back into time.Duration.
+func (*intervalType) EncodeText(v any) ([]byte, error) {
+	d, ok := v.(time.Duration)
+	if !ok {
+		return nil, fmt.Errorf("interval EncodeText: unsupported %T", v)
+	}
+	return []byte(formatIntervalText(d)), nil
 }
-func (*intervalType) EncodeBinary(_ any) ([]byte, error) {
-	return nil, fmt.Errorf("interval EncodeBinary: not supported")
+
+// EncodeBinary writes the 16-byte PG interval representation:
+// microseconds (int64) ++ days (int32) ++ months (int32). pgmem-go's
+// runtime carries a flat time.Duration, so days and months are
+// always zero — the consuming side reassembles the duration from
+// microseconds alone.
+func (*intervalType) EncodeBinary(v any) ([]byte, error) {
+	d, ok := v.(time.Duration)
+	if !ok {
+		return nil, fmt.Errorf("interval EncodeBinary: unsupported %T", v)
+	}
+	b := make([]byte, 16)
+	binary.BigEndian.PutUint64(b[0:8], uint64(d.Microseconds()))
+	// days[8:12] and months[12:16] stay zero.
+	return b, nil
 }
-func (*intervalType) DecodeText(_ []byte) (any, error) {
-	return nil, fmt.Errorf("interval DecodeText: not supported")
+
+func (*intervalType) DecodeText(b []byte) (any, error) {
+	d, err := parseIntervalText(string(b))
+	if err != nil {
+		return nil, fmt.Errorf("interval DecodeText: %w", err)
+	}
+	return d, nil
 }
-func (*intervalType) DecodeBinary(_ []byte) (any, error) {
-	return nil, fmt.Errorf("interval DecodeBinary: not supported")
+
+func (*intervalType) DecodeBinary(b []byte) (any, error) {
+	if len(b) != 16 {
+		return nil, fmt.Errorf("interval DecodeBinary: want 16 bytes, got %d", len(b))
+	}
+	micros := int64(binary.BigEndian.Uint64(b[0:8]))
+	days := int32(binary.BigEndian.Uint32(b[8:12]))
+	months := int32(binary.BigEndian.Uint32(b[12:16]))
+	d := time.Duration(micros) * time.Microsecond
+	d += time.Duration(days) * 24 * time.Hour
+	// Months are length-variable; we approximate with 30-day months
+	// so a round-tripped value at least preserves the rough scale.
+	d += time.Duration(months) * 30 * 24 * time.Hour
+	return d, nil
+}
+
+// formatIntervalText renders a time.Duration as `[N days ]HH:MM:SS[.US]`.
+// Negative durations get a single leading `-` on the time portion;
+// the day count carries its own sign so `-1 day` still composes.
+func formatIntervalText(d time.Duration) string {
+	if d == 0 {
+		return "00:00:00"
+	}
+	neg := d < 0
+	if neg {
+		d = -d
+	}
+	days := int64(d / (24 * time.Hour))
+	d -= time.Duration(days) * 24 * time.Hour
+	hours := int64(d / time.Hour)
+	d -= time.Duration(hours) * time.Hour
+	minutes := int64(d / time.Minute)
+	d -= time.Duration(minutes) * time.Minute
+	seconds := int64(d / time.Second)
+	d -= time.Duration(seconds) * time.Second
+	micros := int64(d / time.Microsecond)
+
+	var sb strings.Builder
+	if days != 0 {
+		if neg {
+			fmt.Fprintf(&sb, "-%d days ", days)
+		} else {
+			fmt.Fprintf(&sb, "%d days ", days)
+		}
+		fmt.Fprintf(&sb, "%02d:%02d:%02d", hours, minutes, seconds)
+	} else {
+		sign := ""
+		if neg {
+			sign = "-"
+		}
+		fmt.Fprintf(&sb, "%s%02d:%02d:%02d", sign, hours, minutes, seconds)
+	}
+	if micros != 0 {
+		fmt.Fprintf(&sb, ".%06d", micros)
+	}
+	return sb.String()
+}
+
+// parseIntervalText is the symmetric reader for formatIntervalText.
+// It handles the small subset of PG interval text we emit; richer
+// shapes (`'1 year 2 months'`) reuse the parser the parseInterval
+// builtin uses, but here we only need to round-trip our own output.
+func parseIntervalText(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty interval")
+	}
+	var d time.Duration
+	// Optional leading `[-]N days`.
+	if i := strings.Index(s, " days "); i > 0 {
+		dayPart := s[:i]
+		neg := false
+		if strings.HasPrefix(dayPart, "-") {
+			neg = true
+			dayPart = dayPart[1:]
+		}
+		n, err := strconv.ParseInt(dayPart, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		if neg {
+			n = -n
+		}
+		d += time.Duration(n) * 24 * time.Hour
+		s = s[i+len(" days "):]
+	}
+	// HH:MM:SS[.US] possibly with leading sign.
+	neg := false
+	if strings.HasPrefix(s, "-") {
+		neg = true
+		s = s[1:]
+	}
+	parts := strings.SplitN(s, ":", 3)
+	if len(parts) != 3 {
+		return 0, fmt.Errorf("expected HH:MM:SS, got %q", s)
+	}
+	h, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	m, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	secStr := parts[2]
+	micros := int64(0)
+	if dot := strings.Index(secStr, "."); dot >= 0 {
+		fracStr := secStr[dot+1:]
+		// Pad/truncate to 6 digits (microseconds).
+		switch {
+		case len(fracStr) > 6:
+			fracStr = fracStr[:6]
+		case len(fracStr) < 6:
+			fracStr += strings.Repeat("0", 6-len(fracStr))
+		}
+		f, err := strconv.ParseInt(fracStr, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		micros = f
+		secStr = secStr[:dot]
+	}
+	sec, err := strconv.ParseInt(secStr, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	tpart := time.Duration(h)*time.Hour + time.Duration(m)*time.Minute + time.Duration(sec)*time.Second + time.Duration(micros)*time.Microsecond
+	if neg {
+		tpart = -tpart
+	}
+	return d + tpart, nil
 }
 
 // ByName looks up by SQL type name. Used by the parser to translate
